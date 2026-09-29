@@ -61,8 +61,8 @@ SIDEBAR_ICON_FNS = {'🏠': icon_home, '⚙️': icon_settings, '⭐': icon_hero
                     '📊': icon_chart, '📋': icon_log, 'ℹ️': icon_info}
 
 # v4.5.0: 「关于」页里的项目主页地址（开源仓库）。
-# URL 对大小写不敏感，以 GitHub 上仓库的显示名为准。
-PROJECT_REPO_URL = 'https://github.com/molan66/Dandan'
+# v4.5.1: 仓库已由 Dandan 更名为 DaDan，同步更新。
+PROJECT_REPO_URL = 'https://github.com/molan66/DaDan'
 PROJECT_REPO_URL_PLACEHOLDER = False   # 已填入真实用户名；若改回占位符请置 True
 
 # v4.4.1(UI-B9 第一步): 账号卡 chip 的几何与 8 组色值收敛为模块常量。

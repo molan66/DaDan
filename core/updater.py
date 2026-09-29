@@ -24,4 +24,6 @@ v4.5.0: 本项目已按 AGPL-3.0 开源, 仓库地址见 ui/main_window.py 的 P
 # v4.5.0: 开源发布版 —— 新增侧边栏「关于」页(版权/许可/项目地址/第三方归属),
 #         补齐 LICENSE / NOTICE.md / THIRD_PARTY.md / docs/PROVENANCE.md,
 #         清理硬编码个人路径与 README、spec 里"仅限个人自用"等与公开发布冲突的表述。
-APP_VERSION = '4.5.0'
+# v4.5.1: 仓库由 Dandan 更名为 DaDan —— 同步「关于」页与 README 里的项目主页地址,
+#         并把 README/NOTICE 里的 AI 开发声明并入本次发布。
+APP_VERSION = '4.5.1'
