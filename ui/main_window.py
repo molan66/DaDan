@@ -60,11 +60,10 @@ SIDEBAR_PAGES = (('🏠', '首页'), ('⚙️', '设置'), ('⭐', '英雄'),
 SIDEBAR_ICON_FNS = {'🏠': icon_home, '⚙️': icon_settings, '⭐': icon_hero,
                     '📊': icon_chart, '📋': icon_log, 'ℹ️': icon_info}
 
-# v4.5.0: 「关于」页里的项目主页地址。
-# ⚠️ 仓库名已固定为 DaDan；把下面一段里的 <你的GitHub用户名> 换成你自己的用户名即可。
-# 只改这一处，界面上的链接就同步了（README 里的链接请一并替换）。
-PROJECT_REPO_URL = 'https://github.com/<你的GitHub用户名>/DaDan'
-PROJECT_REPO_URL_PLACEHOLDER = True   # ← 用户名仍是占位符时置 True；填好后改为 False
+# v4.5.0: 「关于」页里的项目主页地址（开源仓库）。
+# URL 对大小写不敏感，以 GitHub 上仓库的显示名为准。
+PROJECT_REPO_URL = 'https://github.com/molan66/Dandan'
+PROJECT_REPO_URL_PLACEHOLDER = False   # 已填入真实用户名；若改回占位符请置 True
 
 # v4.4.1(UI-B9 第一步): 账号卡 chip 的几何与 8 组色值收敛为模块常量。
 # **数值一个字都没改** —— 这一步只让"改一处即全局生效", 视觉零回归。
