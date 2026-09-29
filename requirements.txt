@@ -1,0 +1,26 @@
+# 大蛋小助手 运行时依赖（Python 3.14；本机打包实测 3.14.7）
+# 安装: pip install -r requirements.txt
+# 说明: 仅这 4 个直接依赖(界面用 PyQt5, 其余为 HTTP/WebSocket/进程查询)。
+#       打包工具不在这里, 见 requirements-build.txt。
+#
+# ⚠️ v4.4.0(P1-26 修复): 原先 5 条全是浮动下限(>=), 不同时间 pip install
+#    会装到不同版本, 而 UI 渲染/HTTP 行为对 Qt 小版本和 urllib3 大版本都敏感
+#    (例如 urllib3 1.x → 2.x 的 Retry/HTTPAdapter 参数语义变化)。现按本机
+#    已验证可打包可运行的确切版本钉死, 保证重装环境后行为一致。
+#    如需升级: 改这里的 == 版本号后, 自行回归验证自动化流程与界面显示。
+#    各依赖的许可证与版权见 THIRD_PARTY.md。
+#
+# 直接依赖(4):
+psutil==7.2.2
+requests==2.34.2
+websocket-client==1.9.2
+PyQt5==5.15.11
+#
+# 以上 4 个直接依赖带出的间接依赖(一并显式钉死, 保证重装环境后行为一致 —— 原先是
+# 注释掉的"可选复刻", 与头部"钉死版本保证行为一致"的承诺不符, 现取消注释):
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.19.0
+charset-normalizer==3.5.1
+idna==3.20
+urllib3==2.8.0
+certifi==2026.7.22

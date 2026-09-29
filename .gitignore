@@ -1,0 +1,46 @@
+# ============================================================
+# 大蛋小助手 .gitignore
+# ============================================================
+
+# ---- 打包产物 ----
+dist/
+build/
+*.exe
+*.spec.bak
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+
+# ---- PyInstaller 中间产物 ----
+*.manifest
+*.pkg
+warn-*.txt
+xref-*.html
+
+# ---- 运行时缓存与日志（程序首次运行时会自动重建）----
+data/logs/
+data/icon_cache/
+data/item_cache/
+data/spell_cache/
+data/augment_cache/
+data/x/
+*.log
+crash.log
+
+# ---- 本机/个人环境 ----
+.workbuddy/
+_shots/
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+desktop.ini
+.DS_Store

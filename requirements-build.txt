@@ -1,0 +1,17 @@
+# 大蛋小助手 打包依赖（仅构建 exe 时需要；运行时不需要这些）
+# 安装: pip install -r requirements-build.txt
+#
+# ⚠️ v4.4.0(P1-26 修复): pyinstaller 原先混在 requirements.txt 的运行时依赖里,
+#    容易让人以为运行程序也依赖它。实际它只在 `PyInstaller build.spec` 打包时用到,
+#    故独立成文件。
+#
+# 本机打包实测版本(2026-09-28)与 Python 3.14.7 组合下 exe 构建成功:
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7
+#
+# pyinstaller 带出的间接依赖(打包环境一致性需要时取消注释):
+# altgraph==0.17.5
+# pefile==2024.8.26
+# pywin32-ctypes==0.2.3
+# packaging==26.3
+# setuptools==84.0.0
