@@ -662,7 +662,14 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         lay.addStretch()
 
         # 窗口控制按钮（统一工厂：主窗口/小窗共用同一样式）
-        for b in make_title_buttons(close_cb=self.close_signal):
+        # v4.4.19: 新增「返回主界面」按钮, 位置在**关闭左边**(用户要求)。
+        #   与「关闭」的区别(这是刻意设计的):
+        #     返回主界面 = 只把主界面调出来, **不停脚本** —— 对局中想看一眼主界面
+        #                  时可以随手点, 不会把正在跑的脚本打断;
+        #     关闭       = 停脚本 + 回主界面(破坏性), 保持原语义不变。
+        #   若两者都只是"回主界面", 那多出来的按钮就没意义了。
+        for b in make_title_buttons(close_cb=self.close_signal,
+                                    main_cb=self.show_main_signal):
             lay.addWidget(b)
 
         # v4.4.0 修复(P2): 原来标题栏拖拽写 `if self._drag_pos:` —— QPoint(0,0)

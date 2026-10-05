@@ -17,6 +17,7 @@ os.environ['NO_PROXY'] = '*'
 import json
 import threading
 import time as _time
+import ctypes
 from concurrent.futures import ThreadPoolExecutor
 
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox, QWidget
@@ -26,6 +27,10 @@ from PyQt5.QtGui import QIcon, QPixmap, QFont, QPainter, QColor, QBrush, QPainte
 from lcu.connector import LCUConnector
 from lcu.api import LCUAPI
 from lcu.websocket_listener import WebSocketListener
+# v4.4.5: 一键启动 LOL(跳过 WeGame 主面板, 直启独立登录器)
+from lcu import launcher as _lol_launcher
+# v4.4.12: 录制登录器点击(全局鼠标钩子) —— 替代靠猜坐标的固定步骤
+from lcu.recorder import ClickRecorder as _ClickRecorder
 # v4.4.0(P1-25): 英雄表构建规则(0 < cid <= 1000 + 名字兜底)与 core/script_core.py
 # 共用同一份实现, 避免"界面英雄表"与"自动选英雄用的英雄表"两处规则漂移。
 from lcu.parsing import is_real_champion, champion_display_name
@@ -79,6 +84,12 @@ def _duration_s(v) -> int:
     if dur > _DURATION_MS_THRESHOLD:
         dur = dur // 1000
     return dur if dur > 0 else 0
+
+
+# v4.4.16: 「全部停止」= 关掉 LOL → 等 STOP_ALL_DELAY_S 秒 → 停脚本。
+# 用户明确要求这个 3 秒间隔: 关客户端是异步的(进程退出、LCU 端口释放都需要时间),
+# 立刻停脚本会让"客户端断开"的收尾流程撞上正在退出的进程。
+STOP_ALL_DELAY_S = 3.0
 
 
 # ==================== v4.4.0(P2): 重连退避节奏 ====================
@@ -564,6 +575,15 @@ class AppController(QObject):
     # 干完把结果经该信号排回主线程再做 UI 更新。
     _start_done_sig = pyqtSignal(bool, str)
 
+    # v4.4.5: 一键启动 LOL 完成信号(后台线程 → 主线程)。
+    _lol_launch_done_sig = pyqtSignal(bool, str)
+
+    # v4.4.13: 录制前的"准备登录器"完成信号(后台线程 → 主线程), 携带窗口 dict 或 None。
+    _rec_prep_done_sig = pyqtSignal(object)
+
+    # v4.4.16: 「全部停止」完成信号(关 LOL 的后台线程 → 主线程停脚本)。
+    _stop_all_done_sig = pyqtSignal(bool, str)
+
     # v4.4.2(P1-4): 手动接受/拒绝/换英雄原本是 @ui_slot 里同步调 core 的 REST
     # (bench_swap 含 sleep + 读回, 最坏 REST 超时 (2.0,5.0) 级), 主线程假死十秒级。
     # 现把阻塞调用挪后台线程, 结果经本信号排回主线程更新 UI。
@@ -580,6 +600,12 @@ class AppController(QObject):
         self._detail_ready.connect(self._on_detail_ready)
         self._start_done_sig.connect(self._on_start_done)
         self._action_done_sig.connect(self._on_action_done)  # v4.4.2(P1-4)
+        # v4.4.5: 一键启动 LOL 完成 → 主线程收尾(提示/回填日志)
+        self._lol_launch_done_sig.connect(self._on_lol_launch_done)
+        # v4.4.13: 录制前准备登录器完成
+        self._rec_prep_done_sig.connect(self._on_rec_prep_done)
+        # v4.4.16: 全部停止(关 LOL 完成 → 停脚本)
+        self._stop_all_done_sig.connect(self._on_stop_all_done)
         # v4.3.10: WS 回调(后台线程) → 主线程的两条通路, 见类属性处说明
         self._ws_connected_sig.connect(self._on_ws_connected)
         self._ws_disconnected_sig.connect(self._on_ws_disconnected)
@@ -697,6 +723,20 @@ class AppController(QObject):
         # v4.4.0(P0-2): 启动流程单飞标志。_start() 现在把阻塞段丢到后台线程,
         # 期间用户可能连点"启动"(或托盘/小窗同时触发), 必须挡住重复启动。
         self._starting = False
+        # v4.4.12: 一键启动 LOL 单飞标志(避免连点按钮导致多线程同时点登录器)
+        self._lol_launching = False
+        # v4.4.12: 鼠标点击录制器(全局低级钩子, 见 lcu/recorder.py)
+        self._recorder = _ClickRecorder()
+        self._rec_rect = None
+        # v4.4.13: 录制前的"准备登录器"单飞标志
+        self._rec_preparing = False
+        # v4.4.16: 「全部停止」单飞标志
+        self._stopping_all = False
+        # v4.4.16: 连上客户端后自动启动脚本 —— 延时用主线程单发定时器 + 去重标志
+        self._auto_start_fired = False
+        self._auto_start_timer = QTimer(self)
+        self._auto_start_timer.setSingleShot(True)
+        self._auto_start_timer.timeout.connect(self._do_auto_start_on_connect)
         self._last_icon_id = 0
 
         # v13 优化项 2:对局即将开始 → 1.5s 后隐藏小窗。
@@ -1098,6 +1138,69 @@ class AppController(QObject):
             self._set_ui_connected(connected, name)
         except Exception as e:
             print(f'[App] 连接处理异常: {type(e).__name__}: {e}')
+
+    def _maybe_auto_start_on_connect(self):
+        """v4.4.16(用户要求): 连上客户端后, 等 x 秒自动启动脚本。
+
+        设计约束(都是实际会踩的坑):
+          - **只触发一次/每段连接**: 用 _auto_start_fired 去重, 断开时复位。否则
+            探活抖动(连上→掉线→连上)会把脚本反复拉起。
+          - 脚本已经在跑就不动; 用户手动停过也不再自动拉起(尊重用户意图)。
+          - 用 singleShot 定时器在主线程计时, 断开时取消。
+        """
+        try:
+            s = self._main.get_settings() if self._main else {}
+            if not s.get('auto_start_on_connect'):
+                return
+            if getattr(self, '_auto_start_fired', False):
+                return
+            try:
+                delay = int(s.get('auto_start_on_connect_delay', 5) or 0)
+            except Exception:
+                delay = 5
+            delay = max(0, min(120, delay))
+            if self._core.is_running or self._starting:
+                print('[自动启动] 脚本已在运行/正在启动, 跳过')
+                self._auto_start_fired = True
+                return
+            self._auto_start_fired = True
+            print(f'[自动启动] 已连上客户端, {delay} 秒后自动启动脚本')
+            try:
+                if self._main:
+                    self._main.append_log(f'[自动启动] 已连上客户端, {delay} 秒后启动脚本')
+            except Exception:
+                pass
+            try:
+                self._auto_start_timer.stop()
+            except Exception:
+                pass
+            self._auto_start_timer.start(max(0, delay) * 1000 + 1)
+        except Exception as e:
+            print(f'[自动启动] 判定异常: {type(e).__name__}: {e}')
+
+    @ui_slot
+    def _do_auto_start_on_connect(self):
+        """延时到点 → 真正启动脚本(主线程)。"""
+        try:
+            if not self._ui_connected:
+                print('[自动启动] 定时到点时已断开, 取消')
+                return
+            if self._core.is_running or self._starting:
+                return
+            print('[自动启动] 延时到点, 启动脚本')
+            self._start()
+        except Exception as e:
+            print(f'[自动启动] 启动异常: {type(e).__name__}: {e}')
+
+    def _cancel_auto_start_on_connect(self):
+        """断开连接 → 取消待触发的自动启动, 并复位去重标志。"""
+        try:
+            if self._auto_start_timer is not None and self._auto_start_timer.isActive():
+                self._auto_start_timer.stop()
+                print('[自动启动] 连接已断开, 取消待触发的自动启动')
+        except Exception:
+            pass
+        self._auto_start_fired = False
 
     def _on_bench(self, ids, cur_id=None):
         try:
@@ -1902,8 +2005,13 @@ class AppController(QObject):
             # 立即后台补拉一次 —— 修复"先开脚本后开游戏,数据永是旧缓存"场景
             if not getattr(self, '_champ_refresh_started', False):
                 self._start_remote_champ_refresh()
+            # v4.4.16: 连上客户端后自动启动脚本(用户要求, 可设延时)
+            self._maybe_auto_start_on_connect()
         elif not connected and self._ui_connected:
             self._ui_connected = False
+            # v4.4.16: 连接断了 → 撤销"自动启动"的待触发计时(否则会在已断开时
+            # 突然把脚本拉起来, 而客户端根本不在)
+            self._cancel_auto_start_on_connect()
             # v4.1.39:重置头像下载去重标记 —— 否则同账号重连后 icon_id 不变,
             # 永不重新走缓存/下载链路,界面头像停在 🎮/旧状态
             self._last_icon_id = 0
@@ -1966,6 +2074,368 @@ class AppController(QObject):
             return False
 
     # ==================== 控制 ====================
+    def _launch_lol(self):
+        """一键启动 LOL。GUI 线程立即返回, 实际工作在后台线程。
+
+        v4.4.15(用户明确要求)的两种行为:
+          ① **没录制过**(默认) → 只把登录器打开、跳过 WeGame, 界面交给用户自己操作,
+             不做任何模拟点击; 因此**也不需要管理员权限**。
+          ② **录过屏** → 除启动外, 还按录制内容自动模拟点击, 复刻用户操作; 因为
+             登录器是提权进程(TCLS\\client.exe), 点击会被 UIPI 丢弃, 所以要先提权。
+        """
+        if self._lol_launching:
+            print('[启动LOL] 已在启动中, 忽略重复请求')
+            return
+
+        has_steps = self._lol_steps_from_settings() is not None
+        if has_steps:
+            # 只有要模拟点击时才需要管理员权限
+            if not self._elevate_for_lol(action='launch'):
+                return
+        else:
+            print('[启动LOL] 未录制点击流程 → 只启动登录器, 不做模拟点击(无需管理员权限)')
+
+        self._lol_launching = True
+        print('[启动LOL] 正在启动英雄联盟…')
+        threading.Thread(target=self._lol_launch_worker, daemon=True,
+                         name='lol-launch').start()
+
+    def _lol_steps_from_settings(self):
+        """读取录制步骤。返回 list 或 None(=没有可用步骤, 即从未录制过)。
+
+        v4.4.15: 调用方只需要知道"要不要模拟点击", 所以"没录制"和"录了但是空"
+        统一按 None 处理。
+        """
+        try:
+            raw = (self._main.get_settings() or {}).get('lol_steps') or []
+            parsed = []
+            for item in raw:
+                if isinstance(item, (list, tuple)) and len(item) >= 3:
+                    parsed.append((f'录制步骤{len(parsed) + 1}',
+                                   float(item[0]), float(item[1]), float(item[2])))
+            return parsed if parsed else None
+        except Exception as e:
+            print(f'[启动LOL] 读取录制步骤失败: {type(e).__name__}: {e}')
+            return None
+
+    def _elevate_for_lol(self, action: str = 'launch') -> bool:
+        """一键启动/全部停止 前的管理员权限检查。
+
+        为什么必须(两个动作都要):
+          - **launch + 有录制步骤**: LOL 原生登录器以管理员权限运行, 非管理员进程
+            注入的鼠标点击会被 UIPI 静默丢弃(实测 click_at 返回 'uipi-blocked')。
+          - **stop_all**: LOL 客户端以管理员权限运行, 非管理员进程 taskkill 会
+            `Access is denied`(实测), 根本关不掉。
+        (注意: "只启动登录器、不模拟点击"的默认路径**不需要**提权, 调用方自行跳过。)
+
+        action: 'launch'(启动并模拟点击) 或 'stop_all'(关闭 LOL)。
+        返回 True  = 已是管理员, 调用方可继续;
+             False = 已触发提权重启, 或用户取消了 UAC, 调用方应中止本次流程。
+        """
+        if self._elevate_requested:
+            return False
+        try:
+            from lcu.clicker import is_admin
+            if is_admin():
+                return True
+        except Exception:
+            # 判定失败按"有权限"处理继续走 —— click_at 自带 UIPI 侦查, 真被拦
+            # 会给出明确原因, 不会静默假成功。
+            return True
+
+        is_stop = (action == 'stop_all')
+        flag = '--stop-all' if is_stop else '--launch-lol'
+        tag = '[全部停止]' if is_stop else '[启动LOL]'
+        try:
+            box = QMessageBox(self._main)
+            box.setWindowTitle('需要管理员权限')
+            if is_stop:
+                box.setText('「全部停止」需要以管理员身份运行。')
+                box.setInformativeText(
+                    '英雄联盟客户端以管理员权限运行；普通权限下无法结束它'
+                    '（表现就是点了没反应、LOL 还开着）。\n\n'
+                    '接下来会弹出 UAC 窗口，请点「是」——程序将以管理员权限自动重启，'
+                    '并在重启后自动继续关闭 LOL。')
+            else:
+                box.setText('「一键启动 LOL」需要以管理员身份运行。')
+                box.setInformativeText(
+                    '英雄联盟登录器本身以管理员权限运行；普通权限下模拟点击会被 '
+                    'Windows 拦截（表现就是点了没反应）。\n\n'
+                    '接下来会弹出 UAC 窗口，请点「是」——程序将以管理员权限自动重启，'
+                    '并在重启后自动继续启动 LOL。')
+            box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            box.setDefaultButton(QMessageBox.Ok)
+            if box.exec_() != QMessageBox.Ok:
+                print(f'{tag} 用户取消了管理员授权')
+                return False
+        except Exception as e:
+            print(f'{tag} 提权提示框异常: {type(e).__name__}: {e}')
+
+        r = 0
+        try:
+            shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+            shell32.ShellExecuteW.argtypes = [
+                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+            shell32.ShellExecuteW.restype = ctypes.c_size_t
+            exe = sys.executable
+            if getattr(sys, 'frozen', False):
+                cwd = os.path.dirname(exe)
+                params = flag
+            else:
+                cwd = os.getcwd()
+                params = f'"{os.path.abspath(__file__)}" {flag}'
+            r = shell32.ShellExecuteW(None, 'runas', exe, params, cwd, 1)
+            print(f'{tag} ShellExecuteW(runas) 返回 {r}')
+        except Exception as e:
+            print(f'{tag} 提权异常: {type(e).__name__}: {e}')
+            return False
+        if r <= 32:
+            print(f'{tag} UAC 未授权(返回值 {r})')
+            return False
+
+        self._elevate_requested = True
+        print(f'{tag} 已请求管理员权限, 旧实例 1.5s 后退出, 由管理员实例自动继续')
+        QTimer.singleShot(1500, lambda: self._quit_for_admin_handoff())
+        return False
+
+    def _lol_launch_worker(self):
+        """一键启动 LOL 的阻塞部分(后台 daemon 线程)。"""
+        ok, msg = False, ''
+        try:
+            def on_status(text):
+                print(f'[启动LOL] {text}')
+
+            # v4.4.15: 只认用户**录制**的步骤。没录过就是 None → run_flow 只启动
+            # 登录器、不做任何模拟点击(不再有"内置默认步骤"兜底, 见 launcher 注释)。
+            steps = self._lol_steps_from_settings()
+            if steps:
+                print(f'[启动LOL] 使用录制步骤 {len(steps)} 步')
+            else:
+                print('[启动LOL] 未录制点击流程 → 本次只启动登录器')
+
+            ok, msg = _lol_launcher.run_flow(
+                self._conn,
+                steps=steps,
+                on_status=on_status,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            msg = f'{type(e).__name__}: {e}'
+        self._lol_launch_done_sig.emit(ok, msg)
+
+    @ui_slot
+    def _on_lol_launch_done(self, ok, msg):
+        """一键启动 LOL 完成 → 主线程收尾。"""
+        self._lol_launching = False
+        if ok:
+            print(f'[启动LOL] ✅ {msg}')
+            # 连上大厅后, 若用户之前没跑脚本, 无需自动启动脚本; 仅提示
+        else:
+            print(f'[启动LOL] ❌ {msg}')
+            try:
+                QMessageBox.information(
+                    self._main, '启动 LOL',
+                    f'{msg}\n\n提示: 若提示凭证过期或缺少按钮坐标, '
+                    f'请先手动启动一次, 并在设置页标定按钮位置。')
+            except Exception:
+                pass
+
+    # ==================== 一键启动 LOL 录制 ====================
+    @ui_slot
+    def _on_record_lol(self):
+        """设置页「开始录制 / 停止录制 (F9)」。
+
+        v4.4.12: 登录器是自绘 UI, 靠猜坐标连改 7 版都在"某一步点空"上打转。
+        改成录制: 用户手动走一遍完整流程, 程序用全局鼠标钩子原样记下每次点击的
+        位置与间隔(见 lcu/recorder.py), 之后一键回放。
+        v4.4.13: 登录器没起来时**自动把它拉起来**(只启动不点击), 不再要求用户先点
+        首页按钮 —— 那个按钮会跑完整自动化把界面点乱, 反而没东西可录。
+        """
+        rec = self._recorder
+        if rec is None:
+            return
+        # --- 录制中 → 停止 ---
+        if rec.is_running:
+            self._finish_recording()
+            return
+
+        # --- 开始录制: 先把登录器准备好(不点击任何按钮) ---
+        win = _lol_launcher.find_window()
+        if not win:
+            # 启动 + 等窗口 + 稳定期最长可能 60s+15s, 绝不能卡在 GUI 线程里 ——
+            # 交给后台线程, 完成后经 _rec_prep_done_sig 排回主线程继续。
+            if self._rec_preparing:
+                print('[录制] 正在准备登录器, 忽略重复请求')
+                return
+            self._rec_preparing = True
+            try:
+                if self._main:
+                    self._main.append_log('[录制] 正在启动登录器, 请稍候…')
+            except Exception:
+                pass
+            print('[录制] 登录器未启动, 后台拉起(不点击任何按钮)…')
+            threading.Thread(target=self._rec_prep_worker, daemon=True,
+                             name='rec-prep').start()
+            return
+
+        self._begin_recording_with_window(win)
+
+    def _rec_prep_worker(self):
+        """后台: 只启动登录器 + 等窗口稳定, 不做任何点击。"""
+        win = None
+        try:
+            win = _lol_launcher.prepare_for_recording(
+                on_status=lambda m: print(f'[录制] {m}'))
+        except Exception as e:
+            print(f'[录制] 准备登录器异常: {type(e).__name__}: {e}')
+        self._rec_prep_done_sig.emit(win if win else None)
+
+    @ui_slot
+    def _on_rec_prep_done(self, win):
+        """登录器准备好 → 主线程继续开录。"""
+        self._rec_preparing = False
+        if not win:
+            try:
+                QMessageBox.warning(
+                    self._main, '开始录制',
+                    '无法启动 LOL 登录器（未找到 TCLS\\client.exe）。\n\n'
+                    '请确认已安装英雄联盟。')
+            except Exception:
+                print('[录制] 登录器准备失败')
+            return
+        self._begin_recording_with_window(win)
+
+    def _begin_recording_with_window(self, win):
+        """拿到登录器窗口后真正开录(弹提示 → 装钩子 → 隐藏主窗)。"""
+        rec = self._recorder
+        if rec is None:
+            return
+        rect = (win['left'], win['top'], win['right'], win['bottom'])
+
+        # 顺序很重要: **先**弹提示(主窗还可见, 提示框有正常父窗口), 用户点掉之后
+        # 再装钩子 + 隐藏主窗 —— 否则提示框会挂在已隐藏的窗口上, 且用户点「确定」
+        # 那一下本身也会被录进去。
+        #
+        # v4.4.17: 文案**不写死登录方式**。原先写的是"QQ登录 → 切换快速登录 → 勾选我
+        # 已阅读 → …"这套完整流程 —— 那只是作者本机的一种走法。别人可能用微信登录、
+        # 账号密码登录、扫码、或者客户端记住登录态后根本不用登录, 写死只会误导。
+        # 改成通用口径: 你怎么平时进游戏, 就怎么走一遍。
+        try:
+            QMessageBox.information(
+                self._main, '开始录制',
+                '接下来会记录你在登录器上的鼠标点击。\n\n'
+                '请按你平时的习惯，把「从打开登录器到进入游戏」完整走一遍就行\n'
+                '（用什么方式登录都可以：QQ / 微信 / 账号密码 / 扫码…都支持，\n'
+                '  程序只记录你点了哪里、隔多久点的，不关心你点的是什么）。\n\n'
+                '• 从登录器界面开始点，一路点到进入大厅为止\n'
+                '• ⚠️ 录制期间不要拖动登录器窗口\n'
+                '• 走完按键盘 F9 停止录制')
+        except Exception:
+            pass
+
+        if not rec.start(rect):
+            try:
+                QMessageBox.warning(
+                    self._main, '开始录制',
+                    '录入钩子安装失败（可能被安全软件拦截）。\n'
+                    '建议先退出杀软的"鼠标防护/宏拦截"，再试一次。')
+            except Exception:
+                pass
+            print('[录制] 钩子安装失败')
+            return
+
+        self._rec_rect = rect
+        print(f'[录制] 开始录制 (登录器窗口 {win["w"]}x{win["h"]} @({win["left"]},{win["top"]}))')
+        try:
+            self._main.set_recording_ui(True, 0)
+        except Exception:
+            pass
+
+        # 隐藏助手主窗, 免得挡住登录器
+        try:
+            if self._main:
+                self._main.hide()
+        except Exception:
+            pass
+
+        self._rec_btn_timer = QTimer(self)
+        self._rec_btn_timer.timeout.connect(self._tick_recording)
+        self._rec_btn_timer.start(500)
+        self._rec_deadline = _time.monotonic() + self.RECORD_MAX_S
+
+    # v4.4.12: 录制最长时长(秒) —— 用户可能走完流程忘了按 F9, 到点自动收尾,
+    # 免得钩子一直挂着、每次鼠标点击都白记一笔。
+    RECORD_MAX_S = 300.0
+
+    def _tick_recording(self):
+        """录制期间刷新已录步数; 钩子线程检测到 F9 会自行结束, 这里收尾。"""
+        rec = self._recorder
+        if rec is None:
+            return
+        if rec.is_running:
+            try:
+                self._main.set_recording_ui(True, rec.count())
+            except Exception:
+                pass
+            # 忘记按 F9 的兜底: 超时自动停
+            if _time.monotonic() >= getattr(self, '_rec_deadline', 0):
+                print(f'[录制] 已达最长录制时长({self.RECORD_MAX_S:.0f}s), 自动停止')
+                self._finish_recording()
+            return
+        # 钩子已停(用户在 F9 上停了) → 收尾
+        self._finish_recording()
+
+    def _finish_recording(self):
+        """停止录制 → 保存步骤序列 → 恢复 UI。"""
+        rec = self._recorder
+        try:
+            if getattr(self, '_rec_btn_timer', None) is not None:
+                self._rec_btn_timer.stop()
+                self._rec_btn_timer = None
+        except Exception:
+            pass
+        if rec is None:
+            return
+        steps = rec.stop(getattr(self, '_rec_rect', None))
+        n = len(steps)
+        dropped = int(getattr(rec, 'last_dropped', 0) or 0)
+        if dropped:
+            print(f'[录制] 已丢弃 {dropped} 次落在登录器窗口外的点击（点到了别处）')
+        if n:
+            try:
+                self._main.persist_setting('lol_steps',
+                                           [[round(fx, 4), round(fy, 4), round(w, 2)]
+                                            for fx, fy, w in steps])
+            except Exception as e:
+                print(f'[录制] 保存步骤失败: {type(e).__name__}: {e}')
+            print(f'[录制] 已录制 {n} 步并保存')
+            for i, (fx, fy, w) in enumerate(steps, 1):
+                print(f'[录制]   第{i}步 frac=({fx:.4f},{fy:.4f}) 等待{w}s')
+        else:
+            print('[录制] 未录到任何点击, 保持原有步骤不改动')
+        try:
+            self._main.set_recording_ui(False)
+            if self._main:
+                self._main.show()
+                self._main.raise_()
+                self._main.activateWindow()
+        except Exception:
+            pass
+        if not n:
+            try:
+                QMessageBox.information(
+                    self._main, '录制结束',
+                    '没有记录到任何点击。\n\n'
+                    '常见原因：\n'
+                    '• 点击落在了大蛋小助手自己的界面上（只记录登录器上的点击）\n'
+                    '• 还没开始点就按了 F9\n'
+                    '• 鼠标钩子被安全软件拦截（可试着关闭杀软的鼠标防护/宏拦截）\n\n'
+                    '请重新点「开始录制」再走一遍。')
+            except Exception:
+                pass
+
     def _start(self):
         """启动脚本(GUI 线程,必须立即返回)。
 
@@ -2166,6 +2636,94 @@ class AppController(QObject):
             self._start()
 
     @ui_slot
+    def _stop_all(self):
+        """「全部停止」：关掉 LOL，3 秒后再停脚本。
+
+        v4.4.16(用户要求): 顺序按用户指定 —— **先关游戏, 再等 3s, 最后停脚本**。
+        反过来先停脚本的话, 脚本一停就没人处理"客户端断开"的收尾, 而且关 LOL
+        期间脚本还在跑会持续探活失败刷日志。
+
+        ⚠️ 权限策略(实测决定): **不预先要管理员**。因为——
+          - 客户端完整运行时, 走 LCU 官方退出接口可以让它自己退出, 无需提权;
+          - 只有"未登录 / 客户端不响应"这种只能强杀的情况才需要管理员。
+        所以这里直接后台跑, 失败了才提示用户提权重试(见 _on_stop_all_done)。
+        一上来就弹 UAC 会平白打断不需要提权的常规流程。
+        """
+        if self._stopping_all:
+            print('[全部停止] 已在执行中, 忽略重复请求')
+            return
+        self._stopping_all = True
+        print('[全部停止] 正在关闭 LOL…')
+        try:
+            if self._main:
+                self._main.append_log('[全部停止] 正在关闭英雄联盟…')
+        except Exception:
+            pass
+        threading.Thread(target=self._stop_all_worker, daemon=True,
+                         name='stop-all').start()
+
+    def _stop_all_worker(self):
+        """后台: 关 LOL → 等 3 秒 → 回主线程停脚本。"""
+        ok, msg = False, ''
+        try:
+            ok, msg = _lol_launcher.quit_client(self._conn)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            msg = f'{type(e).__name__}: {e}'
+        print(f'[全部停止] {("✅ " if ok else "⚠️ ") + msg} → 3 秒后停止脚本')
+        time.sleep(STOP_ALL_DELAY_S)
+        self._stop_all_done_sig.emit(ok, msg)
+
+    @ui_slot
+    def _on_stop_all_done(self, ok, msg):
+        """LOL 关完(或失败) → 主线程停脚本(3 秒已过)并提示。"""
+        self._stopping_all = False
+        try:
+            self._stop()
+        except Exception as e:
+            print(f'[全部停止] 停脚本异常: {type(e).__name__}: {e}')
+        print(f'[全部停止] 脚本已停止（{msg}）')
+        try:
+            if self._main:
+                self._main.append_log(f'[全部停止] {msg}；脚本已停止')
+        except Exception:
+            pass
+        if ok:
+            return
+        # 关不掉(通常是"未登录/客户端不响应"→ 只能强杀, 而强杀要管理员)。
+        # 已经是管理员还失败, 就没有提权这一手可用了, 只如实告知。
+        try:
+            from lcu.clicker import is_admin
+            already_admin = bool(is_admin())
+        except Exception:
+            already_admin = False
+        if already_admin:
+            try:
+                QMessageBox.information(
+                    self._main, '全部停止',
+                    f'{msg}\n\n脚本已停止。\n'
+                    f'当前已是管理员权限仍未能关闭，请手动结束 LOL 进程。')
+            except Exception:
+                pass
+            return
+        # 非管理员 → 问用户要不要提权重试(重启后带 --stop-all 自动继续)
+        try:
+            box = QMessageBox(self._main)
+            box.setWindowTitle('全部停止')
+            box.setText('脚本已停止，但 LOL 没能关闭。')
+            box.setInformativeText(
+                f'{msg}\n\n'
+                f'LOL 以管理员权限运行，普通权限无法强制结束它。\n'
+                f'要现在以管理员身份重启程序、自动把 LOL 关掉吗？')
+            box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            box.setDefaultButton(QMessageBox.Ok)
+            if box.exec_() == QMessageBox.Ok:
+                self._elevate_for_lol(action='stop_all')
+        except Exception:
+            pass
+
+    @ui_slot
     def _minimize_to_tray(self):
         """最小化到托盘"""
         if self._main:
@@ -2185,6 +2743,17 @@ class AppController(QObject):
         # v4.4.0(P0-2): 清掉启动单飞标志 —— 若启动还在后台跑, 收尾后
         # _on_start_done 会走回滚分支, 不会往已关闭的窗口上发信号。
         self._starting = False
+        # v4.4.12: 若正在录制, 退出前必须停掉全局鼠标钩子 —— 钩子挂在后台线程上,
+        # 进程活着而线程被强杀会留下系统级钩子悬挂(鼠标响应变卡)。
+        try:
+            if getattr(self, '_rec_btn_timer', None) is not None:
+                self._rec_btn_timer.stop()
+                self._rec_btn_timer = None
+            if self._recorder is not None and self._recorder.is_running:
+                self._recorder.stop(getattr(self, '_rec_rect', None))
+                print('[录制] 退出前已停止录制并卸载鼠标钩子')
+        except Exception:
+            pass
         for t in (self._ui_conn_refresh_timer, self._reconnect_timer, self._mini_log_timer,
                   self._overlay_guard_timer, self._pending_hide_timer):
             try:
@@ -2270,6 +2839,12 @@ class AppController(QObject):
             return
         self._main.start_script_signal.connect(self._start)
         self._main.stop_script_signal.connect(self._stop)
+        # v4.4.5: 首页「一键启动 LOL」按钮
+        self._main.launch_lol_signal.connect(self._launch_lol)
+        # v4.4.12: 设置页「开始录制 / 停止录制」
+        self._main.record_lol_signal.connect(self._on_record_lol)
+        # v4.4.16: 首页「全部停止」
+        self._main.stop_all_signal.connect(self._stop_all)
         self._main.minimize_signal.connect(self._minimize)
         self._main.close_signal.connect(self._minimize_to_tray)
         self._main.settings_changed_signal.connect(self._on_settings)
@@ -2314,6 +2889,8 @@ class AppController(QObject):
             'auto_play_again': '自动返回', 'auto_play_again_delay': '返回延迟',
             'auto_select_champion': '自动选英雄', 'auto_pick_champion': '自动换英雄',
             'preferred_champions': '偏好英雄',
+            'auto_start_on_connect': '连上客户端自动启动脚本',
+            'auto_start_on_connect_delay': '自动启动延时',
         }
         for k, v in settings.items():
             if k in label and k not in ('preferred_champions',):
@@ -2584,6 +3161,16 @@ class AppController(QObject):
         # 普通启动的场景, 点卡会被 UIPI 拦截)。延迟 800ms 避开首帧渲染, 且须知弹窗
         # (首次启动)已在前面 singleShot 触发, 若 auto_select 开着会在此引导提权。
         QTimer.singleShot(800, self._maybe_elevate_on_startup)
+        # v4.4.7: 提权重启后自动继续「一键启动 LOL」
+        # (_elevate_for_lol 用 ShellExecuteW(runas) 时把 --launch-lol 作为参数传入,
+        #  管理员实例起来后据此接管, 用户不用再点第二次按钮。)
+        if '--launch-lol' in sys.argv:
+            print('[启动LOL] 检测到 --launch-lol(提权后接管), 1.5s 后自动继续')
+            QTimer.singleShot(1500, self._launch_lol)
+        # v4.4.16: 「全部停止」提权重启后自动继续关 LOL
+        if '--stop-all' in sys.argv:
+            print('[全部停止] 检测到 --stop-all(提权后接管), 1.5s 后自动继续')
+            QTimer.singleShot(1500, self._stop_all)
         # v4.1.55: 首次启动强制阅读须知(30s)。splash 淡出后再弹，避免视觉叠加。
         if splash:
             QTimer.singleShot(600, self._main.show_first_launch_agreement)

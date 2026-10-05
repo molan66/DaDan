@@ -114,6 +114,63 @@ def _rank_text(entry) -> str:
     return f'{base} · {lp}胜点'
 
 
+# v4.4.18: 首页右侧竖排的三枚主行动按钮(一键启动 LOL / 启动脚本 / 全部停止)
+# 统一到**同一个样式工厂** —— 用户看截图指出「全部停止」与上面两枚不像一套:
+#   原来 全部停止 = 透明底 + 红描边 + 高40 + 字号13 + 字重600
+#   而   另两枚   = 实心渐变 + 无边框 + 高44 + 字号16 + 字重700
+# 现在几何/字号/字重/交互位移全部共用, 只有配色按语义取(绿=前进, 蓝=品牌主色, 红=终止)。
+_BTN_W = 170          # 三枚按钮统一宽度
+_BTN_H = 44           # 三枚按钮统一高度
+
+
+def _action_btn_qss(variant: str = 'primary') -> str:
+    """首页主行动按钮样式(单一来源)。
+
+    variant:
+        'accent'      —— 一键启动 LOL：翠绿, 表达"前进/执行"
+        'primary'     —— 启动脚本(空闲)：靛蓝品牌主色
+        'danger'      —— 启动脚本(运行中→"停止脚本")：红
+        'danger_deep' —— 全部停止：比上面更深一档的红
+
+    为什么 全部停止 用更深一档而不是同色: 脚本跑起来时「启动脚本」那枚本身也会变红,
+    两枚同色同尺寸会看着像同一个按钮; 靠**深浅 + 文案**区分, 既保持一套观感又不会认错。
+    四档的几何(宽高/圆角/字号/字重/按下位移)完全一致 —— 这是本次统一的核心。
+    """
+    if variant == 'accent':
+        c1, c2 = Glass.ACCENT_HOVER, Glass.ACCENT_DARK
+        h1, h2 = Glass.ACCENT, Glass.ACCENT_PRESSED
+        pressed = Glass.ACCENT_PRESSED
+    elif variant == 'danger':
+        # 与改版前的 _fab_qss(True) 逐字一致, 保证"停止脚本"观感零回归
+        c1, c2 = Glass.DANGER, Glass.STOP_RED
+        h1, h2 = Glass.STOP_RED, Glass.STOP_RED_HOVER
+        pressed = Glass.STOP_RED_PRESSED
+    elif variant == 'danger_deep':
+        c1, c2 = Glass.DANGER_DARK, Glass.STOP_RED_HOVER
+        h1, h2 = Glass.STOP_RED_HOVER, Glass.STOP_RED_PRESSED
+        pressed = Glass.STOP_RED_PRESSED
+    else:   # 'primary'
+        c1, c2 = Glass.PRIMARY_HOVER, Glass.PRIMARY
+        h1, h2 = Glass.PRIMARY, Glass.PRIMARY_PRESSED
+        pressed = Glass.PRIMARY_PRESSED
+    return f"""
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {c1}, stop:1 {c2});
+                color: white; border: none;
+                border-radius: {Glass.RADIUS_BTN};
+                font-size: {Glass.FONT_SIZE_XL}; font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {h1}, stop:1 {h2});
+            }}
+            QPushButton:pressed {{
+                background: {pressed}; padding-top: 2px;
+            }}
+        """
+
+
 def _fab_qss(running: bool) -> str:
     """启动/停止按钮的完整样式表(单一来源)。
 
@@ -125,37 +182,10 @@ def _fab_qss(running: bool) -> str:
        逐字相同, 改一处必漏另一处; 红色三档 hex 也硬编在 _do_run 里。
        现在四态样式只此一处, 色值取 Glass.STOP_RED* / PRIMARY*。
     """
-    if running:
-        return f"""
-            QPushButton {{
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 {Glass.DANGER}, stop:1 {Glass.STOP_RED});
-                color: white; border: none; border-radius: {Glass.RADIUS_BTN};
-                font-size: {Glass.FONT_SIZE_XL}; font-weight: 700;
-            }}
-            QPushButton:hover {{
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 {Glass.STOP_RED}, stop:1 {Glass.STOP_RED_HOVER});
-            }}
-            QPushButton:pressed {{
-                background: {Glass.STOP_RED_PRESSED}; padding-top: 2px;
-            }}
-        """
-    return f"""
-            QPushButton {{
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 {Glass.PRIMARY_HOVER}, stop:1 {Glass.PRIMARY});
-                color: white; border: none; border-radius: {Glass.RADIUS_BTN};
-                font-size: {Glass.FONT_SIZE_XL}; font-weight: 700;
-            }}
-            QPushButton:hover {{
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 {Glass.PRIMARY}, stop:1 {Glass.PRIMARY_PRESSED});
-            }}
-            QPushButton:pressed {{
-                background: {Glass.PRIMARY_PRESSED}; padding-top: 2px;
-            }}
-        """
+    # v4.4.18: 委托给 _action_btn_qss —— 两态配色与工厂里的 'danger'/'primary'
+    # 逐字一致, 留两份实现迟早会漂移(改了一处忘了另一处)。保留本函数是因为
+    # _do_run 与构造点都按"running 布尔"调用, 语义比 variant 字符串更直观。
+    return _action_btn_qss('danger' if running else 'primary')
 
 
 # v4.4.1(UI-B1): Toast 语义类型 → 左侧 3px 色条。键就是 kind 取值。
@@ -590,6 +620,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     stop_script_signal = pyqtSignal()
     minimize_signal = pyqtSignal()
     close_signal = pyqtSignal()
+    # v4.4.5: 首页「一键启动 LOL」按钮
+    launch_lol_signal = pyqtSignal()
+    # v4.4.12: 设置页「开始录制 / 停止录制」→ main 控制全局鼠标钩子
+    record_lol_signal = pyqtSignal()
+    # v4.4.16: 首页「全部停止」→ main 关掉 LOL 并 3 秒后停脚本
+    stop_all_signal = pyqtSignal()
     settings_changed_signal = pyqtSignal(dict)
     # v34: 用户在设置页打开"自动选英雄" → 由 main 决定是直接开还是提权重启
     auto_select_champion_request_signal = pyqtSignal()
@@ -629,6 +665,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._aug_icon_cb = None
         self._aug_dl_cb = None
         self._detail_dlg = None
+        # v4.4.12: 一键启动 LOL 的录制状态(label 引用已随录制卡片重构移除)
         # v4.4.0 修复(P1-23): 生成式占位头像缓存 (icon_id, 首字, dpr, side) -> QPixmap
         self._avatar_gen_cache = {}
         self._init_ui()
@@ -839,6 +876,26 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl.addLayout(status_row)
         lay.addWidget(card)
 
+        # ===== 一键启动 LOL(跳过 WeGame 主面板) =====
+        # v4.4.6: 按钮改放到「启动脚本」正上方(同一右侧竖排), 不再单独占一张卡片;
+        # 宽度与 fab 一致(170)且同为右对齐, 两枚按钮上下严丝合缝。
+        # v4.4.18: 样式改走 _action_btn_qss 工厂, 与另两枚统一几何与字号。
+        self._launch_lol_btn = QPushButton('🚀  一键启动 LOL')
+        self._launch_lol_btn.setFixedSize(_BTN_W, _BTN_H)
+        self._launch_lol_btn.setCursor(Qt.PointingHandCursor)
+        self._launch_lol_btn.setStyleSheet(_action_btn_qss('accent'))
+        self._launch_lol_btn.clicked.connect(self._on_launch_lol)
+
+        # v4.4.15: 按钮下方一行小字, 说明当前是"只启动"还是"启动+自动点击"。
+        # 用户明确要求默认只打开登录器、录制后才模拟点击, 这里让状态一眼可见。
+        self._launch_lol_hint = QLabel('')
+        self._launch_lol_hint.setWordWrap(True)
+        self._launch_lol_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._launch_lol_hint.setFixedWidth(170)
+        self._launch_lol_hint.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        self._refresh_launch_hint()
+
         # ===== 账号信息卡(v37:四行规范结构, 挪到红框位置) =====
         acct_card = GlassCard()
         # v4.1.48: 按用户截图红框宽 = 380, 给账号卡固定宽让右侧 fab 区域稳定;
@@ -1008,13 +1065,23 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         # v4.1.45: 缩到 170x44, 原 200x50 + acct 实测 404 + spacing 12 = 616
         # > 内容区 564 → fab 起点 516+200=716 > 窗口 680 越界 36px
         self._fab = QPushButton('⚡  启动脚本')
-        self._fab.setFixedSize(170, 44)
+        self._fab.setFixedSize(_BTN_W, _BTN_H)
         self._fab.setCursor(Qt.PointingHandCursor)
         # v4.4.1(UI-A1): 样式表抽到模块级 _fab_qss(), 与 _do_run 共用同一份,
         # 字号统一 FONT_SIZE_XL(原先这里 14px、_do_run 里 16px, 点一下跳一号)。
         self._fab.setStyleSheet(_fab_qss(False))
         self._fab.clicked.connect(self._on_start)
         lay.addStretch()
+
+        # v4.4.16: 「全部停止」—— 关掉 LOL 并停脚本(用户要求放在「启动脚本」下方)
+        # v4.4.18: 原先是"透明底 + 红描边 + 高40 + 字号13", 与上面两枚实心渐变按钮
+        # 明显不是一套(用户看截图指出)。现改走同一工厂: 实心渐变 + 同尺寸同字号,
+        # 只把颜色换成更深一档的红(避免与"运行中的启动脚本"那枚红撞色)。
+        self._stop_all_btn = QPushButton('⏹  全部停止')
+        self._stop_all_btn.setFixedSize(_BTN_W, _BTN_H)
+        self._stop_all_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_all_btn.setStyleSheet(_action_btn_qss('danger_deep'))
+        self._stop_all_btn.clicked.connect(self._on_stop_all)
 
         # v37c:底部横排 = 账号信息卡(左下) + 启动按钮(右下) 同处一行。
         # 此前账号卡整行塞在按钮下方会把按钮顶离底部, 现在按钮保持右下贴底不动。
@@ -1026,8 +1093,17 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         bottom.setSpacing(12)
         bottom.addWidget(acct_card)                 # 账号卡占左侧(可随空间伸缩)
         bottom.addStretch(1)                        # 弹性把按钮推到右侧
-        # fab 170x44 fixed: HBox 不会拉伸, AlignBottom 让 fab 贴底
-        bottom.addWidget(self._fab, 0, Qt.AlignBottom | Qt.AlignRight)
+        # v4.4.6: 右侧改为竖排 —— 「一键启动 LOL」在上、「启动脚本」在下,
+        # 两枚同为 170x44 且右对齐; 组内顶部 addStretch 让整组贴底。
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(8)
+        right_col.addStretch(1)
+        right_col.addWidget(self._launch_lol_hint, 0, Qt.AlignRight)
+        right_col.addWidget(self._launch_lol_btn, 0, Qt.AlignRight)
+        right_col.addWidget(self._fab, 0, Qt.AlignRight)
+        right_col.addWidget(self._stop_all_btn, 0, Qt.AlignRight)
+        bottom.addLayout(right_col)
         bottom_w = QWidget()
         bottom_w.setLayout(bottom)
         bottom_w.setStyleSheet('background:transparent;')
@@ -1058,6 +1134,13 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         lay.addWidget(self._make_delay_card('自动匹配', 'auto_queue', 'auto_queue_delay', 2, 0, 30, '进入房间后自动开始匹配'))
         lay.addWidget(self._make_delay_card('自动接受', 'auto_accept', 'auto_accept_delay', 1, 0, 15, '匹配成功后自动接受对局'))
         lay.addWidget(self._make_delay_card('自动返回', 'auto_play_again', 'auto_play_again_delay', 2, 0, 30, '游戏结束后自动返回房间'))
+
+        # v4.4.16(用户要求): 连上客户端后自动启动脚本(可设延时)。
+        # 场景: 开机 → 点「一键启动 LOL」→ 进大厅后不用再点一次「启动脚本」。
+        lay.addWidget(self._make_delay_card(
+            '连上客户端自动启动脚本', 'auto_start_on_connect',
+            'auto_start_on_connect_delay', 5, 0, 120,
+            '检测到连上 LOL 客户端后，等设定秒数自动启动脚本'))
 
         # v34: 自动选英雄(进选人界面2-3 张卡时主动点选; 默认关; 打开时若非管理员则请求提权)
         card = GlassCard()
@@ -1104,9 +1187,167 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
 
         # v4.3.8: 「检查更新」卡片已整体移除(用户明确表示不需要该功能)。
 
+        # v4.4.5: 一键启动 LOL 按钮坐标标定
+        self._add_lol_calibrate_card(lay)
+
         lay.addStretch()
         scroll.setWidget(content)
         return scroll
+
+    def _add_lol_calibrate_card(self, lay):
+        """一键启动 LOL 的「录制 / 回放」卡片(v4.4.12)。
+
+        登录器是自绘 UI 无标准控件, 按钮位置只能靠猜坐标 —— 实测连改 7 版都在
+        "某一步点空"上打转。这里改成让用户**手动走一遍**, 程序原样记下每次点击的
+        位置与间隔(见 lcu/recorder.py), 之后一键复刻, 不再靠猜。
+        """
+        card = GlassCard()
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.setSpacing(8)
+
+        title = QLabel('🚀 一键启动 LOL')
+        title.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
+            f"color:{Glass.TEXT_SECONDARY};background:transparent;")
+        cl.addWidget(title)
+
+        desc = QLabel(
+            '这是「录制回放」功能：录一次，之后一键复刻你的操作。\n'
+            '\n'
+            '没录制时：点首页「一键启动 LOL」只会打开登录器（跳过 WeGame），'
+            '界面交给你自己操作，不会模拟任何点击。\n'
+            '录制之后：再点「一键启动 LOL」就会在启动的同时自动复刻你录下的每一步。\n'
+            '\n'
+            '怎么录：点「开始录制」→ 按你平时的习惯，从登录器一路点到进入游戏 → 按 F9 停止。\n'
+            '登录方式不限：QQ / 微信 / 账号密码 / 扫码都可以，程序只记录你点了哪里、隔多久点。\n'
+            '注意：录制期间不要拖动登录器窗口。')
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        cl.addWidget(desc)
+
+        # 录制状态行
+        rrow = HoverRow()
+        rrow.setStyleSheet('background:transparent;')
+        rl = QHBoxLayout(rrow)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(10)
+        # v4.4.17: 初始文案不再写"使用内置默认步骤" —— v4.4.15 起已彻底删掉默认步骤,
+        # 没录制就是"纯启动不点击"。这段即刻会被下面的 _rec_refresh() 覆盖, 但留个错的
+        # 字面量会误导后来改代码的人。
+        self._rec_state = QLabel('')
+        self._rec_state.setWordWrap(True)
+        self._rec_state.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        rl.addWidget(self._rec_state)
+        rl.addStretch()
+        cl.addWidget(rrow)
+
+        # 按钮行: 开始录制 / 清除
+        brow = QHBoxLayout()
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.setSpacing(10)
+        self._rec_btn = QPushButton('●  开始录制')
+        self._rec_btn.setCursor(Qt.PointingHandCursor)
+        self._rec_btn.setFixedHeight(30)
+        self._rec_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {Glass.ACCENT_SUBTLE}; color: {Glass.ACCENT};
+                border: 1px solid {Glass.ACCENT_BORDER}; border-radius: {Glass.RADIUS_XS}px;
+                font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 12px;
+            }}
+            QPushButton:hover {{ background: {Glass.ACCENT_SOFT}; color: white; }}
+        """)
+        self._rec_btn.clicked.connect(self._on_record_clicked)
+        brow.addWidget(self._rec_btn)
+
+        self._rec_clear_btn = QPushButton('清除录制')
+        self._rec_clear_btn.setCursor(Qt.PointingHandCursor)
+        self._rec_clear_btn.setFixedHeight(30)
+        self._rec_clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {Glass.TEXT_MUTED};
+                border: 1px solid {Glass.BORDER_GLASS}; border-radius: {Glass.RADIUS_XS}px;
+                font-size: {Glass.FONT_SIZE_SM}; padding: 0 10px;
+            }}
+            QPushButton:hover {{ color: {Glass.TEXT_PRIMARY}; border-color: {Glass.BORDER_HOVER}; }}
+        """)
+        self._rec_clear_btn.clicked.connect(self._on_record_clear)
+        brow.addWidget(self._rec_clear_btn)
+        brow.addStretch()
+        cl.addLayout(brow)
+
+        self._rec_refresh()
+        lay.addWidget(card)
+
+    def _rec_refresh(self):
+        """把当前录制状态刷到卡片上(顺带刷新首页按钮那行小字)。"""
+        try:
+            self._refresh_launch_hint()
+        except Exception:
+            pass
+        try:
+            steps = self._settings.get('lol_steps') or []
+            n = len(steps)
+            if n:
+                self._rec_state.setText(
+                    f'✅ 已录制 {n} 步 —— 点首页「一键启动 LOL」会启动登录器并自动复刻这 {n} 步')
+                self._rec_state.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.ACCENT};background:transparent;")
+                self._rec_clear_btn.setEnabled(True)
+            else:
+                self._rec_state.setText(
+                    '⚠️ 还没录制 —— 现在点首页「一键启动 LOL」只会打开登录器，'
+                    '不会模拟任何点击')
+                self._rec_state.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.WARNING};background:transparent;")
+                self._rec_clear_btn.setEnabled(False)
+        except Exception:
+            pass
+
+    def set_recording_ui(self, recording: bool, count: int = 0):
+        """录制中/结束 时由 main 切换按钮文案与状态。"""
+        try:
+            if recording:
+                self._rec_btn.setText('■  停止录制 (F9)')
+                self._rec_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {Glass.DANGER_SUBTLE}; color: {Glass.DANGER};
+                        border: 1px solid {Glass.DANGER}; border-radius: {Glass.RADIUS_XS}px;
+                        font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 12px;
+                    }}
+                    QPushButton:hover {{ background: rgba(248,113,113,0.2); color: white; }}
+                """)
+                self._rec_state.setText(f'🔴 录制中… 已记录 {count} 次点击（走完按 F9）')
+                self._rec_state.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.DANGER};background:transparent;")
+            else:
+                self._rec_btn.setText('●  开始录制')
+                self._rec_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {Glass.ACCENT_SUBTLE}; color: {Glass.ACCENT};
+                        border: 1px solid {Glass.ACCENT_BORDER}; border-radius: {Glass.RADIUS_XS}px;
+                        font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 12px;
+                    }}
+                    QPushButton:hover {{ background: {Glass.ACCENT_SOFT}; color: white; }}
+                """)
+                self._rec_refresh()
+        except Exception:
+            pass
+
+    @ui_slot
+    def _on_record_clicked(self):
+        self.record_lol_signal.emit()
+
+    @ui_slot
+    def _on_record_clear(self):
+        try:
+            self._settings['lol_steps'] = []
+            self._save_settings()
+        except Exception:
+            pass
+        self.set_recording_ui(False)
 
     def _make_delay_card(self, label, toggle_key, delay_key, delay_def, dmin, dmax, desc):
         card = GlassCard()
@@ -1667,6 +1908,35 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         else:
             self.start_script_signal.emit()
 
+    @ui_slot
+    def _on_launch_lol(self):
+        """v4.4.5: 首页「一键启动 LOL」→ 通知 main 执行直启流程。"""
+        self.launch_lol_signal.emit()
+
+    @ui_slot
+    def _on_stop_all(self):
+        """v4.4.16: 首页「全部停止」→ 通知 main 关 LOL + 停脚本。"""
+        self.stop_all_signal.emit()
+
+    def _refresh_launch_hint(self):
+        """刷新首页按钮上方的小字: 当前是"只启动"还是"启动+自动点击"。
+
+        v4.4.15: 用户要求"默认只打开、录制后才模拟点击", 这行字让状态一眼可见,
+        不用去设置页翻。
+        """
+        try:
+            n = len(self._settings.get('lol_steps') or [])
+            if n:
+                self._launch_lol_hint.setText(f'已录制 {n} 步：启动并自动点击')
+                self._launch_lol_hint.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.ACCENT};background:transparent;")
+            else:
+                self._launch_lol_hint.setText('未录制：仅启动，不自动点击')
+                self._launch_lol_hint.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        except Exception:
+            pass
+
     def _toggle(self, key, checked, btn):
         self._on_setting(key, checked)
 
@@ -2208,10 +2478,17 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             'auto_queue': True, 'auto_queue_delay': 2,
             'auto_accept': True, 'auto_accept_delay': 1,
             'auto_play_again': True, 'auto_play_again_delay': 2,
+            # v4.4.16: 连上客户端后自动启动脚本(默认关 —— 用户要显式开启才生效),
+            # 延时默认 5 秒(给客户端进大厅后的首帧/账号信息加载留点时间)。
+            'auto_start_on_connect': False, 'auto_start_on_connect_delay': 5,
             'auto_select_champion': False,   # v34: 进选人自动选英雄(默认关)
             'auto_pick_champion': True,      # 锁后自动换 bench(默认开, 保留旧行为)
             'preferred_champions': [],       # v41: 移除死配置 'queue_id', 队列从 session 取
             'agreement_accepted': False,     # v4.1.55: 首次启动强制阅读须知(30s)后置 True
+            # v4.4.12: 一键启动 LOL 的步骤序列 —— 由设置页「开始录制」写入
+            # (用户手动走一遍, 全局鼠标钩子原样记录 fx/fy/间隔)。为空则回退到
+            # lcu/launcher.py 的 DEFAULT_STEPS。
+            'lol_steps': [],
             # v4.3.7: 移除 'update_url' —— 自定义更新源设置项已删(不再有对外
             # 发布/更新检查的打算, 不需要在软件里手填地址)。旧的 settings.json
             # 里若还留着这个键, defaults.update() 会把它带进来, 但已无人读取, 无害。
