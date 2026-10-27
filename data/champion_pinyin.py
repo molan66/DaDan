@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """英雄拼音搜索索引(自动生成,勿手改)
-生成脚本为开发期工具,不随本仓库分发;新增英雄后按同一格式(v4.5.0 前由
-tools/gen_champion_pinyin.py 生成)补齐即可。
+生成方式: python tools/gen_champion_pinyin.py
 f=全拼(子串匹配)  a=缩写(前缀匹配)
 """
 

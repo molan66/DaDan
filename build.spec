@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # ============================================================
 #  build.spec - PyInstaller 打包配置（大蛋小助手）
-#  说明：本 spec 全程使用相对路径（基于 SPECPATH），换机器/换目录均可直接打包：
+#  说明：与 E:\DaDan\build.spec 同等行为，但做了一些可移植性改进：
 #    1. icon 使用相对路径，避免换电脑后路径失效
 #    2. datas 同时打包 icon_cache 目录下的预热头像（如有）
 #    3. 显式声明 requests/websocket-client 的隐藏依赖
@@ -74,7 +74,7 @@ VSVersionInfo(
          StringStruct('FileDescription', '大蛋小助手 - 英雄联盟客户端助手'),
          StringStruct('FileVersion', '%(ver)s'),
          StringStruct('InternalName', 'dadan-assistant'),
-         StringStruct('LegalCopyright', 'GNU AGPL-3.0-or-later'),
+         StringStruct('LegalCopyright', '仅限个人自用'),
          StringStruct('OriginalFilename', '大蛋小助手.exe'),
          StringStruct('ProductName', '大蛋小助手'),
          StringStruct('ProductVersion', '%(ver)s')])
@@ -141,6 +141,13 @@ a = Analysis(
         'idna',
         'websocket',
         'psutil',  # v31 点卡模块用来按进程名枚举 LOL 客户端窗口
+        # v4.7.0 授权模块**必须显式列出**：它们是"用到才 import"的
+        # (main.py 里写在函数内、UI 里写在槽里), 静态分析一旦漏掉,
+        # 打包出来的 exe 会在**用户点"激活"那一刻**才 ImportError ——
+        # 而 console=False 下没有任何提示, 表现为"点了没反应", 极难排查。
+        'core.licensing',
+        'core.license_crypto',
+        'ui.activation_dialog',
     ],
     hookspath=[],
     hooksconfig={},
@@ -220,6 +227,28 @@ pyz = PYZ(a.pure, cipher=block_cipher)
 # icon 缺失则回退到 None（PyInstaller 允许）
 exe_icon = icon_ico if os.path.isfile(icon_ico) else None
 
+# ============ v4.6.6: 关于 onefile 解压目录(调查结论) ============
+# 问题(实测): 用户关闭程序后进程不退出, 卡在一个 PyInstaller 自己的警告框上:
+#     "Failed to remove temporary directory: C:\Users\<用户>\AppData\Local\Temp\_MEI00003fc02"
+# 根因: onefile 要把整包解压到系统临时目录、退出时再删; 而 VCRUNTIME140*.dll 在
+# 进程存活期间一直映射着, 删除必然失败 → bootloader 弹模态框 → 进程停在那里不退。
+# 实测 C 盘 Temp 堆积 37 个 _MEI*(147.88 MB), 其中 **31 个是空目录** ——
+# 说明文件基本删干净了, 只是目录本身没删掉(退出瞬间还被占用, 事后随手可删)。
+#
+# ⚠️ 我**试过**用 runtime_tmpdir 把解压目录挪走, 结论是**不可行**, 故不用它:
+#   · 相对路径(如 'data/_runtime'): 实测其解析基准是**进程当前工作目录**,
+#     不是 exe 所在目录。从 D:\AI\大蛋小助手 启动就被解压到
+#     D:\AI\大蛋小助手\data\_runtime; 换个工作目录(快捷方式/别的盘)就会落到
+#     意外位置, 甚至因无权限直接启动失败。**不可靠**。
+#   · 绝对路径: 会被逐字写进 exe(bootloader 选项 pyi-runtime-tmpdir),
+#     等于把打包机的目录硬编进去; 在打包机上"看似能用", 换台机器/换目录就失效。
+#   两者都不可取, 所以这里**保持 PyInstaller 默认**(解压到系统临时目录)。
+#
+# ✅ 真正的解法放在程序侧: main._cleanup_stale_runtime_dirs() 在**每次启动时**
+#    清掉历史 _MEI* 残骸。进程退出那一刻它自己的目录注定删不干净, 与其在退出
+#    路径上较劲, 不如交给下一次启动 —— 这样垃圾就不会累积。
+#    已实测: 启动时 C 盘 _MEI* 从 3 降到 1(清掉死进程残留), 且不再新增累积。
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -238,4 +267,7 @@ exe = EXE(
     icon=exe_icon,
     # v4.4.0: 写入 Windows 版本资源(见文件开头), 让 exe「属性 → 详细信息」有版本号
     version=version_file,
+    # v4.6.6: 这里**有意不设** runtime_tmpdir —— 详见上方长篇说明:
+    # 相对路径以工作目录为基准(不可靠), 绝对路径硬编打包机路径(不可移植)。
+    # 解压残骸改由程序启动时自清理(main._cleanup_stale_runtime_dirs)。
 )

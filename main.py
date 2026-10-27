@@ -27,17 +27,16 @@ from PyQt5.QtGui import QIcon, QPixmap, QFont, QPainter, QColor, QBrush, QPainte
 from lcu.connector import LCUConnector
 from lcu.api import LCUAPI
 from lcu.websocket_listener import WebSocketListener
-# v4.4.5: 一键启动 LOL(跳过 WeGame 主面板, 直启独立登录器)
+# v4.4.5: 启动 LOL(跳过 WeGame 主面板, 直启独立登录器)
 from lcu import launcher as _lol_launcher
-# v4.4.12: 录制登录器点击(全局鼠标钩子) —— 替代靠猜坐标的固定步骤
-from lcu.recorder import ClickRecorder as _ClickRecorder
+# v4.8.0: lcu.recorder(全局鼠标钩子录制器)已随录制回放功能整体删除。
 # v4.4.0(P1-25): 英雄表构建规则(0 < cid <= 1000 + 名字兜底)与 core/script_core.py
 # 共用同一份实现, 避免"界面英雄表"与"自动选英雄用的英雄表"两处规则漂移。
 from lcu.parsing import is_real_champion, champion_display_name
 from ui.main_window import MainWindow
 from ui.overlay_window import OverlayWindow
 from core.script_core import ScriptCore
-from core.logger import log_capture, redact_sensitive
+from core.logger import log_capture, redact_sensitive, LOG_MAX_BYTES
 from core.icon_cache import IconCache, prewarm_all
 from core.updater import APP_VERSION
 from ui.window_base import ui_slot
@@ -90,6 +89,31 @@ def _duration_s(v) -> int:
 # 用户明确要求这个 3 秒间隔: 关客户端是异步的(进程退出、LCU 端口释放都需要时间),
 # 立刻停脚本会让"客户端断开"的收尾流程撞上正在退出的进程。
 STOP_ALL_DELAY_S = 3.0
+
+
+# ==================== v4.7.3: 提权原因的文案表 ====================
+# 为什么抽成表: 需要管理员权限的场景不止一种，而**文案必须说出本次真正的原因**。
+# 旧代码在"自动选英雄"和"已录制的一键启动 LOL"两种情况都弹同一句
+# "「自动选英雄」需要以管理员身份运行" —— 对后者是错的：用户根本没开自动选英雄，
+# 看到这句会以为程序搞错了，甚至怀疑在乱要权限。
+# 值: (功能名, 为什么需要权限, 用户能做什么)
+#
+# v4.8.0: 'lol_steps' 这条已删除 —— 录制回放功能整体移除后, "启动 LOL"不再需要
+# 任何管理员权限(只打开登录器), 只剩「自动选英雄」和「全部停止」两个真实原因。
+_ELEVATE_REASON = {
+    'auto_select': (
+        '自动选英雄',
+        '进选人界面后程序要模拟点击英雄卡片，而英雄联盟客户端以管理员权限运行；\n'
+        '普通权限下这些点击会被 Windows 拦截（表现就是卡片一直没被选中）。',
+        '不想每次都提权的话，可以在「设置」里关掉「自动选英雄」。',
+    ),
+    'stop_all': (
+        '全部停止',
+        '英雄联盟客户端以管理员权限运行；普通权限下无法结束它\n'
+        '（表现就是点了没反应、LOL 还开着）。',
+        '暂无替代做法：要强制关掉 LOL 就必须有管理员权限。',
+    ),
+}
 
 
 # ==================== v4.4.0(P2): 重连退避节奏 ====================
@@ -229,6 +253,28 @@ class _ConnProbeWorker(QObject):
         return {'wins': wins, 'losses': losses,
                 'total': wins + losses, 'games': games_out}
 
+    def _probe_note(self, field: str, exc: BaseException):
+        """v4.6.8: 探活里"可降级但值得留痕"的字段拉取失败 —— 同类只报一次。
+
+        背景: do_probe 里荣誉/资产/熟练度/战绩四段原本全是 `except: pass`。
+        这四段正是"账号卡某一块空着"的**唯一现场**, 静默后完全无从归因;
+        而项目在别处(api.last_error / icon_cache.write_fail_count /
+        logger._file_failed)都刻意做了诊断, 这四处与之矛盾。
+
+        为什么要去重: do_probe 由 _ProbeQThread 每 3 秒跑一轮, 若持续失败
+        (例如该端点被版本移除), 每拍一行会把日志刷爆、反而淹没其它线索。
+        故每个字段只报**第一次**, 后续静默 —— 留痕的目的一旦达到就够。
+        """
+        seen = getattr(self, '_probe_noted', None)
+        if seen is None:
+            seen = set()
+            self._probe_noted = seen
+        if field in seen:
+            return
+        seen.add(field)
+        print(f'[探活] {field} 拉取失败(本次会话只提示一次, 界面该字段将沿用旧值): '
+              f'{type(exc).__name__}: {exc}')
+
     @ui_slot
     def do_probe(self):
         # 此方法经 trigger 信号在 worker 所在线程(即 _ProbeQThread)执行
@@ -350,8 +396,8 @@ class _ConnProbeWorker(QObject):
                     self._last_honor = int(hon.get('honorLevel') or 0)
                 except (TypeError, ValueError):
                     pass
-            except Exception:
-                pass
+            except Exception as e:
+                self._probe_note('荣誉', e)
             # v4.1.43: 资产余额(蓝精粹/橙色精粹/神话精粹/RP)。
             # 腾讯 LCU 钱包数据从 /lol-loot/v1/player-loot 筛 type=CURRENCY,
             # 字段为 count(不是 value,后者是单价)。RP 在腾讯服不计费。
@@ -361,8 +407,8 @@ class _ConnProbeWorker(QObject):
                 self._last_wallet_cosmetic = int(w.get('cosmetic') or 0)
                 self._last_wallet_mythic = int(w.get('mythic') or 0)
                 self._last_wallet_rp = int(w.get('rp') or 0)
-            except Exception:
-                pass
+            except Exception as e:
+                self._probe_note('资产', e)
             # v4.1.43: 英雄熟练度 top3(按英雄成就等级降序)。
             # 端点 /lol-champion-mastery/v1/local-player/champion-mastery
             # (原 /lol-collections/v1/... 实测 404)。等级字段 championLevel
@@ -382,8 +428,8 @@ class _ConnProbeWorker(QObject):
                     for m in mlist[:3]
                     if m.get('championId')
                 ]
-            except Exception:
-                pass
+            except Exception as e:
+                self._probe_note('熟练度', e)
             # v4.1.43: 最近战绩(近10场胜负统计)
             try:
                 if self._probe_puuid:
@@ -391,8 +437,8 @@ class _ConnProbeWorker(QObject):
                     matches = self._api.get_recent_matches(self._probe_puuid, 20)
                     self._last_recent = self._parse_recent(
                         matches, self._probe_puuid, limit=10)
-            except Exception:
-                pass
+            except Exception as e:
+                self._probe_note('最近战绩', e)
         # 无论是否 need_profile, info 统一沿用缓存(首次 = 初始占位值)
         info['solo'] = self._last_solo
         info['flex'] = self._last_flex
@@ -549,6 +595,8 @@ class AppController(QObject):
     # _detail_waiters 里 pop 必然找不到 → 回调永不触发 → 弹窗一直读到 40s 硬超时。
     # 这正是"点开详情一直转圈"的真正根因, 别再改回 int / 'qint64' 之外的窄类型。
     _detail_ready = pyqtSignal(object, object, str)
+    # v4.7.0: 授权检查结果从后台线程送回主线程（None = 检查未产出结果）
+    _lic_result_sig = pyqtSignal(object)
 
     # v4.3.10:WS 的 on_open / on_close 回调发生在 **websocket-client 的后台线程**,
     # 那里没有 Qt 事件循环。原实现用 `QTimer.singleShot(0, _do)` 想排回主线程,
@@ -575,11 +623,10 @@ class AppController(QObject):
     # 干完把结果经该信号排回主线程再做 UI 更新。
     _start_done_sig = pyqtSignal(bool, str)
 
-    # v4.4.5: 一键启动 LOL 完成信号(后台线程 → 主线程)。
+    # v4.4.5: 启动 LOL 完成信号(后台线程 → 主线程)。
     _lol_launch_done_sig = pyqtSignal(bool, str)
 
-    # v4.4.13: 录制前的"准备登录器"完成信号(后台线程 → 主线程), 携带窗口 dict 或 None。
-    _rec_prep_done_sig = pyqtSignal(object)
+    # v4.8.0: 录制相关信号(_rec_prep_done_sig)已随录制回放功能删除。
 
     # v4.4.16: 「全部停止」完成信号(关 LOL 的后台线程 → 主线程停脚本)。
     _stop_all_done_sig = pyqtSignal(bool, str)
@@ -600,10 +647,9 @@ class AppController(QObject):
         self._detail_ready.connect(self._on_detail_ready)
         self._start_done_sig.connect(self._on_start_done)
         self._action_done_sig.connect(self._on_action_done)  # v4.4.2(P1-4)
-        # v4.4.5: 一键启动 LOL 完成 → 主线程收尾(提示/回填日志)
+        # v4.4.5: 启动 LOL 完成 → 主线程收尾(提示/回填日志)
         self._lol_launch_done_sig.connect(self._on_lol_launch_done)
-        # v4.4.13: 录制前准备登录器完成
-        self._rec_prep_done_sig.connect(self._on_rec_prep_done)
+        # v4.8.0: 录制前准备登录器的信号连接已删除(录制回放功能整体移除)。
         # v4.4.16: 全部停止(关 LOL 完成 → 停脚本)
         self._stop_all_done_sig.connect(self._on_stop_all_done)
         # v4.3.10: WS 回调(后台线程) → 主线程的两条通路, 见类属性处说明
@@ -704,6 +750,11 @@ class AppController(QObject):
         # 这里用定时器周期性通过 REST 探活来决定 UI 显示什么；WS on_open/on_close
         # 只是辅助信号，避免 UI 在 WS 偶发抖动时被打回"未连接"。
         self._ui_connected = False
+        # v4.7.3: 小窗三态"屏上当前值"(state, text), 供 _sync_conn_state 做幂等比较。
+        # None = 还没推过任何三态。之所以要显式记账: `_do_conn_state` 每次调用都会
+        # 停掉三点跳动动画, 而同步会跟着 3s 周期的探活一起跑 —— 不记账就会周期性
+        # 打断"等待匹配…"的动画。
+        self._conn_state_shown = None
         self._ui_conn_refresh_timer = QTimer()
         self._ui_conn_refresh_timer.timeout.connect(self._refresh_ui_conn)
         self._ui_conn_refresh_timer.setInterval(3000)
@@ -723,13 +774,11 @@ class AppController(QObject):
         # v4.4.0(P0-2): 启动流程单飞标志。_start() 现在把阻塞段丢到后台线程,
         # 期间用户可能连点"启动"(或托盘/小窗同时触发), 必须挡住重复启动。
         self._starting = False
-        # v4.4.12: 一键启动 LOL 单飞标志(避免连点按钮导致多线程同时点登录器)
+        # v4.4.12: 启动 LOL 单飞标志(避免连点按钮导致多线程同时拉登录器)
         self._lol_launching = False
-        # v4.4.12: 鼠标点击录制器(全局低级钩子, 见 lcu/recorder.py)
-        self._recorder = _ClickRecorder()
-        self._rec_rect = None
-        # v4.4.13: 录制前的"准备登录器"单飞标志
-        self._rec_preparing = False
+        # v4.8.0: 录制回放功能已整体移除 —— 原先这里的 _recorder / _rec_rect /
+        # _rec_btn_timer / _rec_deadline / _rec_finishing / _rec_starting /
+        # _rec_preparing 七项状态连同 lcu/recorder.py 一并删除, 不要再加回来。
         # v4.4.16: 「全部停止」单飞标志
         self._stopping_all = False
         # v4.4.16: 连上客户端后自动启动脚本 —— 延时用主线程单发定时器 + 去重标志
@@ -738,6 +787,21 @@ class AppController(QObject):
         self._auto_start_timer.setSingleShot(True)
         self._auto_start_timer.timeout.connect(self._do_auto_start_on_connect)
         self._last_icon_id = 0
+
+        # v4.7.0: 授权状态。**懒检查** —— 后台预热一次, 结果缓存到 _lic_status，
+        # 避免每次点"启动"都重跑指纹采集/验签（合计 300ms+，会卡住 GUI）。
+        # None = 还没查过（与"查了但未激活"语义不同，不能合并成 False）。
+        self._lic_status = None
+        self._lic_dlg = None
+        self._lic_checking = False
+        # None = 没有待兑现的意图。取值：'user'（点启动被拦）/ 'auto'（连上自动排）
+        # / 'activate'（点输入授权码，只弹窗不启动）。v4.9.3: 原来是 False，
+        # 与"三种意图"语义不符，且 'activate' 分支加不进来。
+        self._lic_pending_start = None
+        self._lic_prompt_retries = 0
+        # 激活窗是"被门禁拦下"弹的还是用户主动点的：'blocked' / 'manual'。
+        # 决定激活成功后要不要接着启动脚本（见 _on_license_activated）。
+        self._lic_activation_reason = None
 
         # v13 优化项 2:对局即将开始 → 1.5s 后隐藏小窗。
         # v14.1:QTimer 必须在主线程创建(QObject 线程亲和),否则绑定到
@@ -794,7 +858,7 @@ class AppController(QObject):
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor('#6366f1')))
+        p.setBrush(QBrush(QColor(_Glass.PRIMARY)))   # v4.6.11: 用令牌(原硬编码 '#6366f1')
         p.drawRoundedRect(2, 2, 60, 60, 14, 14)
         p.setBrush(QBrush(QColor(255, 255, 255)))
         path = QPainterPath()
@@ -992,6 +1056,15 @@ class AppController(QObject):
                 return
             self._champ_data = new_data
             self._champ_roles = new_roles
+            # v4.6.3: 顺手把 LCU 的权威别名灌进下载链路 —— 硬编码那份是静态的,
+            # 新英雄没有别名时 CDN 备用源拼不出 URL, 新英雄图标就永远取不到。
+            try:
+                from lcu.api import remember_champion_aliases
+                n_alias = remember_champion_aliases(champs)
+                if n_alias:
+                    pass    # 别名是内部细节, 不刷日志
+            except Exception:
+                pass
             print(f'[App] 后台加载 {len(new_data)} 个英雄(已写缓存)')
             self._save_cache()
             if not getattr(self, '_picker_initialized', False):
@@ -1163,6 +1236,26 @@ class AppController(QObject):
                 print('[自动启动] 脚本已在运行/正在启动, 跳过')
                 self._auto_start_fired = True
                 return
+            # v4.7.0: 未激活时**不要**自动排程 —— 否则每次连上客户端都会
+            # 自动弹激活窗，像是在骚扰。改为静默记一条日志，等用户主动点
+            # 「启动脚本」时再弹（那时他的意图明确，弹窗才合理）。
+            if self._lic_status is None:
+                # 状态还没查出来：记成 auto 意图，结果回来再决定。
+                # 用独立意图值而不是布尔 —— 自动启动**绝不能弹窗**，
+                # 而用户主动点启动则应该弹（见 _on_lic_result）。
+                self._auto_start_fired = True
+                self._lic_pending_start = 'auto'
+                self._prewarm_license()
+                return
+            if not self._license_ok():
+                self._auto_start_fired = True
+                print('[自动启动] 未激活, 跳过自动启动(不弹窗打扰)')
+                try:
+                    if self._main:
+                        self._main.append_log('[自动启动] 未激活，已跳过自动启动')
+                except Exception:
+                    pass
+                return
             self._auto_start_fired = True
             print(f'[自动启动] 已连上客户端, {delay} 秒后自动启动脚本')
             try:
@@ -1300,6 +1393,154 @@ class AppController(QObject):
     # ⚠️ 仍在使用的是: _get_icon_cache_dir(头像落盘)、_item_icon_cb/_dl_item、
     #    _aux_icon_cb/_aux_dl_cb/_aux_fetch、_icon_cb_for_picker、_icon_dl_inflight。
 
+    # ==================== v4.6.3: 清理缓存 ====================
+    #
+    # v4.6.12: 实现整体搬到 core/cache_cleaner.py。这里只留**薄委托**。
+    #
+    # 为什么搬: 这块 300+ 行原本挤在 AppController(3200 行/115 方法)里, 但它其实
+    # 自成一体 —— 只依赖"四个图标缓存 + data 目录 + 几个回调", 不碰连接/脚本核心/
+    # 录制。搬走后: ① 控制器少一块, 边界清楚; ② 这块逻辑能在**不构造整个控制器**
+    # 的情况下单测(而它恰好是缺陷高发区 —— v4.6.3~v4.6.10 有 4 个问题出在这里);
+    # ③ "清理"与"清点"共用同一套判据这件事被物理地保证在同一个文件里, 不会再出现
+    # "两处白名单各写一份然后漂移"(曾因此让某类文件清点算得到、清理删不掉)。
+    #
+    # 下面这些薄方法保留, 是因为**别处仍在按这些名字调用**(信号槽、探活、测试),
+    # 直接删会牵连一大片。它们只是把自己转发给 CacheCleaner。
+
+    def _cleaner(self):
+        """构造清理器(依赖显式注入, 不把控制器整个塞进去)。
+
+        每次新建一个轻量对象即可 —— 它只持有几个引用, 无状态、无缓存,
+        构造开销可忽略; 换来的是"依赖在哪"一眼可见。
+        """
+        from core.cache_cleaner import CacheCleaner
+        return CacheCleaner(
+            data_dir=self._data_base(),
+            caches_provider=self._icon_caches,
+            ui=self._main,
+            on_data_cleared=self._on_champ_cache_cleared,
+            sync_version=self._sync_assets_version,
+        )
+
+    def _on_champ_cache_cleared(self):
+        """英雄数据缓存被清掉后的内存收尾(由 CacheCleaner 回调)。
+
+        内存里那份必须一起清, 否则界面仍显示旧英雄(与"清理"的语义不符);
+        然后允许重拉, 下次探活拿到数据会重新灌入。
+        """
+        self._champ_data = {}
+        self._champ_roles = {}
+        self._champ_refresh_started = False   # 允许重拉
+        self._start_remote_champ_refresh()
+
+    def _walk_cleanable(self, path, classify=None):
+        """遍历目录按白名单累加(实现见 CacheCleaner.walk)。"""
+        return self._cleaner().walk(path, classify=classify)
+
+    def scan_cleanable(self):
+        """清点各类可清理占用(实现见 CacheCleaner.scan)。"""
+        return self._cleaner().scan()
+
+    @staticmethod
+    def _cleanable_file(p):
+        """判断文件是否属于可清理范畴(实现见 cache_cleaner.is_cleanable_file)。"""
+        from core.cache_cleaner import is_cleanable_file
+        return is_cleanable_file(p)
+
+    def clean_caches(self, targets):
+        """执行清理(实现见 CacheCleaner.clean)。返回 (删除数, 释放字节, 说明)。"""
+        return self._cleaner().clean(targets)
+
+    def _data_base(self):
+        """包外 data 目录(exe 同级 / 源码根)。
+
+        ⚠️ 这个名字**没有任何字面调用点以外的引用**吗? 有 —— `_cleaner()` 在用它,
+        测试也在用。保留它而不是内联, 是为了让"数据目录在哪"只有一个答案。
+
+        v4.6.12: 改为复用 core.icon_cache.app_data_dir() —— 原先这里是**第五处**
+        自己算 frozen/源码基准目录的地方(logger、icon_cache、_crash_dir、
+        _save_cache/_load_cache 各有一份)。四处口径今天恰好一致, 但那是巧合:
+        只要哪一处挪一层目录, 清理就会去删一个不存在的路径(os.listdir 抛
+        FileNotFoundError, 被吞掉 → 用户看到"已清理 0 个文件"而真实日志在别处)。
+        已实测 app_data_dir('') 与旧实现返回**完全相同**的路径, 且它还会顺手
+        建目录(失败时打一次诊断)。
+        """
+        from core.icon_cache import app_data_dir
+        return app_data_dir('')
+
+    def _icon_caches(self):
+        """四个图标缓存实例(v4.6.3: 供版本对齐/清理缓存等多处复用, 单一来源)。"""
+        return (self._cache_champ, self._cache_item,
+                self._cache_spell, self._cache_aug)
+
+    @ui_slot
+    def _on_clean_cache(self, targets):
+        """设置页「清理缓存」入口(主线程)。
+
+        targets 为空 → 只清点占用并回填界面(卡片显示时/点「刷新占用」时调用);
+        targets 非空 → 执行清理, 完成后回填新的占用。
+
+        为什么清点与清理共用一个信号: 两者都是"读同一份清点", 分开会多一个信号
+        和一个槽, 而语义上本就是同一个入口的两种模式。
+        """
+        try:
+            targets = list(targets or [])
+            if targets:
+                removed, freed, notes = self.clean_caches(targets)
+                print(f'[清理] 已清理 {removed} 个文件, 释放 {freed} 字节'
+                      + (f', 异常: {notes}' if notes else ''))
+                try:
+                    self._main.on_clean_done(removed, freed, notes)
+                except Exception:
+                    pass
+            # 回填最新占用。
+            # v4.6.8: 区分两种模式 —— 清理后要**保留**上面刚写的"已清理 N 个"
+            # 结果(keep_state=True); 纯清点才用占用数字覆盖状态行。原先两处都不传,
+            # 导致清理结果在同一帧被顶掉, 用户看不到任何反馈(实测复现)。
+            items = self.scan_cleanable()
+            try:
+                self._main.update_clean_sizes(items, keep_state=bool(targets))
+            except Exception:
+                pass
+        except Exception as e:
+            print(f'[清理] 执行失败: {type(e).__name__}: {e}')
+            try:
+                self._main.on_clean_done(0, 0, [f'{type(e).__name__}: {e}'])
+            except Exception:
+                pass
+
+    def _sync_assets_version(self):
+        """v4.6.3: 把游戏版本对齐到图标缓存, 版本一变就清掉旧图。
+
+        为什么需要: 图标按纯 id 落盘({id}.png), 命中即用 —— 游戏更新换了图标后,
+        只要 id 还在缓存里就**永远不会重新下载**(实测本机 icon_cache 236 张的
+        mtime 全停在同一天, 之后再没变过)。
+
+        安全约束(详见 IconCache.apply_assets_version 的说明):
+          - 取不到版本(客户端没开) → 什么都不做。否则每次离线启动都会白清缓存。
+          - 首次运行(无标记) → 只记版本、不清。老用户不该为升级重下已有图标。
+        """
+        try:
+            # 用 getattr 而非直接属性访问: 本方法也可能被"清理缓存"等路径在
+            # 连接尚未建立时调到, 缺属性时应当安静跳过, 而不是记一条误导性的
+            # "版本对齐失败"(那会让排查者以为功能坏了)。
+            api = getattr(self, '_api', None)
+            conn = getattr(self, '_conn', None)
+            if api is None or conn is None:
+                return
+            if not getattr(conn, 'is_connected', False):
+                # 客户端没连上时拿不到版本 → 跳过本次对齐(下次连上再对齐)
+                return
+            ver = api.get_game_version()
+            if not ver:
+                return
+            total = sum(c.apply_assets_version(ver) for c in self._icon_caches())
+            if total:
+                print(f'[App] 图标缓存已按游戏版本 {ver} 同步(清理旧图 {total} 张)')
+        except Exception as e:
+            # 版本对齐失败绝不能让启动挂掉 —— 图标旧一点远比程序起不来轻
+            print(f'[App] 图标版本对齐失败: {type(e).__name__}: {e}')
+
     def _prewarm_icon_cache_async(self):
         """v16:启动期后台预热磁盘图标缓存到内存。
 
@@ -1309,9 +1550,10 @@ class AppController(QObject):
         v4.3.6: 顺带清理磁盘超额文件(内存有 LRU, 磁盘此前没有上限)。
         """
         try:
-            added = prewarm_all(
-                [self._cache_champ, self._cache_item,
-                 self._cache_spell, self._cache_aug])
+            # v4.6.11: 改用 _icon_caches() —— 原先这里**手写了一遍**同一个四元组,
+            # 而 _icon_caches() 的 docstring 自称"单一来源"。将来加第 5 类缓存时
+            # 这里必然漏改, 表现是"新缓存冷启动预热不到"(难查)。
+            added = prewarm_all(self._icon_caches())
             if added:
                 print(f'[App] 预热图标缓存: 共 {added} 张')
         except Exception as e:
@@ -1369,10 +1611,31 @@ class AppController(QObject):
             try:
                 path = self._avatar_disk_path(icon_id)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, 'wb') as f:
-                    f.write(data)
-            except Exception:
-                pass
+                # v4.6.10 修: 改**原子落盘**(先写 .tmp 再 os.replace)。
+                # 原先直接 open(path,'wb').write(data) —— 而同目录里 IconCache
+                # 的写入全都是原子的, 这里是唯一的非原子写者。
+                # 后果: 写入过程被强杀/断电/杀软打断会留下**半截文件**, 而上面
+                # 的读侧判据只是 `len(data) > 200`, 半截文件照样被当命中 →
+                # 头像解码失败但**不会重下**, 表现为"头像一直空着, 重开程序才好"。
+                # tmp 名带 pid+线程 id, 与 IconCache._write_atomic 同款命名习惯,
+                # 因此也会被 is_temp_file() 判为临时文件、被清理逻辑兜住。
+                tmp = f'{path}.tmp.{os.getpid()}.{threading.get_ident()}'
+                try:
+                    with open(tmp, 'wb') as f:
+                        f.write(data)
+                        f.flush()
+                except Exception:
+                    # 写 tmp 就失败 → 尽力清掉残留, 不让它变成垃圾
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                    raise
+                os.replace(tmp, path)
+            except Exception as e:
+                print(f'[App] 头像落盘失败 icon={icon_id}: '
+                      f'{type(e).__name__}: {e}')
             self._avatar_done.emit(icon_id, data)
         except Exception as e:
             print(f'[App] 头像下载失败 icon={icon_id}: '
@@ -1472,6 +1735,14 @@ class AppController(QObject):
                         p['spell2_name'] = self._api.spell_info(p.get('spell2'))[0]
                         p['augment_names'] = [
                             self._api.augment_info(a)[0]
+                            for a in (p.get('augments') or []) if a
+                        ]
+                        # v4.4.20: 与 augment_names **同一顺序、同一过滤条件**取
+                        # 稀有度(kSilver/kGold/kPrismatic)。官方小图标九成是纯白
+                        # 剪影蒙版, 详情窗要靠它染色, 否则满屏白图标(用户反馈的
+                        # "海克斯好多没颜色")。与上面一样只读进程内已缓存的表。
+                        p['augment_rarity'] = [
+                            self._api.augment_rarity(a)
                             for a in (p.get('augments') or []) if a
                         ]
                 else:
@@ -1673,15 +1944,14 @@ class AppController(QObject):
         if self._ws.is_connected:
             self._reconnect_fail = 0
             self._reconnect_timer.setInterval(self._RETRY[0])
+            # v4.7.3: WS 已连着 —— 顺手把三态归正到"已连接"再退出。
+            # 这里原来是纯 `return`: 每 5s 一跳的它见到 WS 已连就不再管三态, 于是
+            # 若三态此刻停在琥珀, 没有任何地方会把它拉回来。见 _sync_conn_state。
+            self._sync_conn_state()
             return
         # v4.3.10: 单飞 —— 上一轮后台连接(可能含全盘 BFS, 30s+)还没跑完就不再起新线程
         if self._connecting:
             return
-
-        # v4.4.1(UI-B5): 起手就把小窗打成"连接中"(琥珀)。这段后台全盘探测(最坏
-        # 30s+)以前在界面上与"客户端根本没开"渲染得一模一样 —— 都是红色"未连接",
-        # 用户会以为软件坏了。放在单飞判断之后: 已在连接中就不必重复推。
-        self._set_conn_state('connecting', '连接中')
 
         self._reconnect_fail += 1
         idx = min(self._reconnect_fail - 1, len(self._RETRY) - 1)
@@ -1689,6 +1959,17 @@ class AppController(QObject):
 
         # 后台线程执行连接，避免阻塞UI
         self._connecting = True
+        # v4.7.3: 起手打「连接中」(琥珀) 也走唯一收口点 —— 由 `_sync_conn_state`
+        # 看 `_connecting` 推。原实现在这里直接调 `_set_conn_state('connecting')`,
+        # 于是"谁写三态"有两处代码, 而它**只判 `_ws.is_connected`、完全不看
+        # `_ui_connected`** —— REST 探活通常先于 WS on_open 成功(见 _sync_conn_state
+        # 的 t0~t3), 这句就会在"界面已经绿色已连接"之后把琥珀重新盖上去, 又因为
+        # 后续置绿全是非跃迁 no-op 而永久停留。这正是用户 v4.7.2 报障的现象。
+        # 收口后判据只剩一份: 已连接(WS 权威) > 连接中 > 未连接。
+        # ⚠️ 只是不再直接打点, **不能提前 return** —— WS 掉线时本函数是唯一的重连
+        # 入口(`_ws.connect()` 由 worker 调), 提前返回会让 WS 永不恢复。
+        self._sync_conn_state()
+
         threading.Thread(target=self._try_connect_worker, daemon=True).start()
 
     def _try_connect_worker(self):
@@ -1753,6 +2034,11 @@ class AppController(QObject):
         try:
             self._reconnect_fail = 0
             self._reconnect_timer.setInterval(self._RETRY[0])
+            # v4.6.3: 真正连上客户端了 → 此刻才拿得到游戏版本, 做一次图标缓存
+            # 版本对齐(版本变了就清旧图)。放在这里而不是启动时: 启动时客户端
+            # 往往还没开, 拿不到版本; 而且清缓存属于"发现过期"才做的事, 放在
+            # 连接成功这个明确的边界上最自然。
+            self._sync_assets_version()
             self._on_connect_success()
         except Exception as e:
             print(f'[App] WS 连接成功处理异常: {type(e).__name__}: {e}')
@@ -1798,6 +2084,14 @@ class AppController(QObject):
         现在同一时刻最多只有一个探活任务在途。
 
         fail_count 保留在主线程(只在 UI 更新时修改),保证线程安全:主线程独占读写。
+
+        ⚠️ v4.6.13 修: 下面两处"判未连接"**不得覆盖 WS 已确认的连接态**。
+        实测(用户报障 + 我逐层追踪): `_on_connect_success()` 先置绿, 紧接着
+        本函数发现 `_conn.is_connected` 为假(它只检查端口/令牌是否为 None,
+        **不做任何探活**)或探活线程尚未 running —— 就立刻 `_set_ui_connected(False)`
+        把刚置的绿点打回"未连接"。表现就是小窗/主窗在"连接中↔未连接"之间抖动,
+        或永远不翻绿。WS 的 on_open 才是权威的连接信号, 这里只是"顺手刷新账号卡
+        数据"的辅助探活, 无权否定它。
         """
         if self._probe_inflight:
             # v4.4.0 看门狗: 在途标志若超时仍未清(见 __init__ 的 _probe_inflight_at),
@@ -1815,13 +2109,16 @@ class AppController(QObject):
             # 判未连接即可, 等重连定时器把线程救回(实际 _ProbeQThread 一旦 start
             # 就长期存活, 此分支几乎走不到)。
             self._probe_fail_count += 1
-            if self._probe_fail_count >= 2:
+            if self._probe_fail_count >= 2 and not self._ws_confirmed_connected():
                 self._set_ui_connected(False, '')
             return
         if not self._conn.is_connected:
-            # 无端口/token 直接判未连,无 REST 必要
+            # 无端口/token 直接判未连,无 REST 必要。
+            # v4.6.13: 但若 WS 已经 on_open(权威信号), 说明只是参数尚未回填,
+            # 此时把界面打回"未连接"是错的 —— 跳过这次 UI 翻转, 等参数就绪。
             self._probe_fail_count = 0
-            self._set_ui_connected(False, '')
+            if not self._ws_confirmed_connected():
+                self._set_ui_connected(False, '')
             return
         # 跨线程调用 worker.do_probe():用 trigger 信号派发,Qt AutoConnection
         # 会按 receiver 线程亲和自动用 QueuedConnection,把 do_probe 排到
@@ -1935,6 +2232,22 @@ class AppController(QObject):
                     pass
                 self._set_ui_connected(False, '')
 
+    def _ws_confirmed_connected(self) -> bool:
+        """WS 是否已确认连上(on_open 已触发且当前仍在连着)。
+
+        v4.6.13 新增: 用来保护"连接态不被辅助探活否定"。
+        背景: `_on_connect_success()` 置绿后会立刻调 `_refresh_ui_conn()`, 而后者
+        在 `_conn.is_connected` 为假(它只查端口/令牌是否 None, **不探活**)或探活
+        线程未 running 时会无条件 `_set_ui_connected(False)` —— 于是刚置的绿点
+        被打回, 用户看到"连接中↔未连接"抖动或永远不翻绿。
+        WS 的 on_open 才是权威信号, 辅助探活没资格否定它。
+        异常时返回 False(保持原有降级行为, 不做额外保护)。
+        """
+        try:
+            return bool(self._ws.is_connected)
+        except Exception:
+            return False
+
     def _set_ui_connected(self, connected: bool, name: str = ''):
         """线程安全的连接状态入口：主线程直跑，后台线程经信号排回主线程。
 
@@ -1959,11 +2272,18 @@ class AppController(QObject):
         self._apply_conn_state(state, text)
 
     def _apply_conn_state(self, state: str, text: str = ''):
-        """v4.4.1(UI-B5): 主线程内把三态推给小窗(浮层可能还没建, 静默跳过)。"""
+        """v4.4.1(UI-B5): 主线程内把三态推给小窗(浮层可能还没建, 静默跳过)。
+
+        v4.7.3: 推送成功后**记下当前屏上是什么**。`_do_conn_state` 每次调用都会
+        停掉三点跳动动画(它只管连接态), 而本函数现在每 3s 都可能被 `_sync_conn_state`
+        走一遍 —— 不记账的话"等待匹配…"的动画会被周期性掐死。记账后由
+        `_sync_conn_state` 做幂等比较, 只在**屏上真的不对**时才推。
+        """
         if not self._overlay:
             return
         try:
             self._overlay.set_conn_state(state, text)
+            self._conn_state_shown = (state, text)
         except Exception as e:
             print(f'[App] 小窗连接指示更新失败: {type(e).__name__}: {e}')
 
@@ -1973,13 +2293,15 @@ class AppController(QObject):
         为什么必须显式做: `_set_ui_connected(False, '')` 只在 True→False 的**跃迁**
         上生效, 而"连接中"不是连接态 —— 若连接线程失败时只调它, 琥珀提示会永久
         停在"连接中"。反过来, 若期间 WS 已真正 on_open, 这里也不能把绿点压回红。
+
+        v4.7.3: 收口到 `_sync_conn_state`。原先直接 `_set_conn_state('disconnected')`,
+        是三态的第二处写点 —— 而"谁写三态"有两份判据, 正是本次缺陷的土壤。
+        注意本方法在 `_try_connect_worker` 的 `finally: self._connecting = False`
+        **之前**被调用(return 会先触发这些调用点), 所以这里必须先清 `_connecting`,
+        否则收口点会按"仍在连接中"又推一次琥珀, 反而settle 不掉。
         """
-        try:
-            if self._ui_connected or self._ws.is_connected:
-                return
-        except Exception:
-            pass
-        self._set_conn_state('disconnected', '未连接')
+        self._connecting = False
+        self._sync_conn_state()
 
     def _apply_ui_connected(self, connected: bool, name: str = ''):
         """主线程内直接同步设置 UI 连接状态（已连接/未连接）
@@ -1996,11 +2318,10 @@ class AppController(QObject):
                     self._main.apply_connection_ui(True, name)
                 except Exception as e:
                     print(f'[App] 主窗连接状态更新失败: {type(e).__name__}: {e}')
-            if self._overlay:
-                try:
-                    self._overlay.set_conn_indicator(True, '已连接')
-                except Exception as e:
-                    print(f'[App] 小窗连接指示更新失败: {type(e).__name__}: {e}')
+            # v4.7.3: 这里原有 `self._overlay.set_conn_indicator(True, '已连接')` —— 它内部
+            # 也转调 `_do_conn_state`, 于是三态有了**两个写点**, 而它只在跃迁分支里执行
+            # (这正是"非跃迁置绿是 no-op、琥珀永久停留"的成因)。现已删除: 三态统一由本
+            # 方法末尾的 `_sync_conn_state()` 收口, 不再有"谁最后写"的竞争。
             # v23:客户端(重新)连上时若英雄数据尚未联网刷新成功(flag 已复位),
             # 立即后台补拉一次 —— 修复"先开脚本后开游戏,数据永是旧缓存"场景
             if not getattr(self, '_champ_refresh_started', False):
@@ -2023,11 +2344,64 @@ class AppController(QObject):
                     self._main.update_account_info(None)
                 except Exception as e:
                     print(f'[App] 主窗连接状态更新失败: {type(e).__name__}: {e}')
-            if self._overlay:
-                try:
-                    self._overlay.set_conn_indicator(False, '未连接')
-                except Exception as e:
-                    print(f'[App] 小窗连接指示更新失败: {type(e).__name__}: {e}')
+            # v4.7.3: 断开时也删掉了 `set_conn_indicator(False, '未连接')` —— 同上,
+            # 三态收口给方法末尾的 `_sync_conn_state()`。
+        # v4.7.3: 三态收尾 —— **无论本次是否发生跃迁**都按当前事实重算一次。
+        # 原先把三态推送写在上面两个跃迁分支里, 是本次用户报障的根因, 详见本方法注释。
+        self._sync_conn_state()
+
+    def _sync_conn_state(self):
+        """v4.7.3: 按**当前连接事实**把小窗三态重算一遍(唯一收口点)。
+
+        【为什么必须"每次重算", 而不是"跃迁时顺带推一次"】
+        连接提示有两条互不相干的通道:
+          · 主窗二元状态 → `_set_ui_connected` → `_apply_ui_connected`;
+          · 小窗三态(顶部圆点+文案, 底部圆点+文案) → `_set_conn_state`。
+        v4.6.13 为"小窗永不翻绿"补了 `_set_conn_state('connected')`, 但补的位置在
+        `if connected and not self._ui_connected:` **跃迁分支内部** —— 于是三态不是
+        由事实推导, 而是由跃迁触发的一次性动作。一旦某个 interleaving 把琥珀色盖
+        上去, 之后所有 `_set_ui_connected(True)` 都是**非跃迁的 no-op**, 三态通道
+        再没有任何机会被纠正, 琥珀就永久留在界面上。
+
+        【真实发生的 interleaving(用户 v4.7.2 报障的正是它)】
+        REST 探活与 WS 是两条独立通道, 而 REST 通常**先**成功:
+          t0 3s 周期探活 `_on_probe_done` → `_set_ui_connected(True)` → 跃迁 → 小窗绿
+          t1 5s 周期 `_try_connect` —— 此时 WS 还没 on_open(`is_connected=False`),
+             而它只判 ws/单飞, **不看 `_ui_connected`** → 往小窗打「连接中」琥珀
+          t2 `[WS] on_open` → `_on_connect_success` → `_set_ui_connected(True)`
+             → `not self._ui_connected` 为假 → 不推三态 → 小窗停在琥珀
+          t3 之后每 3s 探活同样是非跃迁 no-op; 每 5s 的 `_try_connect` 还在补琥珀
+        取证: dadan-build/dist/data/logs/app.log 里 `[App] 已连接客户端（…）` 确实
+        早于 `[WS] on_open 成功: port=54808` —— 即 t0 先于 t2。
+        复现探针: tools/probe_overlay_connecting_stuck.py(按 t0→t3 走, 修复前判红)。
+
+        【判据】与 `_settle_connecting` / `_ws_confirmed_connected` 同一套权威规则:
+        `_ui_connected` 为真 **或** WS 已 on_open, 都算"已连接" —— WS 是权威信号,
+        辅助探活无权否定它。
+        还没连上时再分两种: 后台正在扫客户端(`_connecting`)是"连接中"(琥珀), 否则
+        才是"未连接"(红)。少这一类的话, 启动脚本时本方法的收尾会把 `_try_connect`
+        刚打上的"连接中"压成"未连接", 把"正在找客户端"错误地渲染成"客户端没开"。
+
+        【幂等】按上面的判据算出目标三态后, 与"屏上当前值"比较, **相同就不推**。
+        原因: `_do_conn_state` 每次调用都会停掉三点跳动动画, 而本方法会被 3s 周期的
+        `_set_ui_connected` 反复走到 —— 无条件推会把"等待匹配…"的动画周期性掐死。
+        """
+        try:
+            live = bool(self._ui_connected) or bool(self._ws.is_connected)
+        except Exception:
+            live = bool(self._ui_connected)
+        if live:
+            target = ('connected', '已连接')
+        elif getattr(self, '_connecting', False):
+            target = ('connecting', '连接中')
+        else:
+            target = ('disconnected', '未连接')
+        if getattr(self, '_conn_state_shown', None) == target:
+            return                      # 屏上已经是对的 —— 别为了"重推一次"打断动画
+        try:
+            self._set_conn_state(*target)
+        except Exception as e:
+            print(f'[App] 小窗连接指示同步失败: {type(e).__name__}: {e}')
 
     def _on_connect_success(self):
         """连接成功后更新UI（主线程）—— 立即反馈绿色，后续由定时器持续校准"""
@@ -2073,62 +2447,38 @@ class AppController(QObject):
         except Exception:
             return False
 
-    # ==================== 控制 ====================
+    # ==================== 启动 LOL ====================
     def _launch_lol(self):
-        """一键启动 LOL。GUI 线程立即返回, 实际工作在后台线程。
+        """启动 LOL。GUI 线程立即返回, 实际工作在后台线程。
 
-        v4.4.15(用户明确要求)的两种行为:
-          ① **没录制过**(默认) → 只把登录器打开、跳过 WeGame, 界面交给用户自己操作,
-             不做任何模拟点击; 因此**也不需要管理员权限**。
-          ② **录过屏** → 除启动外, 还按录制内容自动模拟点击, 复刻用户操作; 因为
-             登录器是提权进程(TCLS\\client.exe), 点击会被 UIPI 丢弃, 所以要先提权。
+        v4.8.0(用户明确要求): **只有一种行为** —— 把登录器打开(跳过 WeGame),
+        然后什么都不做, 界面完全交给用户自己操作。
+
+        与 v4.4.15 的关键区别: 那时还有"录过屏就自动模拟点击"的第二分支, 且该分支
+        必须先提权(登录器是提权进程, 点击会被 UIPI 丢弃)。录制回放已整体删除,
+        所以**本方法不再需要管理员权限**, 也就不再调用 _elevate_for_lol。
         """
         if self._lol_launching:
             print('[启动LOL] 已在启动中, 忽略重复请求')
             return
 
-        has_steps = self._lol_steps_from_settings() is not None
-        if has_steps:
-            # 只有要模拟点击时才需要管理员权限
-            if not self._elevate_for_lol(action='launch'):
-                return
-        else:
-            print('[启动LOL] 未录制点击流程 → 只启动登录器, 不做模拟点击(无需管理员权限)')
-
         self._lol_launching = True
-        print('[启动LOL] 正在启动英雄联盟…')
+        print('[启动LOL] 正在启动英雄联盟登录器(不做任何模拟点击)…')
         threading.Thread(target=self._lol_launch_worker, daemon=True,
                          name='lol-launch').start()
 
-    def _lol_steps_from_settings(self):
-        """读取录制步骤。返回 list 或 None(=没有可用步骤, 即从未录制过)。
+    def _elevate_for_lol(self, action: str = 'stop_all') -> bool:
+        """「全部停止」前的管理员权限检查。
 
-        v4.4.15: 调用方只需要知道"要不要模拟点击", 所以"没录制"和"录了但是空"
-        统一按 None 处理。
-        """
-        try:
-            raw = (self._main.get_settings() or {}).get('lol_steps') or []
-            parsed = []
-            for item in raw:
-                if isinstance(item, (list, tuple)) and len(item) >= 3:
-                    parsed.append((f'录制步骤{len(parsed) + 1}',
-                                   float(item[0]), float(item[1]), float(item[2])))
-            return parsed if parsed else None
-        except Exception as e:
-            print(f'[启动LOL] 读取录制步骤失败: {type(e).__name__}: {e}')
-            return None
+        v4.8.0: 录制回放删除后, 本函数的唯一调用方只剩「全部停止」。
+        原先还有 launch 分支(启动后按录制步骤模拟点击, 点击会被 UIPI 丢弃),
+        现在启动 LOL **不再需要任何管理员权限** —— 只启动登录器走的是
+        ShellExecuteW 的正常启动路径。
 
-    def _elevate_for_lol(self, action: str = 'launch') -> bool:
-        """一键启动/全部停止 前的管理员权限检查。
-
-        为什么必须(两个动作都要):
-          - **launch + 有录制步骤**: LOL 原生登录器以管理员权限运行, 非管理员进程
-            注入的鼠标点击会被 UIPI 静默丢弃(实测 click_at 返回 'uipi-blocked')。
-          - **stop_all**: LOL 客户端以管理员权限运行, 非管理员进程 taskkill 会
+        为什么 stop_all 仍必须提权:
+            LOL 客户端以管理员权限运行; 非管理员进程 taskkill 会
             `Access is denied`(实测), 根本关不掉。
-        (注意: "只启动登录器、不模拟点击"的默认路径**不需要**提权, 调用方自行跳过。)
 
-        action: 'launch'(启动并模拟点击) 或 'stop_all'(关闭 LOL)。
         返回 True  = 已是管理员, 调用方可继续;
              False = 已触发提权重启, 或用户取消了 UAC, 调用方应中止本次流程。
         """
@@ -2143,26 +2493,18 @@ class AppController(QObject):
             # 会给出明确原因, 不会静默假成功。
             return True
 
-        is_stop = (action == 'stop_all')
-        flag = '--stop-all' if is_stop else '--launch-lol'
-        tag = '[全部停止]' if is_stop else '[启动LOL]'
+        tag = '[全部停止]'
         try:
             box = QMessageBox(self._main)
             box.setWindowTitle('需要管理员权限')
-            if is_stop:
-                box.setText('「全部停止」需要以管理员身份运行。')
-                box.setInformativeText(
-                    '英雄联盟客户端以管理员权限运行；普通权限下无法结束它'
-                    '（表现就是点了没反应、LOL 还开着）。\n\n'
-                    '接下来会弹出 UAC 窗口，请点「是」——程序将以管理员权限自动重启，'
-                    '并在重启后自动继续关闭 LOL。')
-            else:
-                box.setText('「一键启动 LOL」需要以管理员身份运行。')
-                box.setInformativeText(
-                    '英雄联盟登录器本身以管理员权限运行；普通权限下模拟点击会被 '
-                    'Windows 拦截（表现就是点了没反应）。\n\n'
-                    '接下来会弹出 UAC 窗口，请点「是」——程序将以管理员权限自动重启，'
-                    '并在重启后自动继续启动 LOL。')
+            # v4.7.3: 文案走 _ELEVATE_REASON 单一来源。
+            # v4.8.0: 只剩 stop_all 一个原因, 'lol_steps' 那条已随录制回放一起删除。
+            title, why, hint = _ELEVATE_REASON['stop_all']
+            box.setText(f'「{title}」需要管理员权限')
+            box.setInformativeText(
+                f'{why}\n\n{hint}\n\n'
+                f'接下来会弹出 UAC 窗口，请点「是」——程序将以管理员权限自动重启，'
+                f'并在重启后自动继续关闭 LOL。')
             box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
             box.setDefaultButton(QMessageBox.Ok)
             if box.exec_() != QMessageBox.Ok:
@@ -2181,10 +2523,10 @@ class AppController(QObject):
             exe = sys.executable
             if getattr(sys, 'frozen', False):
                 cwd = os.path.dirname(exe)
-                params = flag
+                params = '--stop-all'
             else:
                 cwd = os.getcwd()
-                params = f'"{os.path.abspath(__file__)}" {flag}'
+                params = f'"{os.path.abspath(__file__)}" --stop-all'
             r = shell32.ShellExecuteW(None, 'runas', exe, params, cwd, 1)
             print(f'{tag} ShellExecuteW(runas) 返回 {r}')
         except Exception as e:
@@ -2200,23 +2542,15 @@ class AppController(QObject):
         return False
 
     def _lol_launch_worker(self):
-        """一键启动 LOL 的阻塞部分(后台 daemon 线程)。"""
+        """启动 LOL 的阻塞部分(后台 daemon 线程)。"""
         ok, msg = False, ''
         try:
             def on_status(text):
                 print(f'[启动LOL] {text}')
 
-            # v4.4.15: 只认用户**录制**的步骤。没录过就是 None → run_flow 只启动
-            # 登录器、不做任何模拟点击(不再有"内置默认步骤"兜底, 见 launcher 注释)。
-            steps = self._lol_steps_from_settings()
-            if steps:
-                print(f'[启动LOL] 使用录制步骤 {len(steps)} 步')
-            else:
-                print('[启动LOL] 未录制点击流程 → 本次只启动登录器')
-
+            # v4.8.0: run_flow 已无 steps 参数 —— 只启动登录器, 不做任何模拟点击。
             ok, msg = _lol_launcher.run_flow(
                 self._conn,
-                steps=steps,
                 on_status=on_status,
             )
         except Exception as e:
@@ -2227,214 +2561,296 @@ class AppController(QObject):
 
     @ui_slot
     def _on_lol_launch_done(self, ok, msg):
-        """一键启动 LOL 完成 → 主线程收尾。"""
+        """启动 LOL 完成 → 主线程收尾。"""
         self._lol_launching = False
         if ok:
             print(f'[启动LOL] ✅ {msg}')
             # 连上大厅后, 若用户之前没跑脚本, 无需自动启动脚本; 仅提示
+            self._maybe_collapse_to_overlay()
         else:
             print(f'[启动LOL] ❌ {msg}')
             try:
                 QMessageBox.information(
                     self._main, '启动 LOL',
-                    f'{msg}\n\n提示: 若提示凭证过期或缺少按钮坐标, '
-                    f'请先手动启动一次, 并在设置页标定按钮位置。')
+                    f'{msg}\n\n提示: 若凭证过期, 请手动完成一次登录/扫码; '
+                    f'程序不会代替你输入账号或密码。')
             except Exception:
                 pass
 
-    # ==================== 一键启动 LOL 录制 ====================
-    @ui_slot
-    def _on_record_lol(self):
-        """设置页「开始录制 / 停止录制 (F9)」。
+    def _maybe_collapse_to_overlay(self):
+        """v4.8.1(用户要求): 启动 LOL 成功后 → 隐藏主界面 + 打开小窗。
 
-        v4.4.12: 登录器是自绘 UI, 靠猜坐标连改 7 版都在"某一步点空"上打转。
-        改成录制: 用户手动走一遍完整流程, 程序用全局鼠标钩子原样记下每次点击的
-        位置与间隔(见 lcu/recorder.py), 之后一键回放。
-        v4.4.13: 登录器没起来时**自动把它拉起来**(只启动不点击), 不再要求用户先点
-        首页按钮 —— 那个按钮会跑完整自动化把界面点乱, 反而没东西可录。
+        **仅在设置项 lol_launch_to_overlay 开启时生效**, 默认关(v4.8.0 行为不变)。
+
+        ## 为什么必须显式调 safe_show() 而不是只 hide() 主窗
+
+        小窗默认是隐藏的 —— 它平时只在"脚本运行中/对局"时由 _start() 那条链路
+        唤出。而「启动 LOL」这条路径**不启动脚本**, 光把主窗隐藏掉会得到
+        "主窗没了、小窗也没有"的空屏状态, 用户会以为软件挂了。
+
+        ## 为什么这里 safe_show() 是安全的(不会像 _start 那样需要判阶段)
+
+        _start() 里要判 phase != InProgress 是因为**脚本可能在玩家已进入对局时被启动**,
+        此时弹小窗会糊在游戏画面上。而这里刚把登录器拉起来, 玩家至多停在登录/选区,
+        不可能已在对局中 —— 所以直接显示是对的。
+        (若玩家点的时候本来就已在大厅/对局中, run_flow 会走"已在游戏大厅"分支,
+         但那种情况主窗收起同样有意义, 小窗也仍由 _overlay_guard_timer 兜底隐藏。)
         """
-        rec = self._recorder
-        if rec is None:
-            return
-        # --- 录制中 → 停止 ---
-        if rec.is_running:
-            self._finish_recording()
-            return
-
-        # --- 开始录制: 先把登录器准备好(不点击任何按钮) ---
-        win = _lol_launcher.find_window()
-        if not win:
-            # 启动 + 等窗口 + 稳定期最长可能 60s+15s, 绝不能卡在 GUI 线程里 ——
-            # 交给后台线程, 完成后经 _rec_prep_done_sig 排回主线程继续。
-            if self._rec_preparing:
-                print('[录制] 正在准备登录器, 忽略重复请求')
+        try:
+            if not (self._main and self._main.get_settings()
+                    .get('lol_launch_to_overlay')):
                 return
-            self._rec_preparing = True
+            if self._overlay:
+                self._overlay.safe_show()
+            # 延到下一拍再隐主窗: 此刻我们还在"点按钮"这条调用链上(信号槽里),
+            # 立刻 hide() 会连同这次点击的收尾一起被吃掉; 让出事件循环一拍更稳。
+            if self._main:
+                QTimer.singleShot(0, self._main.hide)
+            print('[启动LOL] 已按设置收起主界面并打开小窗')
+        except Exception as e:
+            # 任何异常都不该让"启动 LOL 成功"这件事变成失败提示
+            print(f'[启动LOL] 收起主界面失败(不影响已经打开的登录器): '
+                  f'{type(e).__name__}: {e}')
+
+    # ==================== 授权（v4.7.0）====================
+    # 设计要点：
+    #  ① **门禁只卡"启动脚本"这一个动作**，不卡程序启动。
+    #     界面/账号查询/启动 LOL 本身不产生付费价值，卡住只会让买家以为
+    #     软件坏了、直接退款；真正的价值是"挂机自动化"，卡这里既够狠又不误伤
+    #     体验，而且买家看得到机器码、知道该怎么激活。
+    #  ② **不能阻塞 GUI 线程**。指纹采集要 spawn PowerShell（**实测 2026-10-23
+    #     本机冷启动 1.5 s**，不是原来的"~190ms"）、验签 ~128ms，合计 1.6 s+；
+    #     而 _start() 的既有约定是"必须秒回"（见它 docstring：曾因同步跑阻塞调用
+    #     导致 Windows 报"程序未响应"）。所以状态在**后台线程预热**，_start() 只读缓存。
+    #     ⚠️ v4.9.3: 原注释写"~190ms / 合计 300ms+"，比实测小 8 倍。同一句错误量级
+    #     也让激活窗那边漏掉了同样的处理（P1-E：开窗白屏 1.5 s）—— 数字报小了，
+    #     "这值得改"就变成了"这无所谓"。
+    #  ③ 状态没就绪时既不静默放行、也不卡住界面 —— 记下"用户想启动"，
+    #     结果回来后再兑现（_lic_pending_start）。
+    def _prewarm_license(self):
+        """后台线程跑一次授权检查，结果经信号回主线程。启动时调一次。"""
+        if self._lic_checking or self._lic_status is not None:
+            return
+        self._lic_checking = True
+
+        def worker():
+            try:
+                from core import licensing as L
+                st = L.check()
+            except Exception as e:
+                # 检查本身崩了 → 造一个"未激活"状态，**不能因此放行**
+                try:
+                    from core import licensing as L
+                    st = L.LicenseStatus(False, f'授权检查异常：{type(e).__name__}: {e}')
+                except Exception:
+                    st = None
+            try:
+                self._lic_result_sig.emit(st)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name='lic-check').start()
+
+    @ui_slot
+    def _on_lic_result(self, st):
+        self._lic_checking = False
+        self._lic_status = st
+        if st is None:
+            print('[授权] 检查未返回结果(按未激活处理)')
+        elif st.activated:
+            print(f'[授权] 已激活, 有效期 {st.expires_text}')
+        else:
+            print(f'[授权] 未通过: {st.reason}')
+
+        # v4.7.1: 把结果推给首页那张**常驻**授权卡。
+        # 为什么必须推：用户要靠这张卡看到"试用剩几天"和"自己的机器码"，
+        # 而机器码是要发给卖家换授权码的 —— 看不到就没法完成购买流程。
+        self._refresh_license_card()
+
+        # 用户在检查期间点了"启动"（或"输入授权码"）→ 现在兑现。
+        # 意图分三种（见 _maybe_auto_start_on_connect 与 _on_open_activation）：
+        #   'user'     —— 是他主动点"启动"，未激活就弹激活窗；
+        #   'auto'     —— 是连上客户端自动排的，未激活就静默跳过，别打扰；
+        #   'activate' —— 是他主动点"输入授权码"，**只弹窗、绝不启动脚本**。
+        #                 ⚠️ v4.9.3: 这一分支是必须的 —— 没有它时，"想激活"会被
+        #                 当成"想启动"，而试用期用户 _license_ok() 为真，于是
+        #                 点激活反而直接开始挂机（见 _on_open_activation 的说明）。
+        if self._lic_pending_start:
+            intent = self._lic_pending_start
+            self._lic_pending_start = None
+            if intent == 'activate':
+                self._prompt_activation(force_reason_clear=True)
+            elif self._license_ok():
+                self._start()
+            elif intent == 'user':
+                self._prompt_activation()
+            else:
+                print('[自动启动] 未激活, 跳过(自动路径不弹窗)')
+
+    def _refresh_license_card(self):
+        """把当前授权状态推给首页授权卡（UI 只读，不自己判定）。"""
+        try:
+            if self._main and hasattr(self._main, 'update_license_card'):
+                self._main.update_license_card(self._lic_status)
+        except Exception as e:
+            print(f'[授权] 刷新首页授权卡失败: {type(e).__name__}: {e}')
+
+    @ui_slot
+    def _on_open_activation(self):
+        """首页授权卡「输入授权码」被点击 → 打开激活窗。
+
+        与 `_prompt_activation` 的区别：那是"被拦下时"弹（带失败原因），
+        这里是用户**主动**想激活 —— 所以不弹"你又没授权"这类语气，
+        直接把窗打开让他粘码。
+
+        ⚠️ v4.9.3 修（真缺陷，不是措辞问题）：原实现调
+        `self._prompt_activation(force_reason_clear=True)`，而那个方法在
+        `_lic_status is None` 时会置 `_lic_pending_start = 'user'` 然后 **return**
+        —— 于是用户只是想激活，结果 `_on_lic_result` 把"用户想启动"兑现成
+        `self._start()`。对**任何还在 7 天试用期里的用户**（`_license_ok()`
+        为真，已实测 `usable=True`），软件会跳过激活窗直接开始挂机。
+        这里传 intent='activate'，让预热结果回来后走"只弹窗、不启动"分支。
+        """
+        try:
+            if self._lic_status is None:
+                # 还没查出来：先预热，结果回来后由 _on_lic_result 只推卡片状态/弹窗。
+                # **不记 pending_start**：他只是想激活，不是想启动脚本。
+                self._lic_pending_start = 'activate'
+                self._prewarm_license()
+            # 主动激活：激活成功后**只刷新状态，不启动脚本**（见 _on_license_activated）
+            self._lic_activation_reason = 'manual'
+            self._prompt_activation(force_reason_clear=True)
+        except Exception as e:
+            print(f'[授权] 打开激活窗失败: {type(e).__name__}: {e}')
+
+    def _license_ok(self):
+        """能否放行启动脚本。**只读缓存，不做阻塞检查**（缓存未就绪返回 False）。
+
+        只认 LicenseStatus.usable —— 它涵盖"已激活未过期"和"试用期内"。
+        **不要改成只看 activated**：那会把试用期用户关在门外，而试用期
+        正是老买家从"免费用"过渡到"付费"的缓冲（见 licensing.TRIAL_DAYS）。
+
+        未就绪返回 False 是"安全侧"选择：宁可让用户多点一次，也不放行。
+        """
+        try:
+            st = self._lic_status
+            return bool(st is not None and st.usable)
+        except Exception as e:
+            print(f'[授权] 判定异常(按未激活处理): {type(e).__name__}: {e}')
+            return False
+
+    @ui_slot
+    def _retry_prompt_when_ready(self, force_reason_clear=False):
+        """预热还没回来时排的一次重试：就绪了就弹窗，否则再等一轮。
+
+        v4.9.3 新增。上下文：`_prompt_activation` 在状态未就绪时不再偷偷记
+        `_lic_pending_start`（那会导致"点激活却启动脚本"），但"用户主动点激活"
+        这条路径又确实需要弹窗 —— 于是改成在这里短轮询等待。
+        最多等约 6 秒（15 次 × 400ms），比指纹采集(实测 1.5s)留足余量；
+        超时就放弃（用户可再点一次按钮），绝不无限空转。
+        """
+        try:
+            if self._lic_status is not None:
+                self._prompt_activation(force_reason_clear=force_reason_clear)
+                return
+            n = getattr(self, '_lic_prompt_retries', 0) + 1
+            self._lic_prompt_retries = n
+            if n > 15:
+                self._lic_prompt_retries = 0
+                print('[授权] 授权状态迟迟未就绪，停止等待（可再点一次「输入授权码」）')
+                return
+            QTimer.singleShot(
+                400, lambda: self._retry_prompt_when_ready(force_reason_clear))
+        except Exception as e:
+            print(f'[授权] 等待状态就绪失败: {type(e).__name__}: {e}')
+
+    def _license_expired(self):
+        """授权已到期（不是试用）。用于给弹窗一句准确的原因。"""
+        st = self._lic_status
+        return bool(st is not None and st.activated and not st.usable)
+
+    @ui_slot
+    def _prompt_activation(self, force_reason_clear=False):
+        """弹激活窗。状态未就绪时先触发预热，等结果回来再决定弹不弹。
+
+        `force_reason_clear=True`（v4.7.1）用于**用户主动点「输入授权码」**的场景：
+        此时不显示"你没有授权"这类失败原因 —— 他本来就知道自己要激活，
+        再顶一句红字像是被指责。只有"被拦下"时才带原因（那才需要解释为什么）。
+
+        ⚠️ v4.9.3: 状态未就绪时**不再**在这里偷偷置 `_lic_pending_start='user'`。
+        旧实现那样写，导致"用户主动点激活"被当成"用户想启动脚本" —— 调用方
+        （`_on_open_activation`）明确只想要弹窗，却因为这个副作用在试用期内
+        直接启动了脚本。现在把意图交给调用方显式指定，本方法只负责"没就绪就
+        等一下"。
+        """
+        if self._lic_status is None:
+            # 还没查出来：起检查，让结果回来后再走本方法。
+            # 不在这里改 _lic_pending_start —— 意图由调用方决定（见 docstring）。
+            self._prewarm_license()
+            # 排一次重试：预热完成后 _on_lic_result 会推卡片状态，但**不会**
+            # 自动再弹窗（除非调用方记了 pending）。这里用一个短延时兜住
+            # "用户直接点了激活、但没有任何 pending 意图"的场景。
+            QTimer.singleShot(400, lambda: self._retry_prompt_when_ready(
+                force_reason_clear))
+            return
+        try:
+            from ui.activation_dialog import ActivationDialog
+
+            reason = ''
+            if not force_reason_clear:
+                if self._license_expired():
+                    reason = f'授权已于 {self._lic_status.expires_text} 到期，请续期。'
+                elif not self._lic_status.activated:
+                    reason = self._lic_status.reason
+
+            if self._lic_dlg is not None:
+                # 已经开着就抬到前面，别叠出第二个窗
+                try:
+                    self._lic_dlg.show()
+                    self._lic_dlg.raise_()
+                    self._lic_dlg.activateWindow()
+                    return
+                except Exception:
+                    self._lic_dlg = None
+
+            dlg = ActivationDialog(reason=reason)
+            dlg.activated.connect(self._on_license_activated)
+            self._lic_dlg = dlg      # 保持引用：局部变量会被 GC，弹窗瞬间消失
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f'[授权] 打开激活窗失败: {type(e).__name__}: {e}')
             try:
                 if self._main:
-                    self._main.append_log('[录制] 正在启动登录器, 请稍候…')
+                    self._main.append_log(f'[授权] 需要激活，但激活窗打开失败：{e}')
             except Exception:
                 pass
-            print('[录制] 登录器未启动, 后台拉起(不点击任何按钮)…')
-            threading.Thread(target=self._rec_prep_worker, daemon=True,
-                             name='rec-prep').start()
-            return
-
-        self._begin_recording_with_window(win)
-
-    def _rec_prep_worker(self):
-        """后台: 只启动登录器 + 等窗口稳定, 不做任何点击。"""
-        win = None
-        try:
-            win = _lol_launcher.prepare_for_recording(
-                on_status=lambda m: print(f'[录制] {m}'))
-        except Exception as e:
-            print(f'[录制] 准备登录器异常: {type(e).__name__}: {e}')
-        self._rec_prep_done_sig.emit(win if win else None)
 
     @ui_slot
-    def _on_rec_prep_done(self, win):
-        """登录器准备好 → 主线程继续开录。"""
-        self._rec_preparing = False
-        if not win:
-            try:
-                QMessageBox.warning(
-                    self._main, '开始录制',
-                    '无法启动 LOL 登录器（未找到 TCLS\\client.exe）。\n\n'
-                    '请确认已安装英雄联盟。')
-            except Exception:
-                print('[录制] 登录器准备失败')
-            return
-        self._begin_recording_with_window(win)
+    def _on_license_activated(self):
+        """激活成功后强制重查授权，并按"为什么打开激活窗"决定是否接着启动。
 
-    def _begin_recording_with_window(self, win):
-        """拿到登录器窗口后真正开录(弹提示 → 装钩子 → 隐藏主窗)。"""
-        rec = self._recorder
-        if rec is None:
-            return
-        rect = (win['left'], win['top'], win['right'], win['bottom'])
+        不兑现的话用户会以为"激活了但没反应"，然后反复点 —— 这是实测中最
+        容易让人觉得软件有毛病的交互。
 
-        # 顺序很重要: **先**弹提示(主窗还可见, 提示框有正常父窗口), 用户点掉之后
-        # 再装钩子 + 隐藏主窗 —— 否则提示框会挂在已隐藏的窗口上, 且用户点「确定」
-        # 那一下本身也会被录进去。
-        #
-        # v4.4.17: 文案**不写死登录方式**。原先写的是"QQ登录 → 切换快速登录 → 勾选我
-        # 已阅读 → …"这套完整流程 —— 那只是作者本机的一种走法。别人可能用微信登录、
-        # 账号密码登录、扫码、或者客户端记住登录态后根本不用登录, 写死只会误导。
-        # 改成通用口径: 你怎么平时进游戏, 就怎么走一遍。
-        try:
-            QMessageBox.information(
-                self._main, '开始录制',
-                '接下来会记录你在登录器上的鼠标点击。\n\n'
-                '请按你平时的习惯，把「从打开登录器到进入游戏」完整走一遍就行\n'
-                '（用什么方式登录都可以：QQ / 微信 / 账号密码 / 扫码…都支持，\n'
-                '  程序只记录你点了哪里、隔多久点的，不关心你点的是什么）。\n\n'
-                '• 从登录器界面开始点，一路点到进入大厅为止\n'
-                '• ⚠️ 录制期间不要拖动登录器窗口\n'
-                '• 走完按键盘 F9 停止录制')
-        except Exception:
-            pass
-
-        if not rec.start(rect):
-            try:
-                QMessageBox.warning(
-                    self._main, '开始录制',
-                    '录入钩子安装失败（可能被安全软件拦截）。\n'
-                    '建议先退出杀软的"鼠标防护/宏拦截"，再试一次。')
-            except Exception:
-                pass
-            print('[录制] 钩子安装失败')
-            return
-
-        self._rec_rect = rect
-        print(f'[录制] 开始录制 (登录器窗口 {win["w"]}x{win["h"]} @({win["left"]},{win["top"]}))')
-        try:
-            self._main.set_recording_ui(True, 0)
-        except Exception:
-            pass
-
-        # 隐藏助手主窗, 免得挡住登录器
-        try:
-            if self._main:
-                self._main.hide()
-        except Exception:
-            pass
-
-        self._rec_btn_timer = QTimer(self)
-        self._rec_btn_timer.timeout.connect(self._tick_recording)
-        self._rec_btn_timer.start(500)
-        self._rec_deadline = _time.monotonic() + self.RECORD_MAX_S
-
-    # v4.4.12: 录制最长时长(秒) —— 用户可能走完流程忘了按 F9, 到点自动收尾,
-    # 免得钩子一直挂着、每次鼠标点击都白记一笔。
-    RECORD_MAX_S = 300.0
-
-    def _tick_recording(self):
-        """录制期间刷新已录步数; 钩子线程检测到 F9 会自行结束, 这里收尾。"""
-        rec = self._recorder
-        if rec is None:
-            return
-        if rec.is_running:
-            try:
-                self._main.set_recording_ui(True, rec.count())
-            except Exception:
-                pass
-            # 忘记按 F9 的兜底: 超时自动停
-            if _time.monotonic() >= getattr(self, '_rec_deadline', 0):
-                print(f'[录制] 已达最长录制时长({self.RECORD_MAX_S:.0f}s), 自动停止')
-                self._finish_recording()
-            return
-        # 钩子已停(用户在 F9 上停了) → 收尾
-        self._finish_recording()
-
-    def _finish_recording(self):
-        """停止录制 → 保存步骤序列 → 恢复 UI。"""
-        rec = self._recorder
-        try:
-            if getattr(self, '_rec_btn_timer', None) is not None:
-                self._rec_btn_timer.stop()
-                self._rec_btn_timer = None
-        except Exception:
-            pass
-        if rec is None:
-            return
-        steps = rec.stop(getattr(self, '_rec_rect', None))
-        n = len(steps)
-        dropped = int(getattr(rec, 'last_dropped', 0) or 0)
-        if dropped:
-            print(f'[录制] 已丢弃 {dropped} 次落在登录器窗口外的点击（点到了别处）')
-        if n:
-            try:
-                self._main.persist_setting('lol_steps',
-                                           [[round(fx, 4), round(fy, 4), round(w, 2)]
-                                            for fx, fy, w in steps])
-            except Exception as e:
-                print(f'[录制] 保存步骤失败: {type(e).__name__}: {e}')
-            print(f'[录制] 已录制 {n} 步并保存')
-            for i, (fx, fy, w) in enumerate(steps, 1):
-                print(f'[录制]   第{i}步 frac=({fx:.4f},{fy:.4f}) 等待{w}s')
+        ⚠️ v4.9.3: 但**不能无条件兑现**。用户可能只是主动点「输入授权码」
+        补个授权（他本来就在试用期里用得好好的），激活后自动开始挂机是
+        他没要求的行为。所以这里按 `_lic_activation_reason` 区分：
+          · 'blocked' —— 点"启动"被授权门禁拦下才弹的窗 → 激活后接着启动；
+          · 'manual'  —— 用户自己点「输入授权码」→ 只刷新状态，不启动。
+        """
+        self._lic_dlg = None
+        self._lic_status = None          # 作废旧缓存，必须重查（码变了）
+        self._lic_checking = False
+        if getattr(self, '_lic_activation_reason', 'manual') == 'blocked':
+            self._lic_pending_start = 'user'   # 激活完接着把这次启动兑现掉
         else:
-            print('[录制] 未录到任何点击, 保持原有步骤不改动')
-        try:
-            self._main.set_recording_ui(False)
-            if self._main:
-                self._main.show()
-                self._main.raise_()
-                self._main.activateWindow()
-        except Exception:
-            pass
-        if not n:
-            try:
-                QMessageBox.information(
-                    self._main, '录制结束',
-                    '没有记录到任何点击。\n\n'
-                    '常见原因：\n'
-                    '• 点击落在了大蛋小助手自己的界面上（只记录登录器上的点击）\n'
-                    '• 还没开始点就按了 F9\n'
-                    '• 鼠标钩子被安全软件拦截（可试着关闭杀软的鼠标防护/宏拦截）\n\n'
-                    '请重新点「开始录制」再走一遍。')
-            except Exception:
-                pass
+            self._lic_pending_start = None     # 主动激活：只要状态，不启动
+        self._lic_activation_reason = None
+        self._prewarm_license()
 
     def _start(self):
         """启动脚本(GUI 线程,必须立即返回)。
@@ -2445,7 +2861,22 @@ class AppController(QObject):
         客户端没开/假死时用户点"启动"后主界面十几秒不响应,Windows 直接报
         "程序未响应"。现在阻塞段全部移入 _start_worker 后台线程,本方法只做
         "能在 GUI 线程安全秒回"的事(提权检查 + 单飞标志 + 派发)。
+
+        v4.7.0: 这里也是**授权门禁的唯一收口点**。脚本启动有 3 条路径
+        (首页按钮 / 小窗按钮 / 连上客户端自动启动), 它们全部汇到本方法,
+        所以只要卡住这里就不必在每处各写一遍校验 —— 那种写法必漏。
+        校验失败时弹激活窗并**直接 return**, 绝不放行。
         """
+        # v4.7.0: 授权门禁 —— 未激活 / 过期 / 换机 都不允许启动脚本。
+        # 放在提权检查**之前**: 提权会重启进程(弹 UAC), 对一个根本没授权的
+        # 用户弹 UAC 既无意义又容易被当成"要管理员权限才能盗用"。
+        if not self._license_ok():
+            # 被拦下：状态未就绪时让预热结果回来后弹窗（意图=启动）
+            self._lic_pending_start = 'user'
+            self._lic_activation_reason = 'blocked'
+            self._prompt_activation()
+            return
+
         # v4.1.58: 启动脚本前先查"自动选英雄"权限。实测(2026-09-09 真实日志):
         # 非管理员进程对管理员权限的 LOL 客户端(leagueclientux.exe)模拟点击会被
         # UIPI 静默丢弃(cursor/sendinput/postmsg 三机制全失效), 点卡 12 个点全
@@ -2572,12 +3003,12 @@ class AppController(QObject):
                 self._tray_toggle.setIcon(icon_tray_stop())
             if self._overlay:
                 try:
-                    # v4.3.10: 用 set_conn_indicator 而不是 update_connection_status。
-                    # 后者只驱动底部 _conn_dot/_conn_lbl, 顶部 _live_dot 仍是旧的
-                    # → 点启动的瞬间会出现"底部已连接、顶部未连接"的自相矛盾显示。
-                    self._overlay.set_conn_indicator(
-                        self._conn.is_connected,
-                        '已连接' if self._conn.is_connected else '未连接')
+                    # v4.7.3: 这里原先是 `set_conn_indicator(self._conn.is_connected, …)` ——
+                    # 而 `is_connected` 只是"端口/令牌非 None"的判空, **不探活**, 也
+                    # 完全不知道 WS 是否已 on_open。用它决定界面颜色, 就会出现"WS 已经
+                    # 连上、界面却被打成未连接"的第三种撕裂。改走唯一收口点, 与
+                    # _apply_ui_connected 用同一套权威判据(WS on_open 优先)。
+                    self._sync_conn_state()
                     self._overlay.set_script_running(True)
                     # v4.1.65: 不再无条件 safe_show()。启动这一瞬间核心线程正在跑
                     # _reconcile_state 取真实阶段, 让 400ms 后按阶段决定显隐
@@ -2672,7 +3103,14 @@ class AppController(QObject):
             traceback.print_exc()
             msg = f'{type(e).__name__}: {e}'
         print(f'[全部停止] {("✅ " if ok else "⚠️ ") + msg} → 3 秒后停止脚本')
-        time.sleep(STOP_ALL_DELAY_S)
+        # v4.6.5 修: 原写 `time.sleep(...)` —— 但本模块导入的是 `import time as _time`
+        # (第 19 行), 全局根本没有 `time` 这个名字, 于是这里必然抛
+        # NameError: name 'time' is not defined。
+        # 后果(实测 2026-10-10 日志 + uncaught.log 两条): 后台线程在这里当场崩掉,
+        # 下一行的 _stop_all_done_sig.emit 永不执行 → **「全部停止」只关了 LOL,
+        # 脚本永远停不下来**, 而且界面没有任何提示(异常发生在 daemon 线程里,
+        # 只有 uncaught.log 留痕)。用户看到的现象就是"点了没反应"。
+        _time.sleep(STOP_ALL_DELAY_S)
         self._stop_all_done_sig.emit(ok, msg)
 
     @ui_slot
@@ -2743,17 +3181,8 @@ class AppController(QObject):
         # v4.4.0(P0-2): 清掉启动单飞标志 —— 若启动还在后台跑, 收尾后
         # _on_start_done 会走回滚分支, 不会往已关闭的窗口上发信号。
         self._starting = False
-        # v4.4.12: 若正在录制, 退出前必须停掉全局鼠标钩子 —— 钩子挂在后台线程上,
-        # 进程活着而线程被强杀会留下系统级钩子悬挂(鼠标响应变卡)。
-        try:
-            if getattr(self, '_rec_btn_timer', None) is not None:
-                self._rec_btn_timer.stop()
-                self._rec_btn_timer = None
-            if self._recorder is not None and self._recorder.is_running:
-                self._recorder.stop(getattr(self, '_rec_rect', None))
-                print('[录制] 退出前已停止录制并卸载鼠标钩子')
-        except Exception:
-            pass
+        # v4.8.0: 原先这里要停掉录制的全局鼠标钩子(钩子挂在后台线程上, 进程活着而
+        # 线程被强杀会留下系统级钩子悬挂)。录制功能已整体删除, 此项收尾随之移除。
         for t in (self._ui_conn_refresh_timer, self._reconnect_timer, self._mini_log_timer,
                   self._overlay_guard_timer, self._pending_hide_timer):
             try:
@@ -2839,24 +3268,36 @@ class AppController(QObject):
             return
         self._main.start_script_signal.connect(self._start)
         self._main.stop_script_signal.connect(self._stop)
-        # v4.4.5: 首页「一键启动 LOL」按钮
+        # v4.4.5: 首页「启动 LOL」按钮
         self._main.launch_lol_signal.connect(self._launch_lol)
-        # v4.4.12: 设置页「开始录制 / 停止录制」
-        self._main.record_lol_signal.connect(self._on_record_lol)
+        # v4.8.0: 设置页「开始录制 / 停止录制」已随录制回放功能删除
+        # (record_lol_signal 与 _on_record_lol 一并移除)。
         # v4.4.16: 首页「全部停止」
         self._main.stop_all_signal.connect(self._stop_all)
         self._main.minimize_signal.connect(self._minimize)
         self._main.close_signal.connect(self._minimize_to_tray)
         self._main.settings_changed_signal.connect(self._on_settings)
+        # v4.7.0: 授权检查（后台线程）→ 主线程。放在信号连接处统一接。
+        self._lic_result_sig.connect(self._on_lic_result)
+        # v4.7.1: 首页授权卡「输入授权码」→ 打开激活窗。
+        # 卡片**常驻可见**，用户任何时候都能主动激活，不必等"被拦住"才看到入口。
+        self._main.open_activation_signal.connect(self._on_open_activation)
         # v34: 设置页打开"自动选英雄" → 触发提权重启流程
         self._main.auto_select_champion_request_signal.connect(self._on_auto_select_champion_request)
         # v4.1.60: 须知确认后补查提权(升级场景 agreement 缺失)
         self._main.agreement_confirmed_signal.connect(self._maybe_elevate_on_startup)
+        # v4.6.3: 设置页「清理缓存」(空列表 = 只清点不清理)
+        self._main.clean_cache_signal.connect(self._on_clean_cache)
 
         self._overlay.swap_signal.connect(self._on_swap)
         self._overlay.accept_signal.connect(self._on_accept)
         self._overlay.decline_signal.connect(self._on_decline)
-        self._overlay.stop_signal.connect(self._stop)
+        # v4.6.11: **删除** `self._overlay.stop_signal.connect(self._stop)` ——
+        # 该信号全项目**从未 emit**(小窗的"运行/停止"实际走 toggle_script_signal,
+        # 见 overlay_window 里 `_run_btn.clicked.connect(self.toggle_script_signal)`)。
+        # 留一条"已连接但永不触发"的线, 会让排查者以为小窗有独立的停止入口,
+        # 从而在 toggle 路径上找错方向。信号本身保留(已是公开 API, 删掉可能
+        # 影响外部脚本); 将来若真要用, 补 emit 时再把这行连回来。
         self._overlay.toggle_script_signal.connect(self._toggle_script)
         self._overlay.show_main_signal.connect(self._show_main)
         self._overlay.close_signal.connect(lambda: (self._stop(), self._show_main()))
@@ -2905,6 +3346,11 @@ class AppController(QObject):
         且非管理员, 直接弹提权引导(复用 _on_auto_select_champion_request)。
         首次启动(agreement_accepted=False)跳过 —— 须知弹窗优先, 且此时尚未开
         auto_select。
+
+        v4.7.3 说明: **这里只查「自动选英雄」**，不查启动 LOL。
+        理由：自动选英雄是常驻能力，开着就每次选人都要权限，值得开机先把权限备好；
+        v4.8.0: 启动 LOL 已不需要任何权限（录制回放删除后不再模拟点击），
+        因此更没有任何理由在开机时替它弹 UAC。
         """
         try:
             s = self._main.get_settings() if self._main else {}
@@ -2916,11 +3362,11 @@ class AppController(QObject):
             if is_admin():
                 return
             print('[启动] 自动选英雄已开启但当前非管理员, 启动时引导提权')
-            self._on_auto_select_champion_request()
+            self._on_auto_select_champion_request(reason='auto_select')
         except Exception as e:
             print(f'[启动] 启动时提权检查异常(忽略): {type(e).__name__}: {e}')
 
-    def _on_auto_select_champion_request(self):
+    def _on_auto_select_champion_request(self, reason: str = 'auto_select'):
         """v35: 设置页开启「自动选英雄」→ 权限判定 + (必要时)提权重启。
 
         v34 实测教训: 用户已是管理员进程时旧 process_elevated() 误报非管理员
@@ -2933,6 +3379,13 @@ class AppController(QObject):
         return 不再继续); False=用户取消 UAC(自动选英雄开关已回退关闭)。供
         _start 启动脚本时复用(settings 已持久化 auto_select=True 但双击普通
         启动的场景, 点开关信号不会触发, 必须在这里补查)。
+
+        v4.7.3: 加 `reason` 参数 —— 需要提权的原因不止"自动选英雄"一种，
+        旧实现在多种情况下都弹同一句"「自动选英雄」需要以管理员身份运行"，
+        对其它原因是**错的**：用户压根没开自动选英雄，看到这句会以为程序搞错了，
+        甚至以为在乱要权限。文案必须说出本次真正的原因。
+        v4.8.0: 录制回放删除后, 走 _ELEVATE_REASON 的只剩 auto_select 一个原因
+        (「全部停止」走 _elevate_for_lol, 不走这里)。
         """
         # v4.1.64: 去重 —— 已发起过提权请求则不再重复弹框/runas
         if self._elevate_requested:
@@ -2943,12 +3396,13 @@ class AppController(QObject):
             elevated = is_admin()
         except Exception:
             elevated = False
-        print(f'[设置] 自动选英雄请求: 当前进程管理员={elevated}')
+        print(f'[设置] 提权请求({reason}): 当前进程管理员={elevated}')
         if elevated:
-            print('[设置] 已是管理员权限, 自动选英雄直接生效(不重启)')
+            print('[设置] 已是管理员权限, 直接生效(不重启)')
             try:
                 if self._main:
-                    self._main.append_log('[设置] 自动选英雄已开启(管理员权限, 直接生效)')
+                    self._main.append_log(
+                        f'[设置] {_ELEVATE_REASON[reason][0]}(管理员权限, 直接生效)')
             except Exception:
                 pass
             return True
@@ -2965,18 +3419,28 @@ class AppController(QObject):
         try:
             from PyQt5.QtWidgets import QMessageBox
             if self._main:
+                title, why, hint = _ELEVATE_REASON.get(
+                    reason, _ELEVATE_REASON['auto_select'])
                 box = QMessageBox(self._main)
                 box.setWindowTitle('需要管理员权限')
-                box.setText('「自动选英雄」需要以管理员身份运行才能模拟点击选卡。')
-                box.setInformativeText(
-                    '接下来会弹出 Windows 用户账户控制(UAC)窗口。\n'
-                    '请点「是」允许 → 程序将以管理员权限自动重启。')
+                box.setText(f'「{title}」需要管理员权限')
+                box.setInformativeText(f'{why}\n\n{hint}\n\n'
+                                       '接下来会弹出 Windows 用户账户控制(UAC)窗口。\n'
+                                       '请点「是」允许 → 程序将以管理员权限自动重启')
                 box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
                 box.setDefaultButton(QMessageBox.Ok)
                 ret = box.exec_()
                 if ret != QMessageBox.Ok:
-                    print('[设置] 用户取消了管理员授权, 开关保持关闭')
-                    self._revert_auto_select_champion()
+                    print('[设置] 用户取消了管理员授权')
+                    # v4.7.3: **只回退本次真正相关的那项设置**。
+                    # 不能一律调 _revert_auto_select_champion —— 那会把用户没碰过的
+                    # 「自动选英雄」悄悄关掉, 而用户取消的只是"这次提权"。
+                    # v4.8.0: 现在只有 auto_select 会走到这里, 保留条件判断是为了
+                    # 将来新增原因时不会误伤其它设置。
+                    if reason == 'auto_select':
+                        self._revert_auto_select_champion()
+                    else:
+                        print('[设置] 取消的是 LOL 相关提权, 不动「自动选英雄」开关')
                     return False
         except Exception as e:
             print(f'[设置] 提示框异常: {type(e).__name__}: {e}')
@@ -3044,6 +3508,10 @@ class AppController(QObject):
                 sys.stderr.flush()
             except Exception:
                 pass
+            # v4.9.1: 走 _exit 之前隔离自己的解压目录 —— 否则 bootloader 收尾时
+            # 发现删不掉(里面的 DLL 可能被 LoL 进程映射着), 会弹一个模态框把
+            # 进程卡在那儿等用户点「确定」。详见 _quarantine_own_runtime_dir。
+            _quarantine_own_runtime_dir()
             _os._exit(0)
 
     # ==================== v4.3.8: 版本检查功能已整体移除 ====================
@@ -3161,12 +3629,12 @@ class AppController(QObject):
         # 普通启动的场景, 点卡会被 UIPI 拦截)。延迟 800ms 避开首帧渲染, 且须知弹窗
         # (首次启动)已在前面 singleShot 触发, 若 auto_select 开着会在此引导提权。
         QTimer.singleShot(800, self._maybe_elevate_on_startup)
-        # v4.4.7: 提权重启后自动继续「一键启动 LOL」
-        # (_elevate_for_lol 用 ShellExecuteW(runas) 时把 --launch-lol 作为参数传入,
-        #  管理员实例起来后据此接管, 用户不用再点第二次按钮。)
-        if '--launch-lol' in sys.argv:
-            print('[启动LOL] 检测到 --launch-lol(提权后接管), 1.5s 后自动继续')
-            QTimer.singleShot(1500, self._launch_lol)
+        # v4.7.0: 启动后就后台预热授权状态（指纹采集 + 验签约 300ms）。
+        # 放 300ms 延后是为了避开首帧渲染/闪屏淡出，别和启动动画抢 CPU。
+        # 预热完成前用户若点"启动"，不会放行也不会卡界面（见 _prompt_activation）。
+        QTimer.singleShot(300, self._prewarm_license)
+        # v4.8.0: 启动 LOL 已不需要管理员权限(录制回放删除后没有模拟点击了),
+        # 所以 --launch-lol 接管分支随之删除 —— 现在只有「全部停止」会提权重启。
         # v4.4.16: 「全部停止」提权重启后自动继续关 LOL
         if '--stop-all' in sys.argv:
             print('[全部停止] 检测到 --stop-all(提权后接管), 1.5s 后自动继续')
@@ -3298,7 +3766,11 @@ def _crash_dir():
     return os.path.join(base, 'data', 'logs')
 
 
-_UNCAUGHT_MAX_BYTES = 512 * 1024
+# v4.6.11: 与 core.logger 的 app.log 用**同一个**上限常量 —— 原先这里和
+# logger.LOG_MAX_BYTES 各写一份 `512 * 1024`, 而两处的注释都声称"与对方策略
+# 一致"。值各写各的, 改一处另一处不会跟。uncaught.log 本就应该和 app.log
+# 同样的轮转口径, 直接复用其常量。
+_UNCAUGHT_MAX_BYTES = LOG_MAX_BYTES
 
 
 def _append_uncaught(header, text):
@@ -3397,7 +3869,286 @@ def _install_excepthooks():
         pass
 
 
+# v4.6.7: 判定"解压残骸是否已陈旧"的最小年龄(秒)。
+# 用于 _runtime_dir_in_use 判据② —— 防"另一个实例正在解压"的竞态:
+# 刚解压出来的目录里文件还在写入、尚未被映射, "试打开"会全部成功,
+# 只看文件锁就会把它误判为死目录并删掉(实测确认这正是启动失败的成因)。
+# 2 分钟足够覆盖一次解压(实测冷启动解压 < 3 秒), 又远小于两次会话间隔。
+_RT_STALE_MIN_AGE_S = 120.0
+
+# v4.9.1: 退出时把自己的 _MEIPASS 改名, 让 PyInstaller bootloader 那句
+#         "Failed to remove temporary directory: ...\_MEI000052182" 弹框
+#         根本不发生(它按**原路径**删除, 找不到 = 视作已删干净, 静默退出)。
+#         实测(2026-10-23, 独立 onefile 探针): 运行前 _MEI 数 3 → 运行后
+#         多出一个 `_MEI000053642_QUAR`, 进程 exit code 0、无弹窗。
+_RT_QUARANTINE_SUFFIX = '_QUAR'
+
+# v4.9.1: 判定"文件是否真被别的进程占用", 只认这两个 Win32 错误码 ——
+#         它们是**语义不同**的两件事, 而 Python 的 os.open 把两者塌缩成
+#         同一个 PermissionError, 这正是 v4.6.7 起"残骸永远清不掉"的根因。
+#   实测(2026-10-23, 对照实验):
+#     ① 文件被 icreateLol.exe 映像映射 → GENERIC_WRITE 报 ERROR_SHARING_VIOLATION(32)
+#     ② 文件只是 DACL 不给写(提权实例创建, 中完整性进程看它只有 RX)
+#        → GENERIC_WRITE 报 ERROR_ACCESS_DENIED(5); 但同一文件 os.remove **成功**
+#   所以: 32 = 真在用(必须跳过); 5 = 只是没写权(照常清理)。
+_ERROR_SHARING_VIOLATION = 32
+_ERROR_ACCESS_DENIED = 5
+
+
+def _open_probe_error(path):
+    """用 GENERIC_WRITE 试开一个文件, 返回 (ok, winerror)。
+
+    为什么要自己调 CreateFileW 而不是 os.open:
+      os.open(fp, O_RDWR) 抛的 PermissionError **不带 Win32 错误码**
+      (实测 e.winerror 为 None, 只有 errno=13), 拿不到 32 / 5 的区别。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_ALL = 0x7
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        ctypes.set_last_error(0)
+        h = k32.CreateFileW(path, GENERIC_WRITE, FILE_SHARE_ALL, None,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+        if ctypes.cast(h, ctypes.c_void_p).value == ctypes.c_void_p(-1).value:
+            return False, ctypes.get_last_error()
+        k32.CloseHandle(h)
+        return True, 0
+    except Exception:
+        # 探测本身出错 -> 交给调用方按"保守"处理
+        return False, None
+
+
+def _runtime_dir_in_use(path) -> bool:
+    """v4.6.7: 判断一个 onefile 解压目录是否**正在被使用**(只读探测)。
+    为什么要这个函数: 见 _cleanup_stale_runtime_dirs 里"血的教训" ——
+    直接 rmtree 会删残活实例的目录(实测 44 -> 42 文件, 丢的是 Qt5Core.dll 与
+    platforms\\qwindows.dll, 直接导致"no Qt platform plugin could be initialized"),
+    所以必须**先探测后动手**。
+
+    两条判据(任一命中即判"在用"):
+
+      ① **文件被占用** —— 活实例的目录里有大量文件被映射/独占(实测活目录
+         44 个文件里 32 个打不开); 而死目录里所有文件都能打开。这是直接信号。
+         v4.9.1 校准: 判据从"能否 O_RDWR 打开"改成"**Win32 错误码是不是
+         ERROR_SHARING_VIOLATION(32)**"。原写法把"没有写权限"(错误码 5)
+         也当成占用 —— 但那种文件**随时可删**, 于是提权实例留下的残骸
+         被判"在用"无限跳过(实测 2026-10-23: 残留 _MEI000052182 永远清不掉)。
+
+      ② **目录太新** —— 关键补充, 防**解压中的竞态**: 另一个实例刚开始解压时,
+         文件正在写入、**还没被映射**(所以判据①此时全都打得开!), 若只看①
+         就会把它当死目录删掉 —— 正是用户遇到的启动失败场景。
+         正在解压的目录 mtime 是"刚刚", 而真正的残骸至少是上一次会话之前的。
+         故用 _RT_STALE_MIN_AGE_S(2 分钟)做安全垫: 太新一律不碰。
+
+    只读探测: 全程不写、不删、不改名, 因此对活实例零影响。
+
+    ⚠️ 曾试过但**不可靠**的判据: "目录改名成功 = 没人在用" ——
+       实测被映射的 dll 只锁文件、不锁父目录, 活目录改名照样成功。
+
+    保守取向: 任何探测异常都返回 True(当作"在用") —— 宁可漏清, 不可误删。
+    """
+    try:
+        # 判据②: 太新的目录不动(防解压竞态)
+        try:
+            if _time.time() - os.path.getmtime(path) < _RT_STALE_MIN_AGE_S:
+                return True
+        except OSError:
+            return True                  # 取不到时间 -> 保守当作在用
+        names = os.listdir(path)
+    except Exception:
+        return True                      # 连列目录都失败 -> 保守当作在用
+    if not names:
+        return False                     # 空目录(v4.6.6 残留的多为此类, 且已过年龄检查)
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            ok, winerror = _open_probe_error(fp)
+            if ok:
+                continue                 # 能写开 -> 肯定没人独占
+            if winerror is None:
+                return True              # 探测本身失败 -> 保守当作在用
+            if winerror == _ERROR_SHARING_VIOLATION:
+                return True              # 判据①: 真被映射/独占 -> 在用
+            if winerror == _ERROR_ACCESS_DENIED:
+                # v4.9.1: 只是没写权限(DACL 不给), **不代表在用** ——
+                # 这类文件删除只需父目录的 FILE_DELETE_CHILD, 实测可删。
+                # 继续探测下一个文件, 别因为一个 RX-only 文件就整体放弃。
+                continue
+            return True                  # 其它未知错误 -> 保守当作在用
+    return False
+
+
+def _cleanup_stale_runtime_dirs():
+    """v4.6.6: 清掉上一次运行留下的解压残骸。
+
+    背景(实测 2026-10-10): 用户关闭程序后进程不退出, 卡在 PyInstaller 自己的
+    警告框上 —— "Failed to remove temporary directory: ...\\Temp\\_MEI00003fc02"。
+    查证结果: C 盘 Temp 里堆了 **37 个** _MEI* 目录(147.88 MB), 其中
+    **31 个是空目录** —— 说明文件基本都删掉了, 只有目录本身没删掉(退出瞬间
+    目录还被占用/引用, 属于时序问题, 事后随手就能删干净)。
+    另有 2 个只剩 VCRUNTIME140*.dll(进程一直加载着, 必然删不掉)。
+
+    所以这里做"下次启动时补一刀": 把那批残骸清掉, 让垃圾不累积。
+    这也是唯一可靠的做法 —— 进程退出那一刻它自己的目录注定删不干净,
+    与其在退出路径上较劲, 不如交给下一次启动。
+
+    ⚠️ 为什么不用 runtime_tmpdir 把解压目录挪走(试过, 结论是不可行):
+      · 相对路径: 实测其解析基准是**进程当前的工作目录**, 不是 exe 所在目录 ——
+        从 D:\\AI\\大蛋小助手 启动就被解压到该目录下的 data\\_runtime; 换个工作
+        目录(快捷方式/别的盘)就会落到意外位置, 甚至因无权限直接启动失败;
+      · 绝对路径: 会被逐字写进 exe(bootloader 选项 pyi-runtime-tmpdir), 等于把
+        打包机的目录硬编进去; 在打包机上"看似能用", 换台机器就失效。
+      两者都不可取, 故保持 PyInstaller 默认(解压到系统临时目录), 改由本函数兜底。
+
+    ⚠️ 安全边界(四条, 全部必须守住 —— 见下方"血的教训"):
+      1. **只扫系统临时目录下的 _MEI***, 不碰别处;
+      2. **跳过当前进程自己在用的那个目录** —— 通过 sys._MEIPASS 比对;
+      3. **动手前先探测该目录是否被别的实例占用** —— 交给 _runtime_dir_in_use(),
+         它用**两条**判据: ① 逐个文件试独占打开(被映射的 dll 打不开);
+         ② 目录 mtime 太新(2 分钟内)也一律不判死 —— 专防"另一实例正在解压"
+         这个竞态(那时文件还没被映射, 只看①会误判成可删)。任一命中即整个跳过;
+      4. 删除本身失败**直接跳过**, 不报错、不重试纠缠。
+
+    🔴 血的教训(v4.6.7 修复, 实测复现): 最初版本只用 rmtree(ignore_errors=False)
+       直接删, 以为"删不掉会抛异常 = 自然跳过其它实例"。**这是错的** ——
+       rmtree 是**逐文件**删除, 遇到被锁的文件才抛异常, 而**抛之前已经删掉的文件
+       不会回滚**。实测: 同时开两个实例, 后启动的那个把前者的解压目录从
+       44 个文件删到 42 个(少了 2 个), 而那些被删的正是 Python 运行时可能按需
+       加载的文件 —— 活实例随时可能因此崩溃。
+       所以必须先探测、后动手: 探测是只读的, 判活了就完全不碰它。
+       另: 曾想用"目录改名成功=没人在用"来判断, 实测**不可靠** —— 被映射的 dll
+       只锁文件、不锁父目录, 活目录改名照样成功。
+
+    整段包在 try/except 里: 清理失败绝不能影响启动。
+    """
+    try:
+        import tempfile
+        tmp = tempfile.gettempdir()
+        if not tmp or not os.path.isdir(tmp):
+            return
+        cur = os.path.abspath(getattr(sys, '_MEIPASS', '') or '')
+        removed = 0
+        skipped_busy = 0
+        for name in os.listdir(tmp):
+            if not name.startswith('_MEI'):
+                continue
+            p = os.path.join(tmp, name)
+            if not os.path.isdir(p):
+                continue
+            ap = os.path.abspath(p)
+            # 守则 2: 绝不动当前进程正在使用的解压目录
+            if cur and (ap == cur or cur.startswith(ap + os.sep)):
+                continue
+            # 守则 3: **先探测**是否被别的实例占用。只读探测, 判活了完全不碰 ——
+            # 这是关键: 绝不能先删再遇到锁(那样已经删残了)。
+            if _runtime_dir_in_use(ap):
+                skipped_busy += 1
+                continue
+            try:
+                import shutil
+                shutil.rmtree(ap, ignore_errors=False)
+                removed += 1
+            except Exception:
+                # 守则 4: 删除中途失败(可能这一瞬间被别的实例抢用) —— 跳过。
+                # 🔴 为什么这里**不再**尝试"改名后再删"(v4.9.1 曾写过又删掉):
+                #    实测被映射的文件"同目录改名"能成功, 但 rmtree 是逐文件删除,
+                #    改名只是换个名字, 文件依旧删不掉 —— 兜底等于白做, 还多出一层
+                #    垃圾名字。真正的解法在退出侧(_quarantine_own_runtime_dir),
+                #    这里只需保持"探到忙就整体不碰"的简单语义。
+                #    剩下删不掉的那些文件是被 LoL 等外部进程映射着的; 等它们退出后,
+                #    下一次启动的这一轮就能正常删掉, 因此不会无限累积。
+                continue
+        if removed:
+            print(f'[启动] 已清理 {removed} 个历史解压残骸')
+        if skipped_busy:
+            # 有新实例正在跑是**正常**的(比如升级后双开), 静默即可;
+            # 但仍打印出来, 便于排查"为什么残骸没被清掉"。
+            print(f'[启动] 另有 {skipped_busy} 个解压目录正在被其它实例使用, 已跳过')
+    except Exception:
+        pass
+
+
+def _quarantine_own_runtime_dir():
+    """v4.9.2: 退出前把 _MEIPASS 改名为 *_QUAR，并在原路径重建一个空目录。
+
+    背景(用户 2026-10-23 截图): 关闭大蛋小助手后弹出一个灰色 "Warning" 框:
+        Failed to remove temporary directory: C:\\Users\\...\\Temp\\_MEI000052182
+    点了「确定」进程才退 —— 不点就一直挂着。
+
+    根因(实测, 不是推断): 那个 _MEI 目录里的 VCRUNTIME140*.dll 被
+    **英雄联盟的 icreateLol.exe 映射着**(Restart Manager 查到 PID 20084;
+    对同一份 DLL 的新副本查则为空, 所以不是误报)。被映像映射的 DLL,
+    DeleteFileW 恒返回 ERROR_ACCESS_DENIED(5) —— 实测用 runas 提权后删除
+    依然 FAIL, 所以这与权限无关, 提权永远解决不了。
+    bootloader 注定删不掉, 就把这件事变成模态框甩给用户。
+
+    🔴 只"改名"是不够的(v4.9.1 的做法, **实测无效**):
+       改名后 bootloader 按**原路径**遍历删除, 原路径已不存在, 它同样报失败。
+       实测(窗口模式 onefile 探针, 三种模式各跑一次, 用 exit code 判别):
+         none          → exit 1（复现失败）
+         rename        → exit 1（**改名没能解决**）
+         rename_empty  → exit 0（✅ 改名 + 原路径重建空目录 = 成功）
+       真机也一致: v4.9.1 装了 rename 之后关闭程序, Warning 框**照样弹**,
+       对话框里写的还是原路径 `_MEI000065942`。
+
+    ✅ 所以两步都要做:
+       ① `os.rename(mei, mei + '_QUAR')` —— 把真正的内容(含被锁 DLL)挪走;
+       ② `os.makedirs(mei)` —— 在原路径建一个**空**目录。
+       bootloader 去删原路径时, 看到的是一个空目录, 删得干干净净 -> 静默退出。
+       被锁的文件留在 `_MEIxxxxx_QUAR` 里, 由下次启动的
+       _cleanup_stale_runtime_dirs 收拾(它按 `_MEI` 前缀扫描, 天然覆盖)。
+    """
+    try:
+        if not getattr(sys, 'frozen', False):
+            return                       # 源码运行没有 _MEIPASS, 直接跳过
+        mei = getattr(sys, '_MEIPASS', '') or ''
+        if not mei or not os.path.isdir(mei):
+            return
+        if mei.endswith(_RT_QUARANTINE_SUFFIX):
+            return                       # 幂等: 已经改过就别再套一层后缀
+        new = mei + _RT_QUARANTINE_SUFFIX
+        if os.path.exists(new):
+            return                       # 目标已存在 -> 不覆盖, 交给清理逻辑
+        os.rename(mei, new)
+        # ② 关键: 原路径必须重新存在且为空, 否则 bootloader 会报"删不掉"。
+        try:
+            os.makedirs(mei, exist_ok=True)
+        except OSError:
+            pass
+        print(f'[退出] 已隔离解压目录, 避免 bootloader 弹框: {os.path.basename(new)}')
+    except Exception as e:
+        # 失败不要紧: 最坏情况退回"弹框"的老行为, 不能因此影响退出。
+        try:
+            print(f'[退出] 隔离解压目录失败(不影响退出): {type(e).__name__}: {e}')
+        except Exception:
+            pass
+
+
 def main():
+    # v4.6.6: 先清历史残骸(实测会堆到上百 MB), 再初始化 Qt。
+    # 放在最前面: 此时还没加载任何 Qt/依赖 dll, 删除成功率最高。
+    _cleanup_stale_runtime_dirs()
+    # v4.9.1: 用一个**单一出口**接管"退出时隔离解压目录"。
+    # 为什么用 atexit 而不是在各个退出分支里各加一句:
+    #   退出路径有托盘菜单、主窗关闭、QApplication.quit、崩溃兜底等多条,
+    #   逐条加必然漏(本机历史:tray 关闭漏掉 log_capture.stop 就是同一类事故)。
+    #   atexit 在解释器收尾时统一跑一次, 且发生在 bootloader 清理之前。
+    #   唯一的例外是 _exit(0)(不跑 atexit), 那里已单独显式调用。
+    # 幂等: _quarantine_own_runtime_dir 内部判了后缀, 重复调用无副作用。
+    try:
+        import atexit
+        atexit.register(_quarantine_own_runtime_dir)
+    except Exception:
+        pass
     # 高DPI环境变量（必须在任何Qt调用之前）
     os.environ['QT_ENABLE_HIGHDPI_SCALING'] = '1'
     os.environ['QT_SCALE_FACTOR_ROUNDING_POLICY'] = 'PassThrough'
