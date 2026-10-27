@@ -15,13 +15,13 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit,
     QApplication, QScrollArea, QProgressBar,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect, QCheckBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QUrl
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation
 # v4.4.0 修复(P1-22): QFont 原来在 SidebarButton.paintEvent 内部 import
 # (每次重绘都走一遍模块查找), 提到模块顶部, 字体对象在 __init__ 建好复用。
 from PyQt5.QtGui import (QColor, QPainter, QLinearGradient, QFont,
-                         QPixmap, QPainterPath, QDesktopServices)
+                         QPixmap, QPainterPath)
 
 from .styles import Glass
 # v4.3.0: 对局展示格式化抽到 match_fmt(详情弹窗也要用, 它不能反向 import 本模块);
@@ -30,8 +30,8 @@ from .match_fmt import (LANE_CN as _LANE_CN, phase_text as _phase_text,
                         game_mode_text as _game_mode_text,
                         dur_text as _dur_text, time_text as _time_text)
 from .icons import (icon_home, icon_settings, icon_hero, icon_chart, icon_log,
-                     icon_info, AnimatedToggle, make_title_buttons,
-                     rounded_pixmap, icon_to_pixmap)
+                     AnimatedToggle, make_title_buttons, rounded_pixmap,
+                     icon_to_pixmap)
 from .animated_widgets import (SpringStackedWidget, GlassTitleBar, GlassCard,
                                HoverRow, StatusDot, paint_window_backdrop,
                                make_empty_state)
@@ -56,14 +56,9 @@ DOT_RGB_OFFLINE = (248, 113, 113)      # 未连接: 红
 CONN_TEXT_ONLINE = '客户端已连接'
 CONN_TEXT_OFFLINE = '未连接到客户端'
 SIDEBAR_PAGES = (('🏠', '首页'), ('⚙️', '设置'), ('⭐', '英雄'),
-                 ('📊', '战绩'), ('📋', '日志'), ('ℹ️', '关于'))
+                 ('📊', '战绩'), ('📋', '日志'))
 SIDEBAR_ICON_FNS = {'🏠': icon_home, '⚙️': icon_settings, '⭐': icon_hero,
-                    '📊': icon_chart, '📋': icon_log, 'ℹ️': icon_info}
-
-# v4.5.0: 「关于」页里的项目主页地址（开源仓库）。
-# v4.5.1: 仓库已由 Dandan 更名为 DaDan，同步更新。
-PROJECT_REPO_URL = 'https://github.com/molan66/DaDan'
-PROJECT_REPO_URL_PLACEHOLDER = False   # 已填入真实用户名；若改回占位符请置 True
+                    '📊': icon_chart, '📋': icon_log}
 
 # v4.4.1(UI-B9 第一步): 账号卡 chip 的几何与 8 组色值收敛为模块常量。
 # **数值一个字都没改** —— 这一步只让"改一处即全局生效", 视觉零回归。
@@ -114,7 +109,7 @@ def _rank_text(entry) -> str:
     return f'{base} · {lp}胜点'
 
 
-# v4.4.18: 首页右侧竖排的三枚主行动按钮(一键启动 LOL / 启动脚本 / 全部停止)
+# v4.4.18: 首页右侧竖排的三枚主行动按钮(启动 LOL / 启动脚本 / 全部停止)
 # 统一到**同一个样式工厂** —— 用户看截图指出「全部停止」与上面两枚不像一套:
 #   原来 全部停止 = 透明底 + 红描边 + 高40 + 字号13 + 字重600
 #   而   另两枚   = 实心渐变 + 无边框 + 高44 + 字号16 + 字重700
@@ -123,11 +118,62 @@ _BTN_W = 170          # 三枚按钮统一宽度
 _BTN_H = 44           # 三枚按钮统一高度
 
 
+def _mini_btn_qss(primary: bool = False) -> str:
+    """设置页授权卡里的小号按钮样式（30px 高）。
+
+    单独一档是因为：卡片内的次要动作不该用 _action_btn_qss 的 170x44 大按钮
+    （会把卡片撑高、喧宾夺主）。配色仍取 Glass 令牌，与全局观感一致。
+    """
+    if primary:
+        bg, hover, pressed = Glass.PRIMARY, Glass.PRIMARY_HOVER, Glass.PRIMARY_PRESSED
+        fg, bd = '#ffffff', 'transparent'
+    else:
+        bg, hover, pressed = ('rgba(255,255,255,0.07)', 'rgba(255,255,255,0.12)',
+                              'rgba(255,255,255,0.16)')
+        fg, bd = Glass.TEXT_SECONDARY, Glass.BORDER_GLASS
+    return f"""
+            QPushButton {{
+                background: {bg}; color: {fg};
+                border: 1px solid {bd}; border-radius: {Glass.RADIUS_SM};
+                font-size: {Glass.FONT_SIZE_SM}; font-weight: 700;
+            }}
+            QPushButton:hover {{ background: {hover}; color: {Glass.TEXT_PRIMARY}; }}
+            QPushButton:pressed {{ background: {pressed}; padding-top: 1px; }}
+        """
+
+
+def _group_code(code: str, size: int = 5) -> str:
+    """把长串按 size 分组加连字符，仅用于**显示**（复制时给纯码）。
+
+    与 license-server/src/shared.js 的 groupCode 行为一致 —— 两边都只是"给人看"，
+    解析侧一律先剔除连字符，所以这里格式不占契约。
+    """
+    s = (code or '').replace('-', '')
+    return '-'.join(s[i:i + size] for i in range(0, len(s), size))
+
+
+def _fmt_size(n) -> str:
+    """字节 → 人类可读。v4.6.3: 清理缓存卡片显示占用用。
+
+    用 1024 进制并保留一位小数, 与 Windows 资源管理器口径一致(避免用户
+    拿这里的数字和右键属性对不上而怀疑程序在乱报)。
+    """
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return '0 B'
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if v < 1024 or unit == 'GB':
+            return f'{v:.0f} {unit}' if unit == 'B' else f'{v:.1f} {unit}'
+        v /= 1024
+    return f'{v:.1f} GB'
+
+
 def _action_btn_qss(variant: str = 'primary') -> str:
     """首页主行动按钮样式(单一来源)。
 
     variant:
-        'accent'      —— 一键启动 LOL：翠绿, 表达"前进/执行"
+        'accent'      —— 启动 LOL：翠绿, 表达"前进/执行"
         'primary'     —— 启动脚本(空闲)：靛蓝品牌主色
         'danger'      —— 启动脚本(运行中→"停止脚本")：红
         'danger_deep' —— 全部停止：比上面更深一档的红
@@ -620,10 +666,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     stop_script_signal = pyqtSignal()
     minimize_signal = pyqtSignal()
     close_signal = pyqtSignal()
-    # v4.4.5: 首页「一键启动 LOL」按钮
+    # v4.4.5: 首页「启动 LOL」按钮
     launch_lol_signal = pyqtSignal()
-    # v4.4.12: 设置页「开始录制 / 停止录制」→ main 控制全局鼠标钩子
-    record_lol_signal = pyqtSignal()
+    # v4.8.0: record_lol_signal(设置页「开始录制/停止录制」)已随录制功能删除。
     # v4.4.16: 首页「全部停止」→ main 关掉 LOL 并 3 秒后停脚本
     stop_all_signal = pyqtSignal()
     settings_changed_signal = pyqtSignal(dict)
@@ -633,6 +678,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     # "老版本已开 auto_select 但 agreement_accepted 缺失"升级场景, 800ms
     # 启动检查会因 agreement=False 跳过, 须在确认须知后补一次)
     agreement_confirmed_signal = pyqtSignal()
+    # v4.6.3: 设置页「清理缓存」→ main 执行(需要访问缓存实例与日志句柄)
+    clean_cache_signal = pyqtSignal(list)
+    # v4.7.1: 首页授权卡「输入授权码」→ 由 main 打开激活窗。
+    # 用信号而不是直接弹窗：弹窗要访问 licensing（可能触发指纹采集），
+    # 统一由 main 处理更符合本项目的分层（UI 不碰耗时逻辑）。
+    open_activation_signal = pyqtSignal()
 
 
     sig_update_connection = pyqtSignal(bool, str)
@@ -665,7 +716,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._aug_icon_cb = None
         self._aug_dl_cb = None
         self._detail_dlg = None
-        # v4.4.12: 一键启动 LOL 的录制状态(label 引用已随录制卡片重构移除)
         # v4.4.0 修复(P1-23): 生成式占位头像缓存 (icon_id, 首字, dpr, side) -> QPixmap
         self._avatar_gen_cache = {}
         self._init_ui()
@@ -716,9 +766,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._pages.addWidget(self._make_hero_page())
         self._pages.addWidget(self._make_recent_page())
         self._pages.addWidget(self._make_log_page())
-        # v4.5.0: 「关于」页 —— 版权/许可证/项目地址/第三方归属的唯一集中展示处
-        # (AGPL-3.0 §0「Appropriate Legal Notices」+ §5 的界面落点)。
-        self._pages.addWidget(self._make_about_page())
         body.addWidget(self._pages, 1)
 
         body_widget = QWidget()
@@ -836,6 +883,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         # 切到战绩页时补一轮图标并重开时间窗(下载是后台异步的, 离开页面后轮询会停)
         if idx == 3:
             self._tick_recent_icons(rearm=True)
+        # v4.6.3: 切到设置页时清点一次缓存占用 —— 否则用户看到的是上次的旧数字
+        if idx == 1:
+            self.refresh_clean_sizes()
 
     # ==================== 首页 ====================
     def _make_home_page(self):
@@ -876,18 +926,20 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl.addLayout(status_row)
         lay.addWidget(card)
 
-        # ===== 一键启动 LOL(跳过 WeGame 主面板) =====
+        # ===== 启动 LOL(跳过 WeGame 主面板) =====
         # v4.4.6: 按钮改放到「启动脚本」正上方(同一右侧竖排), 不再单独占一张卡片;
         # 宽度与 fab 一致(170)且同为右对齐, 两枚按钮上下严丝合缝。
         # v4.4.18: 样式改走 _action_btn_qss 工厂, 与另两枚统一几何与字号。
-        self._launch_lol_btn = QPushButton('🚀  一键启动 LOL')
+        # v4.8.0: 文案去掉"一键" —— 它已不做任何自动点击, 保留"一键"会让买家
+        # 以为点下去会自动登录/自动进大厅。
+        self._launch_lol_btn = QPushButton('🚀  启动 LOL')
         self._launch_lol_btn.setFixedSize(_BTN_W, _BTN_H)
         self._launch_lol_btn.setCursor(Qt.PointingHandCursor)
         self._launch_lol_btn.setStyleSheet(_action_btn_qss('accent'))
         self._launch_lol_btn.clicked.connect(self._on_launch_lol)
 
-        # v4.4.15: 按钮下方一行小字, 说明当前是"只启动"还是"启动+自动点击"。
-        # 用户明确要求默认只打开登录器、录制后才模拟点击, 这里让状态一眼可见。
+        # v4.4.15: 按钮下方一行小字, 说明这个按钮到底做什么。
+        # v4.8.0: 固定为"只打开登录器" —— 不再有"已录制N步: 启动并自动点击"这种状态。
         self._launch_lol_hint = QLabel('')
         self._launch_lol_hint.setWordWrap(True)
         self._launch_lol_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -897,6 +949,86 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._refresh_launch_hint()
 
         # ===== 账号信息卡(v37:四行规范结构, 挪到红框位置) =====
+        # v4.6.11: 150 行的构建过程抽到 _build_account_card(), 这里只留调用。
+        acct_card = self._build_account_card()
+        self._acct_card = acct_card
+
+        # 当前状态
+        card2 = GlassCard()
+        c2l = QVBoxLayout(card2)
+        c2l.setContentsMargins(14, 12, 14, 12)
+        c2l.setSpacing(8)
+        t2 = QLabel('当前状态')
+        t2.setStyleSheet(f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.TEXT_SECONDARY};background:transparent;")
+        c2l.addWidget(t2)
+        self._phase_label = QLabel('等待启动')
+        self._phase_label.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_LG};color:{Glass.TEXT_PRIMARY};background:transparent;font-weight:600;")
+        c2l.addWidget(self._phase_label)
+        lay.addWidget(card2)
+
+        # 启动按钮（右对齐）
+        # v4.1.45: 缩到 170x44, 原 200x50 + acct 实测 404 + spacing 12 = 616
+        # > 内容区 564 → fab 起点 516+200=716 > 窗口 680 越界 36px
+        self._fab = QPushButton('⚡  启动脚本')
+        self._fab.setFixedSize(_BTN_W, _BTN_H)
+        self._fab.setCursor(Qt.PointingHandCursor)
+        # v4.4.1(UI-A1): 样式表抽到模块级 _fab_qss(), 与 _do_run 共用同一份,
+        # 字号统一 FONT_SIZE_XL(原先这里 14px、_do_run 里 16px, 点一下跳一号)。
+        self._fab.setStyleSheet(_fab_qss(False))
+        self._fab.clicked.connect(self._on_start)
+        lay.addStretch()
+
+        # v4.4.16: 「全部停止」—— 关掉 LOL 并停脚本(用户要求放在「启动脚本」下方)
+        # v4.4.18: 原先是"透明底 + 红描边 + 高40 + 字号13", 与上面两枚实心渐变按钮
+        # 明显不是一套(用户看截图指出)。现改走同一工厂: 实心渐变 + 同尺寸同字号,
+        # 只把颜色换成更深一档的红(避免与"运行中的启动脚本"那枚红撞色)。
+        self._stop_all_btn = QPushButton('⏹  全部停止')
+        self._stop_all_btn.setFixedSize(_BTN_W, _BTN_H)
+        self._stop_all_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_all_btn.setStyleSheet(_action_btn_qss('danger_deep'))
+        self._stop_all_btn.clicked.connect(self._on_stop_all)
+
+        # v37c:底部横排 = 账号信息卡(左下) + 启动按钮(右下) 同处一行。
+        # 此前账号卡整行塞在按钮下方会把按钮顶离底部, 现在按钮保持右下贴底不动。
+        # v4.1.45: maxWidth 380 给 fab 让出空间; fab 缩 170x44 + 直接 addWidget
+        # + AlignBottom | AlignRight 贴底(原 QVBoxLayout 包装会被 HBox 拉伸到同高)
+        acct_card.setMaximumWidth(380)
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(12)
+        bottom.addWidget(acct_card)                 # 账号卡占左侧(可随空间伸缩)
+        bottom.addStretch(1)                        # 弹性把按钮推到右侧
+        # v4.4.6: 右侧改为竖排 —— 「启动 LOL」在上、「启动脚本」在下,
+        # 两枚同为 170x44 且右对齐; 组内顶部 addStretch 让整组贴底。
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(8)
+        right_col.addStretch(1)
+        right_col.addWidget(self._launch_lol_hint, 0, Qt.AlignRight)
+        right_col.addWidget(self._launch_lol_btn, 0, Qt.AlignRight)
+        right_col.addWidget(self._fab, 0, Qt.AlignRight)
+        right_col.addWidget(self._stop_all_btn, 0, Qt.AlignRight)
+        bottom.addLayout(right_col)
+        bottom_w = QWidget()
+        bottom_w.setLayout(bottom)
+        bottom_w.setStyleSheet('background:transparent;')
+        lay.addWidget(bottom_w)
+
+        scroll.setWidget(content)
+        return scroll
+
+
+    def _build_account_card(self) -> GlassCard:
+        """构建首页「账号信息卡」(v4.6.11 从 _make_home_page 抽出)。
+
+        为什么要抽: _make_home_page 原本 273 行, 一个函数里串了连接状态卡/
+        按钮组/账号卡/当前状态卡/底部横排五块。账号卡这一块独占 150 行、
+        内部自成体系(7 行: 头像+ID / 等级 / 段位 / 资产 / 神话+荣誉 /
+        熟练度 top3 / 近期战绩), 是天然的分节边界。
+        抽出的正文**一字未改**, 只把末尾的 `self._acct_card = acct_card`
+        换成 `return acct_card` —— 赋值仍由调用方完成, 保持原语义。
+        """
         acct_card = GlassCard()
         # v4.1.48: 按用户截图红框宽 = 380, 给账号卡固定宽让右侧 fab 区域稳定;
         # 头像缩 48 / label 列缩 44 让 7 行内容可塞下不溢出.
@@ -1045,73 +1177,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         row7.addStretch()
         acl.addLayout(row7)
         # 注:v37b 移到启动按钮下方, 此处不再 addWidget(延迟到 fab 后)
-        self._acct_card = acct_card
-
-        # 当前状态
-        card2 = GlassCard()
-        c2l = QVBoxLayout(card2)
-        c2l.setContentsMargins(14, 12, 14, 12)
-        c2l.setSpacing(8)
-        t2 = QLabel('当前状态')
-        t2.setStyleSheet(f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.TEXT_SECONDARY};background:transparent;")
-        c2l.addWidget(t2)
-        self._phase_label = QLabel('等待启动')
-        self._phase_label.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_LG};color:{Glass.TEXT_PRIMARY};background:transparent;font-weight:600;")
-        c2l.addWidget(self._phase_label)
-        lay.addWidget(card2)
-
-        # 启动按钮（右对齐）
-        # v4.1.45: 缩到 170x44, 原 200x50 + acct 实测 404 + spacing 12 = 616
-        # > 内容区 564 → fab 起点 516+200=716 > 窗口 680 越界 36px
-        self._fab = QPushButton('⚡  启动脚本')
-        self._fab.setFixedSize(_BTN_W, _BTN_H)
-        self._fab.setCursor(Qt.PointingHandCursor)
-        # v4.4.1(UI-A1): 样式表抽到模块级 _fab_qss(), 与 _do_run 共用同一份,
-        # 字号统一 FONT_SIZE_XL(原先这里 14px、_do_run 里 16px, 点一下跳一号)。
-        self._fab.setStyleSheet(_fab_qss(False))
-        self._fab.clicked.connect(self._on_start)
-        lay.addStretch()
-
-        # v4.4.16: 「全部停止」—— 关掉 LOL 并停脚本(用户要求放在「启动脚本」下方)
-        # v4.4.18: 原先是"透明底 + 红描边 + 高40 + 字号13", 与上面两枚实心渐变按钮
-        # 明显不是一套(用户看截图指出)。现改走同一工厂: 实心渐变 + 同尺寸同字号,
-        # 只把颜色换成更深一档的红(避免与"运行中的启动脚本"那枚红撞色)。
-        self._stop_all_btn = QPushButton('⏹  全部停止')
-        self._stop_all_btn.setFixedSize(_BTN_W, _BTN_H)
-        self._stop_all_btn.setCursor(Qt.PointingHandCursor)
-        self._stop_all_btn.setStyleSheet(_action_btn_qss('danger_deep'))
-        self._stop_all_btn.clicked.connect(self._on_stop_all)
-
-        # v37c:底部横排 = 账号信息卡(左下) + 启动按钮(右下) 同处一行。
-        # 此前账号卡整行塞在按钮下方会把按钮顶离底部, 现在按钮保持右下贴底不动。
-        # v4.1.45: maxWidth 380 给 fab 让出空间; fab 缩 170x44 + 直接 addWidget
-        # + AlignBottom | AlignRight 贴底(原 QVBoxLayout 包装会被 HBox 拉伸到同高)
-        acct_card.setMaximumWidth(380)
-        bottom = QHBoxLayout()
-        bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.setSpacing(12)
-        bottom.addWidget(acct_card)                 # 账号卡占左侧(可随空间伸缩)
-        bottom.addStretch(1)                        # 弹性把按钮推到右侧
-        # v4.4.6: 右侧改为竖排 —— 「一键启动 LOL」在上、「启动脚本」在下,
-        # 两枚同为 170x44 且右对齐; 组内顶部 addStretch 让整组贴底。
-        right_col = QVBoxLayout()
-        right_col.setContentsMargins(0, 0, 0, 0)
-        right_col.setSpacing(8)
-        right_col.addStretch(1)
-        right_col.addWidget(self._launch_lol_hint, 0, Qt.AlignRight)
-        right_col.addWidget(self._launch_lol_btn, 0, Qt.AlignRight)
-        right_col.addWidget(self._fab, 0, Qt.AlignRight)
-        right_col.addWidget(self._stop_all_btn, 0, Qt.AlignRight)
-        bottom.addLayout(right_col)
-        bottom_w = QWidget()
-        bottom_w.setLayout(bottom)
-        bottom_w.setStyleSheet('background:transparent;')
-        lay.addWidget(bottom_w)
-
-        scroll.setWidget(content)
-        return scroll
-
+        return acct_card
     # ==================== 设置页 ====================
     def _make_settings_page(self):
         scroll = QScrollArea()
@@ -1136,11 +1202,31 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         lay.addWidget(self._make_delay_card('自动返回', 'auto_play_again', 'auto_play_again_delay', 2, 0, 30, '游戏结束后自动返回房间'))
 
         # v4.4.16(用户要求): 连上客户端后自动启动脚本(可设延时)。
-        # 场景: 开机 → 点「一键启动 LOL」→ 进大厅后不用再点一次「启动脚本」。
+        # 场景: 开机 → 点「启动 LOL」→ 进大厅后不用再点一次「启动脚本」。
         lay.addWidget(self._make_delay_card(
             '连上客户端自动启动脚本', 'auto_start_on_connect',
             'auto_start_on_connect_delay', 5, 0, 120,
             '检测到连上 LOL 客户端后，等设定秒数自动启动脚本'))
+
+        # v4.8.1(用户要求): 点「启动 LOL」成功后隐藏主界面并打开小窗。
+        # 做成"开关 + 说明"的独立卡片(不带延时控件 —— 它与时间无关)。
+        card_lo = GlassCard()
+        clo = QVBoxLayout(card_lo)
+        clo.setContentsMargins(14, 12, 14, 12)
+        clo.setSpacing(8)
+        row_lo, _ = _make_toggle_row(
+            '启动 LOL 后收起主界面', 'lol_launch_to_overlay',
+            self._settings, self._toggles, self._toggle)
+        clo.addWidget(row_lo)
+        desc_lo = QLabel(
+            '登录器启动成功后，自动把主界面收起、只留小窗；'
+            '想回到主界面点小窗上的「主窗」按钮即可')
+        desc_lo.setWordWrap(True)
+        desc_lo.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
+            f"background:transparent;padding-left:52px;padding-right:8px;")
+        clo.addWidget(desc_lo)
+        lay.addWidget(card_lo)
 
         # v34: 自动选英雄(进选人界面2-3 张卡时主动点选; 默认关; 打开时若非管理员则请求提权)
         card = GlassCard()
@@ -1187,167 +1273,404 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
 
         # v4.3.8: 「检查更新」卡片已整体移除(用户明确表示不需要该功能)。
 
-        # v4.4.5: 一键启动 LOL 按钮坐标标定
-        self._add_lol_calibrate_card(lay)
+        # v4.4.5: 启动 LOL 按钮坐标标定
+        # v4.8.0: 设置页「启动 LOL 录制/回放」卡片已整体删除
+        # (录制回放功能移除, 启动 LOL 只打开登录器, 不再需要录制任何点击流程)。
+
+        # v4.6.3: 清理缓存(用户要求)
+        self._add_clean_cache_card(lay)
+
+        # v4.7.3: 授权/激活（用户要求放设置页，不放首页）
+        self._add_license_card(lay)
 
         lay.addStretch()
         scroll.setWidget(content)
         return scroll
 
-    def _add_lol_calibrate_card(self, lay):
-        """一键启动 LOL 的「录制 / 回放」卡片(v4.4.12)。
+    # ==================== v4.7.3: 授权 / 激活 ====================
+    def _add_license_card(self, lay):
+        """设置页的「授权 / 激活」卡片。
 
-        登录器是自绘 UI 无标准控件, 按钮位置只能靠猜坐标 —— 实测连改 7 版都在
-        "某一步点空"上打转。这里改成让用户**手动走一遍**, 程序原样记下每次点击的
-        位置与间隔(见 lcu/recorder.py), 之后一键复刻, 不再靠猜。
+        ## 为什么放设置页（用户明确要求）
+
+        原来是首页大卡片，两个问题：
+          1. **把首页右下角的功能按钮挤走了** —— 首页底部是「启动 LOL /
+             启动脚本 / 全部停止」这条主操作链，多一张卡就顶出去了，显示不全；
+          2. **位置不合常识** —— 激活码/授权这类东西用户会去"设置"或"关于"里找，
+             没有放首页的道理（用户原话："激活码这东西哪有放首页的"）。
+
+        ## 为什么必须常驻可见（这是 v4.7.0 的真缺陷）
+
+        v4.7.0 把试用状态与机器码只放进了"被拦下时弹的激活窗"，而试用期内
+        不弹窗 ⇒ **用户拿不到自己的机器码**，没法发给卖家换授权码，
+        购买流程直接断掉（实测用户第一句话就是"没看到7天试用和获取机器码按钮"）。
+        所以这个入口的可见性是**功能必需**，不是装饰。
         """
         card = GlassCard()
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
 
-        title = QLabel('🚀 一键启动 LOL')
+        # ---- 标题行：🔑 授权 + 右侧状态 ----
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title = QLabel('🔑 授权 / 激活')
+        title.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
+            f"color:{Glass.TEXT_SECONDARY};background:transparent;")
+        title_row.addWidget(title)
+        title_row.addStretch()
+
+        self._lic_state_lbl = QLabel('读取中…')
+        self._lic_state_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_SM};font-weight:700;"
+            f"color:{Glass.TEXT_MUTED};background:transparent;")
+        title_row.addWidget(self._lic_state_lbl)
+        cl.addLayout(title_row)
+
+        # ---- 说明/剩余天数 ----
+        self._lic_hint_lbl = QLabel('')
+        self._lic_hint_lbl.setWordWrap(True)
+        self._lic_hint_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        cl.addWidget(self._lic_hint_lbl)
+
+        # ---- 机器码：值 + 复制 ----
+        mid_row = QHBoxLayout()
+        mid_row.setSpacing(8)
+        self._lic_mid_lbl = QLabel('机器码读取中…')
+        self._lic_mid_lbl.setWordWrap(True)
+        self._lic_mid_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._lic_mid_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_SECONDARY};"
+            f"background:transparent;font-family:'Cascadia Code','Consolas',monospace;")
+        mid_row.addWidget(self._lic_mid_lbl, 1)
+
+        self._lic_copy_btn = QPushButton('复制机器码')
+        self._lic_copy_btn.setFixedSize(96, 30)
+        self._lic_copy_btn.setCursor(Qt.PointingHandCursor)
+        self._lic_copy_btn.setStyleSheet(_mini_btn_qss())
+        self._lic_copy_btn.clicked.connect(self._on_copy_machine_id)
+        mid_row.addWidget(self._lic_copy_btn, 0, Qt.AlignTop)
+        cl.addLayout(mid_row)
+
+        # ---- 动作行 ----
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
+        self._lic_hint2_lbl = QLabel('')
+        self._lic_hint2_lbl.setWordWrap(True)
+        self._lic_hint2_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        act_row.addWidget(self._lic_hint2_lbl, 1)
+
+        self._lic_act_btn = QPushButton('输入授权码')
+        self._lic_act_btn.setFixedSize(110, 30)
+        self._lic_act_btn.setCursor(Qt.PointingHandCursor)
+        self._lic_act_btn.setStyleSheet(_mini_btn_qss(primary=True))
+        self._lic_act_btn.clicked.connect(self.open_activation_signal.emit)
+        act_row.addWidget(self._lic_act_btn, 0, Qt.AlignTop)
+        cl.addLayout(act_row)
+
+        self._lic_machine_id = ''
+        self.update_license_card(None)
+        lay.addWidget(card)
+
+    def update_license_card(self, status):
+        """由 main.py 在授权判定完成后调用，刷新设置页的授权卡。
+
+        `status` 是 core.licensing.LicenseStatus（或 None = 还没查出来）。
+        **只读它、不自己判定** —— 放行口径统一在 licensing.usable，
+        别在 UI 里重写一遍（那是两处逻辑迟早分家的经典来源）。
+        """
+        try:
+            if getattr(self, '_lic_state_lbl', None) is None:
+                return
+
+            if status is None:
+                self._lic_state_lbl.setText('读取中…')
+                self._lic_state_lbl.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_SM};font-weight:700;"
+                    f"color:{Glass.TEXT_MUTED};background:transparent;")
+                self._lic_mid_lbl.setText('机器码读取中…')
+                self._lic_hint_lbl.setText('')
+                self._lic_hint2_lbl.setText('')
+                return
+
+            mid = getattr(status, 'machine_id', '') or ''
+            if mid:
+                self._lic_machine_id = mid
+                # 分组显示更易读；复制时给纯码（不带连字符）
+                self._lic_mid_lbl.setText(f'机器码  {_group_code(mid)}')
+
+            if getattr(status, 'activated', False):
+                d = status.days_left
+                if d is not None and d < 0:
+                    self._lic_state_lbl.setText('已过期')
+                    color = Glass.DANGER
+                    self._lic_hint_lbl.setText(
+                        f'授权已于 {status.expires_text} 到期。')
+                    self._lic_hint2_lbl.setText('把上面的机器码发给卖家换取新授权码，'
+                                                '然后点右侧按钮输入。')
+                else:
+                    self._lic_state_lbl.setText('已激活')
+                    color = Glass.SUCCESS
+                    tail = f'（剩余 {d} 天）' if d is not None else ''
+                    self._lic_hint_lbl.setText(f'有效期至 {status.expires_text}{tail}')
+                    self._lic_hint2_lbl.setText('换电脑后需要重新激活：把新电脑的机器码发给卖家。')
+            elif getattr(status, 'trial', False):
+                self._lic_state_lbl.setText('试用中')
+                color = Glass.WARNING
+                left = status.trial_days_left
+                left_txt = f'剩余约 {left:.1f} 天' if left is not None else ''
+                self._lic_hint_lbl.setText(f'{left_txt}，功能不受限。')
+                # 这句是**转化关键**：明确告诉他下一步做什么
+                self._lic_hint2_lbl.setText('想长期使用：把上面的机器码发给卖家，'
+                                            '拿到授权码后点右侧按钮输入即可。')
+            else:
+                self._lic_state_lbl.setText('未激活')
+                color = Glass.DANGER
+                self._lic_hint_lbl.setText('试用已结束。')
+                self._lic_hint2_lbl.setText('把上面的机器码发给卖家换取授权码，'
+                                            '然后点右侧按钮输入。')
+
+            self._lic_state_lbl.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_SM};font-weight:700;"
+                f"color:{color};background:transparent;")
+        except Exception as e:
+            print(f'[授权卡] 刷新失败: {type(e).__name__}: {e}')
+
+    @ui_slot
+    def _on_copy_machine_id(self):
+        """复制机器码。没有就现场采集一次。
+
+        ⚠️ v4.9.3: 注释原写"约 190ms，点击时略等可接受" —— **实测冷启动 1.509 s**，
+        差了 8 倍。这个量级已经不能叫"略等"：点下去界面会卡 1.5 秒（最坏 30 s，
+        即 subprocess 超时上限）。真要改好应该像激活窗那样走后台线程；
+        这里暂未改（本方法只在设置页授权卡点「复制」时触发，不在自动流程上），
+        但**注释必须写成真实量级** —— 否则下一个人还会拿 190ms 当依据做判断，
+        而 P1-E「激活窗白屏」就是这么被忽略掉的。
+        """
+        mid = self._lic_machine_id
+        if not mid:
+            try:
+                from core import licensing as L
+                mid = L.machine_id()
+                self._lic_machine_id = mid
+                self._lic_mid_lbl.setText(f'机器码  {_group_code(mid)}')
+            except Exception as e:
+                self._lic_hint2_lbl.setText(f'读取机器码失败：{type(e).__name__}: {e}')
+                return
+        cb = QApplication.clipboard()
+        if cb is None:
+            self._lic_hint2_lbl.setText('无法访问剪贴板，请手动选中机器码后按 Ctrl+C。')
+            return
+        # 复制**纯码**（无连字符）：微信里更不容易被自动换行截断
+        cb.setText(mid)
+        self._lic_hint2_lbl.setText('机器码已复制 ✓ 发给卖家，他会回你一串授权码。')
+
+
+    # ==================== v4.6.3: 清理缓存 ====================
+    def _add_clean_cache_card(self, lay):
+        """设置页的「清理缓存」卡片。
+
+        用户要求能清理: 所有日志 / 对局记录 / 旧英雄、海克斯、装备图标。
+
+        设计取舍:
+        - **显示实际占用**再让用户勾 —— 否则"清理"是个盲操作, 用户不知道
+          清了能腾出多少、也不知道有没有东西可清。
+        - 默认**不勾任何项**: 清理是破坏性操作, 默认全选会导致手快点一下就
+          把日志清空, 而日志正是排查问题的依据。让用户显式选择。
+        - 英雄头像与英雄图标在同一个目录(icon_cache), 无法只清其一, 故合并
+          为一项并在文案里说明。
+        """
+        card = GlassCard()
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.setSpacing(8)
+
+        title = QLabel('🧹 清理缓存')
         title.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
             f"color:{Glass.TEXT_SECONDARY};background:transparent;")
         cl.addWidget(title)
 
         desc = QLabel(
-            '这是「录制回放」功能：录一次，之后一键复刻你的操作。\n'
-            '\n'
-            '没录制时：点首页「一键启动 LOL」只会打开登录器（跳过 WeGame），'
-            '界面交给你自己操作，不会模拟任何点击。\n'
-            '录制之后：再点「一键启动 LOL」就会在启动的同时自动复刻你录下的每一步。\n'
-            '\n'
-            '怎么录：点「开始录制」→ 按你平时的习惯，从登录器一路点到进入游戏 → 按 F9 停止。\n'
-            '登录方式不限：QQ / 微信 / 账号密码 / 扫码都可以，程序只记录你点了哪里、隔多久点。\n'
-            '注意：录制期间不要拖动登录器窗口。')
+            '游戏版本更新后，旧图标可能已失效（官方改过立绘/强化图标）。'
+            '这里可以手动清理，清掉的内容下次连上客户端会自动重新下载。\n'
+            '日志请谨慎清理：它是排查问题时唯一的依据。')
         desc.setWordWrap(True)
         desc.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         cl.addWidget(desc)
 
-        # 录制状态行
-        rrow = HoverRow()
-        rrow.setStyleSheet('background:transparent;')
-        rl = QHBoxLayout(rrow)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(10)
-        # v4.4.17: 初始文案不再写"使用内置默认步骤" —— v4.4.15 起已彻底删掉默认步骤,
-        # 没录制就是"纯启动不点击"。这段即刻会被下面的 _rec_refresh() 覆盖, 但留个错的
-        # 字面量会误导后来改代码的人。
-        self._rec_state = QLabel('')
-        self._rec_state.setWordWrap(True)
-        self._rec_state.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
-        rl.addWidget(self._rec_state)
-        rl.addStretch()
-        cl.addWidget(rrow)
+        # 勾选项: (key, 文案)
+        self._clean_checks = {}
+        _ITEMS = (
+            ('icons', '英雄 / 装备 / 技能 / 海克斯图标'),
+            ('avatars', '账号头像（与英雄图标同目录，一并清理）'),
+            ('logs', '所有日志（含历史日志与崩溃记录）'),
+            ('data', '英雄数据缓存（下次自动重拉）'),
+            # v4.6.3: 对局记录本地不落盘(每次从 LCU 实时拉), 这里点一下只是
+            # 清空界面显示。仍然列出来 —— 用户明确要求能清"对局记录",
+            # 界面上找不到会以为漏做了; 点了会明确告知"无本地缓存文件"。
+            ('recent', '对局记录（本地无缓存，仅清空界面显示）'),
+        )
+        for key, text in _ITEMS:
+            row = HoverRow()
+            row.setStyleSheet('background:transparent;')
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            cb = QCheckBox()
+            cb.setStyleSheet(
+                "QCheckBox{background:transparent;}"
+                "QCheckBox::indicator{width:14px;height:14px;border-radius:3px;"
+                f"border:1px solid {Glass.BORDER_HOVER};background:rgba(255,255,255,0.04);}}"
+                "QCheckBox::indicator:checked{"
+                f"background:{Glass.PRIMARY};border-color:{Glass.PRIMARY};}}")
+            cb.setCursor(Qt.PointingHandCursor)
+            rl.addWidget(cb)
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_SECONDARY};"
+                f"background:transparent;")
+            lbl.setCursor(Qt.PointingHandCursor)
+            lbl.mousePressEvent = lambda e, b=cb: b.toggle()
+            rl.addWidget(lbl)
+            rl.addStretch()
+            size_lbl = QLabel('')
+            size_lbl.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
+                f"background:transparent;")
+            rl.addWidget(size_lbl)
+            cl.addWidget(row)
+            self._clean_checks[key] = (cb, size_lbl)
 
-        # 按钮行: 开始录制 / 清除
+        # 按钮行
         brow = QHBoxLayout()
         brow.setContentsMargins(0, 0, 0, 0)
         brow.setSpacing(10)
-        self._rec_btn = QPushButton('●  开始录制')
-        self._rec_btn.setCursor(Qt.PointingHandCursor)
-        self._rec_btn.setFixedHeight(30)
-        self._rec_btn.setStyleSheet(f"""
+        self._clean_btn = QPushButton('清理所选')
+        self._clean_btn.setCursor(Qt.PointingHandCursor)
+        self._clean_btn.setFixedHeight(30)
+        self._clean_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {Glass.ACCENT_SUBTLE}; color: {Glass.ACCENT};
-                border: 1px solid {Glass.ACCENT_BORDER}; border-radius: {Glass.RADIUS_XS}px;
-                font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 12px;
+                background: {Glass.DANGER_SUBTLE}; color: {Glass.DANGER};
+                border: 1px solid {Glass.DANGER}; border-radius: {Glass.RADIUS_XS}px;
+                font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 14px;
             }}
-            QPushButton:hover {{ background: {Glass.ACCENT_SOFT}; color: white; }}
+            QPushButton:hover {{ background: rgba(248,113,113,0.20); color: white; }}
+            QPushButton:disabled {{ color: {Glass.TEXT_MUTED};
+                border-color: {Glass.BORDER_GLASS}; background: transparent; }}
         """)
-        self._rec_btn.clicked.connect(self._on_record_clicked)
-        brow.addWidget(self._rec_btn)
+        self._clean_btn.clicked.connect(self._on_clean_clicked)
+        brow.addWidget(self._clean_btn)
 
-        self._rec_clear_btn = QPushButton('清除录制')
-        self._rec_clear_btn.setCursor(Qt.PointingHandCursor)
-        self._rec_clear_btn.setFixedHeight(30)
-        self._rec_clear_btn.setStyleSheet(f"""
+        self._clean_refresh_btn = QPushButton('刷新占用')
+        self._clean_refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._clean_refresh_btn.setFixedHeight(30)
+        self._clean_refresh_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {Glass.TEXT_MUTED};
                 border: 1px solid {Glass.BORDER_GLASS}; border-radius: {Glass.RADIUS_XS}px;
-                font-size: {Glass.FONT_SIZE_SM}; padding: 0 10px;
+                font-size: {Glass.FONT_SIZE_SM}; padding: 0 12px;
             }}
-            QPushButton:hover {{ color: {Glass.TEXT_PRIMARY}; border-color: {Glass.BORDER_HOVER}; }}
+            QPushButton:hover {{ color: {Glass.TEXT_PRIMARY};
+                border-color: {Glass.BORDER_HOVER}; }}
         """)
-        self._rec_clear_btn.clicked.connect(self._on_record_clear)
-        brow.addWidget(self._rec_clear_btn)
+        self._clean_refresh_btn.clicked.connect(self.refresh_clean_sizes)
+        brow.addWidget(self._clean_refresh_btn)
         brow.addStretch()
         cl.addLayout(brow)
 
-        self._rec_refresh()
+        self._clean_state = QLabel('')
+        self._clean_state.setWordWrap(True)
+        self._clean_state.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        cl.addWidget(self._clean_state)
+
         lay.addWidget(card)
 
-    def _rec_refresh(self):
-        """把当前录制状态刷到卡片上(顺带刷新首页按钮那行小字)。"""
+    def update_clean_sizes(self, items, keep_state=False):
+        """由 main 回填各项占用。items: {key: (文件数, 字节数)}。
+
+        v4.6.8 修 🔴: `keep_state=True` 时**不覆写**下方那行状态文案。
+        原来的缺陷(实测复现): 清理完成后 main 先调 `on_clean_done()` 写上
+        "✅ 已清理 N 个文件"，紧接着在**同一帧、同一调用栈**里调本方法回填占用，
+        而本方法无条件 `setText('当前共 N 个文件、X')` —— 于是成功提示被顶掉,
+        用户一个字都看不到; 失败提示同样被吞。清理功能的唯一反馈通道等于失效。
+        修法: 清理路径传 keep_state=True(保留刚写的结果), 纯清点路径照旧覆盖。
+        """
         try:
-            self._refresh_launch_hint()
-        except Exception:
-            pass
-        try:
-            steps = self._settings.get('lol_steps') or []
-            n = len(steps)
-            if n:
-                self._rec_state.setText(
-                    f'✅ 已录制 {n} 步 —— 点首页「一键启动 LOL」会启动登录器并自动复刻这 {n} 步')
-                self._rec_state.setStyleSheet(
-                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.ACCENT};background:transparent;")
-                self._rec_clear_btn.setEnabled(True)
+            total_n = total_sz = 0
+            for key, (cb, lbl) in self._clean_checks.items():
+                n, sz = items.get(key, (0, 0))
+                total_n += n
+                total_sz += sz
+                if n:
+                    lbl.setText(f'{n} 个 · {_fmt_size(sz)}')
+                    lbl.setStyleSheet(
+                        f"font-size:{Glass.FONT_SIZE_XS};"
+                        f"color:{Glass.TEXT_SECONDARY};background:transparent;")
+                else:
+                    lbl.setText('空')
+                    lbl.setStyleSheet(
+                        f"font-size:{Glass.FONT_SIZE_XS};"
+                        f"color:{Glass.TEXT_MUTED};background:transparent;")
+            if keep_state:
+                # 刚显示过"已清理…"的结果 → 保留它, 不拿占用数字盖掉
+                return
+            if total_n:
+                self._clean_state.setText(
+                    f'当前共 {total_n} 个文件、{_fmt_size(total_sz)}')
             else:
-                self._rec_state.setText(
-                    '⚠️ 还没录制 —— 现在点首页「一键启动 LOL」只会打开登录器，'
-                    '不会模拟任何点击')
-                self._rec_state.setStyleSheet(
-                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.WARNING};background:transparent;")
-                self._rec_clear_btn.setEnabled(False)
+                self._clean_state.setText('当前没有可清理的内容')
         except Exception:
             pass
 
-    def set_recording_ui(self, recording: bool, count: int = 0):
-        """录制中/结束 时由 main 切换按钮文案与状态。"""
+    def refresh_clean_sizes(self):
+        """请求 main 重新清点占用(卡片每次显示时也会调)。"""
         try:
-            if recording:
-                self._rec_btn.setText('■  停止录制 (F9)')
-                self._rec_btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {Glass.DANGER_SUBTLE}; color: {Glass.DANGER};
-                        border: 1px solid {Glass.DANGER}; border-radius: {Glass.RADIUS_XS}px;
-                        font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 12px;
-                    }}
-                    QPushButton:hover {{ background: rgba(248,113,113,0.2); color: white; }}
-                """)
-                self._rec_state.setText(f'🔴 录制中… 已记录 {count} 次点击（走完按 F9）')
-                self._rec_state.setStyleSheet(
-                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.DANGER};background:transparent;")
-            else:
-                self._rec_btn.setText('●  开始录制')
-                self._rec_btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {Glass.ACCENT_SUBTLE}; color: {Glass.ACCENT};
-                        border: 1px solid {Glass.ACCENT_BORDER}; border-radius: {Glass.RADIUS_XS}px;
-                        font-size: {Glass.FONT_SIZE_SM}; font-weight: 600; padding: 0 12px;
-                    }}
-                    QPushButton:hover {{ background: {Glass.ACCENT_SOFT}; color: white; }}
-                """)
-                self._rec_refresh()
+            self.clean_cache_signal.emit([])      # 空列表 = 只清点不清理
         except Exception:
             pass
 
-    @ui_slot
-    def _on_record_clicked(self):
-        self.record_lol_signal.emit()
-
-    @ui_slot
-    def _on_record_clear(self):
+    def _on_clean_clicked(self):
         try:
-            self._settings['lol_steps'] = []
-            self._save_settings()
+            picked = [k for k, (cb, _l) in self._clean_checks.items()
+                      if cb.isChecked()]
+        except Exception:
+            picked = []
+        if not picked:
+            self._clean_state.setText('⚠️ 请先勾选要清理的项目')
+            self._clean_state.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.WARNING};"
+                f"background:transparent;")
+            return
+        self._clean_state.setText('正在清理…')
+        self._clean_state.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
+            f"background:transparent;")
+        # 交给 main 执行(它持有缓存实例与日志句柄), 清理完回填占用
+        self.clean_cache_signal.emit(picked)
+
+    def on_clean_done(self, removed, freed, notes):
+        """main 清理完成后回调(主线程)。"""
+        try:
+            txt = f'✅ 已清理 {removed} 个文件，释放 {_fmt_size(freed)}'
+            if notes:
+                txt += f'（{"; ".join(notes[:3])}）'
+            self._clean_state.setText(txt)
+            self._clean_state.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.ACCENT};"
+                f"background:transparent;")
+            for cb, _l in self._clean_checks.values():
+                cb.setChecked(False)
         except Exception:
             pass
-        self.set_recording_ui(False)
+
+    # v4.8.0: 录制/回放卡片(_add_lol_calibrate_card)、_rec_refresh、
+    # set_recording_ui、_on_record_clicked、_on_record_clear 全部随录制功能删除。
 
     def _make_delay_card(self, label, toggle_key, delay_key, delay_def, dmin, dmax, desc):
         card = GlassCard()
@@ -1738,169 +2061,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
 
         return page
 
-    # ==================== 关于页 ====================
-    def _make_about_page(self):
-        """v4.5.0: 版权 / 许可证 / 项目地址 / 第三方归属的唯一集中展示处。
-
-        上游 sona 是无界面的注入插件, 本程序有界面 —— 按 AGPL-3.0 §0 对
-        "Appropriate Legal Notices" 的定义(菜单式界面里"列表中的一个醒目项"即
-        满足), 这里把许可、来源、免责声明一并摆出来, 属于最省事也最没有争议的做法。
-        页面本身不含任何交互逻辑, 打开外链一律走 QDesktopServices(系统浏览器)。
-        """
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            "QScrollArea{background:transparent;border:none;}" + Glass.SCROLL_QSS)
-
-        content = QWidget()
-        content.setStyleSheet('background:transparent;')
-        lay = QVBoxLayout(content)
-        lay.setContentsMargins(20, 16, 16, 16)
-        lay.setSpacing(10)
-
-        title = QLabel('关于')
-        title.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XL};font-weight:700;"
-            f"color:{Glass.TEXT_PRIMARY};background:transparent;")
-        lay.addWidget(title)
-
-        # ---- 卡片 1: 程序与版本 ----
-        card1 = GlassCard()
-        c1 = QVBoxLayout(card1)
-        c1.setContentsMargins(14, 12, 14, 12)
-        c1.setSpacing(6)
-        name_lbl = QLabel('大蛋小助手')
-        name_lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_LG};font-weight:700;"
-            f"color:{Glass.TEXT_PRIMARY};background:transparent;")
-        c1.addWidget(name_lbl)
-        ver_lbl = QLabel(f'版本 v{APP_VERSION}')
-        ver_lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_SM};color:{Glass.TEXT_SECONDARY};"
-            f"background:transparent;")
-        c1.addWidget(ver_lbl)
-        desc_lbl = QLabel(
-            '英雄联盟客户端辅助工具 —— 通过客户端本地 LCU 接口'
-            '（REST + WebSocket）通信，不注入游戏进程、不修改游戏内存。')
-        desc_lbl.setWordWrap(True)
-        desc_lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
-            f"background:transparent;")
-        c1.addWidget(desc_lbl)
-        lay.addWidget(card1)
-
-        # ---- 卡片 2: 开源许可 ----
-        card2 = GlassCard()
-        c2 = QVBoxLayout(card2)
-        c2.setContentsMargins(14, 12, 14, 12)
-        c2.setSpacing(6)
-        c2.addWidget(self._about_heading('开源许可'))
-        lic_lbl = QLabel(
-            '本项目以 GNU Affero General Public License v3.0 or later'
-            '（AGPL-3.0-or-later）发布。你可以自由使用、修改、再分发，'
-            '但须保留版权与许可声明，并且任何基于本项目的衍生作品也必须以'
-            '同一许可开放源代码。完整条款见仓库中的 LICENSE 文件。')
-        lic_lbl.setWordWrap(True)
-        lic_lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_SECONDARY};"
-            f"background:transparent;")
-        c2.addWidget(lic_lbl)
-        lay.addWidget(card2)
-
-        # ---- 卡片 3: 项目主页 ----
-        card3 = GlassCard()
-        c3 = QVBoxLayout(card3)
-        c3.setContentsMargins(14, 12, 14, 12)
-        c3.setSpacing(6)
-        c3.addWidget(self._about_heading('项目主页'))
-        link_btn = QPushButton(PROJECT_REPO_URL)
-        link_btn.setCursor(Qt.PointingHandCursor)
-        link_btn.setStyleSheet(f"""
-            QPushButton {{ background: rgba(99,102,241,0.10); color: {Glass.PRIMARY_HOVER};
-                           border: none; border-radius: 6px; padding: 8px 10px;
-                           font-size: {Glass.FONT_SIZE_SM}; text-align: left; }}
-            QPushButton:hover {{ background: rgba(99,102,241,0.22); color: {Glass.TEXT_PRIMARY}; }}
-        """)
-        link_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(PROJECT_REPO_URL)))
-        c3.addWidget(link_btn)
-        if PROJECT_REPO_URL_PLACEHOLDER:
-            hint = QLabel('（地址中仍是占位用户名，发布前请替换）')
-            hint.setWordWrap(True)
-            hint.setStyleSheet(
-                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.WARNING};"
-                f"background:transparent;")
-            c3.addWidget(hint)
-        src_lbl = QLabel('源码、问题反馈与更新都在该仓库获得。')
-        src_lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
-            f"background:transparent;")
-        c3.addWidget(src_lbl)
-        lay.addWidget(card3)
-
-        # ---- 卡片 4: 第三方归属 ----
-        card4 = GlassCard()
-        c4 = QVBoxLayout(card4)
-        c4.setContentsMargins(14, 12, 14, 12)
-        c4.setSpacing(6)
-        c4.addWidget(self._about_heading('第三方组件与致谢'))
-        for txt in (
-            '功能设计参考并改写了 sona（https://github.com/WJZ-P/sona，AGPL-3.0）'
-            '的若干功能实现，详见仓库中的 NOTICE.md 与 docs/PROVENANCE.md。',
-            '界面基于 PyQt5（Riverbank Computing，GPL-3.0）构建，'
-            '其余依赖清单与许可证见 THIRD_PARTY.md。',
-            '英雄中文名、别名与拼音索引基于官方公开数据整理；'
-            '英雄与物品图标由程序在运行时按需从官方 CDN 获取，不随本仓库分发。',
-        ):
-            t = QLabel(txt)
-            t.setWordWrap(True)
-            t.setStyleSheet(
-                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_SECONDARY};"
-                f"background:transparent;")
-            c4.addWidget(t)
-        lay.addWidget(card4)
-
-        # ---- 卡片 5: 免责声明（Riot 要求的逐字声明 + 风险提示）----
-        card5 = GlassCard()
-        c5 = QVBoxLayout(card5)
-        c5.setContentsMargins(14, 12, 14, 12)
-        c5.setSpacing(6)
-        c5.addWidget(self._about_heading('免责声明'))
-        disco = QLabel(
-            '大蛋小助手 isn\'t endorsed by Riot Games and doesn\'t reflect the '
-            'views or opinions of Riot Games or anyone officially involved in '
-            'producing or managing Riot Games properties. Riot Games, and all '
-            'associated properties are trademarks or registered trademarks of '
-            'Riot Games, Inc.')
-        disco.setWordWrap(True)
-        disco.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
-            f"background:transparent;")
-        c5.addWidget(disco)
-        risk = QLabel(
-            '本程序为非官方第三方工具，与 Riot Games、腾讯及其关联公司无任何关系。'
-            '使用自动化工具可能违反游戏用户协议，并可能导致账号受到处罚，'
-            '请自行评估风险，作者不承担由此产生的任何后果。')
-        risk.setWordWrap(True)
-        risk.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.WARNING};"
-            f"background:transparent;")
-        c5.addWidget(risk)
-        lay.addWidget(card5)
-
-        lay.addStretch()
-        scroll.setWidget(content)
-        return scroll
-
-    def _about_heading(self, text):
-        """「关于」页卡片内的小标题(统一样式, 避免每张卡片各写一份)。"""
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_SM};font-weight:700;"
-            f"color:{Glass.TEXT_PRIMARY};background:transparent;")
-        return lbl
-
     @ui_slot
     def _on_start(self):
         if self._running:
@@ -1910,7 +2070,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
 
     @ui_slot
     def _on_launch_lol(self):
-        """v4.4.5: 首页「一键启动 LOL」→ 通知 main 执行直启流程。"""
+        """v4.4.5: 首页「启动 LOL」→ 通知 main 执行直启流程。"""
         self.launch_lol_signal.emit()
 
     @ui_slot
@@ -1919,21 +2079,16 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self.stop_all_signal.emit()
 
     def _refresh_launch_hint(self):
-        """刷新首页按钮上方的小字: 当前是"只启动"还是"启动+自动点击"。
+        """刷新首页按钮上方的小字: 这个按钮做什么。
 
-        v4.4.15: 用户要求"默认只打开、录制后才模拟点击", 这行字让状态一眼可见,
-        不用去设置页翻。
+        v4.8.0: 固定文案。原先按"有没有录制步骤"在两种说法间切换
+        (已录制N步: 启动并自动点击 / 未录制: 仅启动不自动点击), 录制回放删除后
+        只有一种行为了, 再保留分支就是给后来人留个不存在的状态。
         """
         try:
-            n = len(self._settings.get('lol_steps') or [])
-            if n:
-                self._launch_lol_hint.setText(f'已录制 {n} 步：启动并自动点击')
-                self._launch_lol_hint.setStyleSheet(
-                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.ACCENT};background:transparent;")
-            else:
-                self._launch_lol_hint.setText('未录制：仅启动，不自动点击')
-                self._launch_lol_hint.setStyleSheet(
-                    f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+            self._launch_lol_hint.setText('仅打开登录器，不自动登录')
+            self._launch_lol_hint.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         except Exception:
             pass
 
@@ -1959,8 +2114,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self.settings_changed_signal.emit(self._settings)
 
     # ==================== 外部接口 ====================
-    def update_connection_status(self, connected, name=''):
-        self.sig_update_connection.emit(connected, name)
+    # v4.6.11 删除 update_connection_status(): 全项目零调用(仅注释里提到"不再
+    # 调用它"), 而它做的事与下面的 apply_connection_ui 完全一样(同一个信号)。
+    # 留着会让维护者以为有两个入口、且不知道该改哪个。
 
     def apply_connection_ui(self, connected: bool, text: str = '') -> None:
         """v4.4.0 修复(P1-24): 一次性更新连接状态文本 + 状态点颜色。
@@ -2485,10 +2641,13 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             'auto_pick_champion': True,      # 锁后自动换 bench(默认开, 保留旧行为)
             'preferred_champions': [],       # v41: 移除死配置 'queue_id', 队列从 session 取
             'agreement_accepted': False,     # v4.1.55: 首次启动强制阅读须知(30s)后置 True
-            # v4.4.12: 一键启动 LOL 的步骤序列 —— 由设置页「开始录制」写入
-            # (用户手动走一遍, 全局鼠标钩子原样记录 fx/fy/间隔)。为空则回退到
-            # lcu/launcher.py 的 DEFAULT_STEPS。
-            'lol_steps': [],
+            # v4.8.1(用户要求): 点「启动 LOL」成功后自动"隐藏主界面 + 打开小窗"。
+            # 默认**关** —— 保持 v4.8.0 的既有行为不变, 让用户自己在设置里打开。
+            # 为什么默认关: 它改变了点一个按钮的可见后果(主窗消失), 属于"用户没要求
+            # 就不该发生"的界面变化。显式开启才生效。
+            'lol_launch_to_overlay': False,
+            # v4.8.0: 'lol_steps'(录制的点击步骤)已删除 —— 录制回放功能移除。
+            # 老用户设置文件里若还留着这个键, load 时按"未知键"忽略即可, 不做迁移。
             # v4.3.7: 移除 'update_url' —— 自定义更新源设置项已删(不再有对外
             # 发布/更新检查的打算, 不需要在软件里手填地址)。旧的 settings.json
             # 里若还留着这个键, defaults.update() 会把它带进来, 但已无人读取, 无害。
@@ -2575,4 +2734,14 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 pass
 
     def _settings_path(self):
-        return os.path.join(os.environ.get('APPDATA', '~'), 'LOLScript', 'settings.json')
+        """设置文件路径: %APPDATA%\\LOLScript\\settings.json。
+
+        v4.6.8 修兜底: 原写 `os.environ.get('APPDATA', '~')` —— 而 `'~'` 在这里
+        **不会被展开**(os.path.join 不做 shell 展开), 会在当前工作目录下造出一个
+        名字就叫 `~` 的目录。实测确认 APPDATA 正常时不受影响, 但环境变量缺失
+        (服务账户/精简环境)就会写出非法路径。
+        改为 `os.path.expanduser('~')`, 至少指向真实的家目录。
+        ⚠️ 存储位置本身**有意不动**: 改到别处会让老用户的既有设置全部读不到。
+        """
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+        return os.path.join(base, 'LOLScript', 'settings.json')

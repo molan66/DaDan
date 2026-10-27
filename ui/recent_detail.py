@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QPushButton,
                              QScrollArea, QVBoxLayout, QWidget)
 
 from .styles import Glass
-from .icons import rounded_pixmap
+from .icons import rounded_pixmap, augment_pixmap
 from .match_fmt import (dur_text, game_mode_text, kda_ratio, kda_text,
                         lane_text, num_text, rate_text, time_text, wan_text)
 # v4.4.0 修复(P1-21/P2): 与主窗/小窗共用拖拽 + 玻璃去重实现
@@ -55,20 +55,28 @@ def _kv(label, width):
 
 
 class _IconBox(QLabel):
-    """头像 / 装备通用图标格: 自带占位 + 轮询补图。
+    """头像 / 装备 / 技能 / 海克斯通用图标格: 自带占位 + 轮询补图。
 
-    kind: 'champ' | 'item'; key: championId | itemId(<=0 表示空槽位, 不下载)。
+    kind: 'champ' | 'item' | 'spell' | 'augment'; key 为对应 id(<=0 空槽位)。
     失败超窗后不再重试 —— 防某个 id 永远没有图时每 500ms 空打网络。
+
+    v4.4.20: 新增 rarity 形参。仅 'augment' 用到 —— 官方海克斯小图标九成是
+    **纯白剪影蒙版**, 必须按稀有度染色才看得出区别(详见 main 侧 _aug_rarity_cb)。
     """
 
     RETRY_WINDOW_S = 14.0
 
-    def __init__(self, size, radius, kind, key, text='', parent=None):
+    def __init__(self, size, radius, kind, key, text='', parent=None, rarity=''):
         super().__init__(parent)
         self.setFixedSize(size, size)
         self.setAlignment(Qt.AlignCenter)
         self.kind = kind
         self.key = int(key or 0)
+        # 稀有度随格子一起存: 图标是异步回填的, set_data 时才需要它,
+        # 不能等到那时再去查表(会把一次纯 UI 刷新变成一次可能的网络请求)。
+        # 只存字符串 —— 上游字段缺失/类型异常时兜成 ''(不上色), 不让脏数据
+        # 一路传到 icons 层再炸(实测 int 会让 .strip() 抛 AttributeError)。
+        self.rarity = rarity if isinstance(rarity, str) else ''
         self.loaded = self.key <= 0
         self.deadline = _time.monotonic() + self.RETRY_WINDOW_S
         self.setStyleSheet(
@@ -82,8 +90,14 @@ class _IconBox(QLabel):
         # v4.4.0 修复(P1-16/P1-17): 传 widget=self 让 DPR 跟屏走, 并走上
         # icons.round_pixmap 的 LRU —— 详情窗重开时同一批头像/装备图标
         # (10 人 × 最多 7 件装备)不再逐张重新解码缩放。
-        pix = rounded_pixmap(data, self.width(), max(3, self.width() // 5),
-                             widget=self)
+        # v4.4.20: 海克斯走 augment_pixmap(白蒙版按稀有度染色); 其余 kind
+        # 维持 rounded_pixmap 不变, 保证非海克斯图标零回归。
+        radius = max(3, self.width() // 5)
+        if self.kind == 'augment':
+            pix = augment_pixmap(data, self.width(), self.rarity, radius,
+                                 widget=self)
+        else:
+            pix = rounded_pixmap(data, self.width(), radius, widget=self)
         if pix is None:
             return False
         self.setText('')
@@ -227,19 +241,24 @@ class _PlayerRow(QWidget):
         # 海克斯时列宽塌缩, 同一屏里的行会左右错位。
         augs = [a for a in (p.get('augments') or []) if a]
         if aux_grab is not None:
+            # v4.4.20: 稀有度与 id 一一对应传下去 —— 官方白蒙版图标必须按它染色
+            aug_rar = p.get('augment_rarity') or []
             aug_w = self._icon_strip(augs[:4], 'augment', self.AUG,
                                      icon_boxes, aux_grab, aux_request,
-                                     self.aug_strip_w(), placeholder=4)
+                                     self.aug_strip_w(), placeholder=4,
+                                     rarities=aug_rar)
             lay.addWidget(aug_w)
         lay.addStretch()
 
     def _icon_strip(self, keys, kind, size, icon_boxes, grab, request,
-                    fixed_w=None, placeholder=0):
+                    fixed_w=None, placeholder=0, rarities=None):
         """一排等尺寸图标格(技能/装备/海克斯共用)。
 
         fixed_w 给定则整条定宽 —— 表头与行都按同一个宽度排, 列才不会错位。
         placeholder: 至少渲染这么多个格位(不足补空), 用于"有的行没有、有的行有"
         的列(海克斯), 保证行高与列宽稳定。
+        rarities: v4.4.20 新增, 与 keys **下标对齐**的稀有度列表(仅 augment 用)。
+        长度不足的位置按 ''(不上色)处理, 不会 IndexError。
         """
         w = QWidget()
         w.setStyleSheet('background:transparent;')
@@ -265,12 +284,14 @@ class _PlayerRow(QWidget):
         keys = list(keys or [])
         while len(keys) < placeholder:
             keys.append(0)
-        for k in keys:
+        rar = list(rarities or [])
+        for i, k in enumerate(keys):
             try:
                 k = int(k or 0)
             except (TypeError, ValueError):
                 k = 0
-            box = _IconBox(size, 4, kind, k)
+            box = _IconBox(size, 4, kind, k,
+                           rarity=(rar[i] if i < len(rar) else ''))
             if k > 0 and not box.loaded:
                 data = _grab(k)
                 if not data or not box.set_data(data):

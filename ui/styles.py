@@ -81,6 +81,29 @@ class Glass:
     ACCENT_BORDER = 'rgba(52, 211, 153, 0.85)'
     ACCENT_BORDER_HOVER = 'rgba(52, 211, 153, 1.0)'
 
+    # ===== 海克斯强化稀有度色（v4.4.20）=====
+    # 起因: 用户反馈"海克斯好多没有颜色"。实测 LCU 的 augmentSmallIconPath
+    # 指向的 *_small.png 绝大多数是**纯白剪影蒙版**(整图只有 #ffffff+透明),
+    # 官方客户端是把它当遮罩、按稀有度现染色的; 我们原样贴图, 于是九成格子发白。
+    # ⚠️ 比例随版本变(16.21 实测 594 条里 527 条白蒙版), 且**不是全部** ——
+    #    仍有约 67 条自带颜色, 其中 5 条 kEventChoice 也是白蒙版。见 AUG_EVENT 说明。
+    #
+    # 取值不是拍脑袋: 直接采样官方自带的稀有度占位图
+    # (Kiwi/Augments/Icons/GenericAbilityAugmentIcon_{Silver,Gold,Prismatic}.png)
+    # 的主色, 保证与游戏内观感同源 —— 改这三个值等于改"游戏里那个颜色"。
+    #   Silver    #adc2c6   冷银灰
+    #   Gold      #e3c49f   暖金
+    #   Prismatic 官方是纯白描边 + 彩虹高光, 蒙版单色染不出彩虹, 取偏品红的
+    #             亮色以与 Gold 拉开区分度(纯白会和 Silver 的白蒙版混淆)
+    AUG_SILVER = '#adc2c6'
+    AUG_GOLD = '#e3c49f'
+    AUG_PRISMATIC = '#e8b3ff'
+    # kEventChoice(事件类)多数官方图自带颜色, 不会被着色; 这里只作为兜底同名键,
+    # 与 Gold 同值以免将来出现未着色的事件图标时观感突兀。
+    # ⚠️ 但**不能假设 kEventChoice 一定自带颜色**: 16.21 实测 25 条 kEventChoice
+    #    里有 5 条(340/341/342/355/364)是白蒙版, 会真的走到这条着色分支。
+    AUG_EVENT = '#e3c49f'
+
     # ===== 文字色（对比度 7:1+）=====
     TEXT_PRIMARY = '#ffffff'        # 主文字 - 纯白
     TEXT_SECONDARY = '#c8c8d8'     # 次文字 - 亮灰

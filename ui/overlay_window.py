@@ -442,6 +442,9 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
     swap_signal = pyqtSignal(int)
     accept_signal = pyqtSignal()
     decline_signal = pyqtSignal()
+    # v4.6.11 说明: stop_signal **全项目从未 emit**(小窗的"运行/停止"走下面的
+    # toggle_script_signal)。main.py 里那条 connect 已删除, 避免"已连未发"误导
+    # 排查方向。信号声明保留 —— 它是公开 API, 将来做独立的"停止"入口可直接用。
     stop_signal = pyqtSignal()
     toggle_script_signal = pyqtSignal()
     show_main_signal = pyqtSignal()
@@ -555,9 +558,9 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
             # 会多出一个图标(用户可见)却无任何日志。补打印, 便于定位。
             print(f'[Overlay] 隐藏任务栏按钮失败: {type(e).__name__}: {e}')
 
-    def _apply_glass_effect(self):
-        """调度入口(基类去重): 同一 geometry 下每次显示只真正应用一次。"""
-        super()._apply_glass_effect()
+    # v4.6.11 删除 _apply_glass_effect 的空覆写: 原先它只写了一句
+    # `super()._apply_glass_effect()` —— 基类已提供完全相同的调度(可见性+
+    # 几何去重), 覆写没有任何附加行为, 属纯噪音。
 
     def _glass_apply_core(self):
         """真正应用系统 Acrylic 模糊 + 系统圆角（无阴影）"""
@@ -878,9 +881,9 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         return bar
 
     # ==================== 外部接口 ====================
-    def update_connection_status(self, connected):
-        """仅驱动底部 _conn_dot + 文案,不影响顶部 _live_dot(那是连接态指示)"""
-        self.sig_conn.emit(connected)
+    # v4.6.11 删除 update_connection_status(): 全项目零调用(仅被注释提及)。
+    # 它只驱动底部 _conn_dot, 而真正在用的是下面 set_conn_indicator /
+    # set_conn_state(顶部+底部一起翻转) —— 留着会让人误以为有两个并行入口。
 
     def set_conn_indicator(self, connected: bool, text: str = ''):
         """统一驱动小窗连接状态指示器:顶部 _live_dot + 底部 _conn_dot + 两处文字同步翻转。

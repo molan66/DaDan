@@ -283,6 +283,149 @@ def _decode_rounded(data, size, radius, dpr):
     return out
 
 
+# ============================================================
+# v4.4.20: 海克斯强化稀有度 → 染色
+# ============================================================
+# 官方 cherry-augments.json 的 rarity 字段四种取值, 颜色取自官方自带的
+# 稀有度占位图主色(见 ui/styles.py 的说明), 保持与游戏内同源。
+#   kEventChoice 在官方数据里对应的图标**自带颜色**(不属白蒙版), 会走
+#   "不染色"分支; 这里仍给一个键只为 rarity 字符串异常时不出 KeyError。
+_RARITY_COLOR = {
+    'kSilver': Glass.AUG_SILVER,
+    'kGold': Glass.AUG_GOLD,
+    'kPrismatic': Glass.AUG_PRISMATIC,
+    'kEventChoice': Glass.AUG_EVENT,
+}
+
+
+def _is_white_mask_image(img) -> bool:
+    """判断图是否"纯白剪影蒙版"(所有可见像素都是不透明白)。
+
+    v4.4.20: 官方海克斯小图标绝大多数就是这种图 —— 全图只有 #ffffff + 透明,
+    颜色信息为零, 靠外层按稀有度染色才有观感。这类图**直接平铺就是一片白**,
+    正是用户反馈"海克斯好多没颜色"的根因。
+
+    ⚠️ 比例随游戏版本变, 不要按版本猜: 16.21 实测 594 条里 527 条是白蒙版
+    (约九成), 但**不是全部** —— 所以判据必须逐图判断, 不能按 rarity 一刀切
+    (实测有 5 条 kEventChoice 也是白蒙版)。
+
+    判据故意取"全部可见像素都接近纯白"而不是"含白"，避免把本来就有颜色的
+    图标(如 kEventChoice 那批)误染。抽样上限 4096 像素: 64×64 的官方图正好
+    全采, 更大图也够判断且不拖慢界面。
+    """
+    try:
+        im = img.convertToFormat(QImage.Format_ARGB32)
+        w, h = im.width(), im.height()
+        if w <= 0 or h <= 0:
+            return False
+        step = max(1, int(((w * h) / 4096) ** 0.5))
+        seen = 0
+        for y in range(0, h, step):
+            for x in range(0, w, step):
+                px = im.pixel(x, y)
+                # ARGB32: 0xAARRGGBB
+                if ((px >> 24) & 0xFF) <= 32:
+                    continue          # 透明像素不参与判断
+                seen += 1
+                r, g, b = (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF
+                # 容差 24: 抗锯齿边缘会有极轻微的降级白, 不算"有颜色"
+                if abs(r - 255) > 24 or abs(g - 255) > 24 or abs(b - 255) > 24:
+                    return False
+        return seen > 0
+    except Exception:
+        return False
+
+
+def augment_pixmap(data, size, rarity='', radius=None, widget=None, dpr=None,
+                   cache=True):
+    """海克斯图标专用: 白蒙版按稀有度染色后再画圆角。
+
+    v4.4.20 新增, 修"海克斯好多没有颜色"。链路:
+      bytes → 解码 → **若是纯白蒙版则按 rarity 染成单色** → 圆角裁剪。
+
+    关键设计:
+    - 只染**白蒙版**。官方图里自带颜色的那一批(16.21 实测 67 条)判据不通过,
+      原样保留 —— 染色对它们属于信息破坏。
+      ⚠️ 不要把「自带颜色」和某个 rarity 划等号: 16.21 实测 kEventChoice 里也有
+      5 条是白蒙版。判据只认图本身, 不认 rarity。
+    - rarity 未知('')时不做任何染色, 与原行为完全一致(退化成 rounded_pixmap)。
+    - 染色用 CompositionMode_SourceIn: 用颜色填充整张画布, 再以**原图 alpha**
+      为遮罩合成, 于是只改颜色、不动形状边缘的抗锯齿。
+    - 缓存键把 rarity 算进去: 同一张白蒙版在不同稀有度下必须是不同的 pixmap,
+      否则金色会串到银色上(装备/英雄 id 重叠的同类坑, 见 _digest 的位置)。
+    """
+    if not data:
+        return None
+    # 稀有度可能不是字符串 —— 表字段缺失/被写成数字/上游改结构都可能。
+    # 这里必须**只认字符串**, 否则 `(12345 or '').strip()` 直接 AttributeError
+    # 把整个图标格子打挂(实测过)。非字符串一律当"没有稀有度", 退化到原路径。
+    rarity = rarity if isinstance(rarity, str) else ''
+    color = _RARITY_COLOR.get(rarity.strip())
+    if not color:
+        # 没有可用稀有度 → 走原路径, 行为与改动前逐字节一致
+        if radius is None:
+            return icon_pixmap(data, size, widget=widget, dpr=dpr, cache=cache)
+        return rounded_pixmap(data, size, radius, widget=widget, dpr=dpr,
+                              cache=cache)
+    if not _assert_gui_thread():
+        # v4.6.11 修: 这里**不能**传 force=True。
+        # 原实现传了, 而 force 的语义是"跳过白蒙版判据" → 会把**本来自带颜色**的
+        # 图标也强行染成单色(信息破坏, 正是本函数刻意避免的事)。
+        # "绕过 LRU 缓存"(因为 QPixmap 有线程亲和)与"跳过正确性判据"是两件
+        # 不相干的事, 不该绑在一起。非主线程本就只能返回一次性结果, 那就保持
+        # 与主线程**同样的判据**, 只是不写缓存。
+        # (实测: 该分支当前不可达 —— 所有调用点都在主线程; 属防御代码自洽性修复)
+        _warn_once_non_gui()
+        try:
+            return _tint_rounded(data, size, radius if radius is not None else 4,
+                                 color, _resolve_dpr(widget, dpr))
+        except Exception:
+            return None
+    d = _resolve_dpr(widget, dpr)
+    r = int(radius) if radius is not None else 4
+    key = ('aug', _digest(data), int(size), round(d, 3), r, color)
+    if cache:
+        hit = _cache_get(key)
+        if hit is not None:
+            return hit
+    try:
+        pm = _tint_rounded(data, size, r, color, d)
+    except Exception:
+        return None
+    return _cache_put(key, pm) if cache else pm
+
+
+def _tint_rounded(data, size, radius, color, dpr):
+    """解码 → (纯白蒙版才)染色 → 圆角裁剪。
+
+    v4.6.11: 删掉了 `force` 形参。它唯一的用途是让非主线程分支**跳过**
+    `_is_white_mask_image` 判据 —— 而那个判据正是本函数"不破坏自带颜色图标"的
+    保证。留一个能关掉正确性检查的开关没有正当场景, 故连同调用点一并去掉。
+    """
+    img = QImage()
+    if not img.loadFromData(data or b''):
+        return None
+    if not _is_white_mask_image(img):
+        # 图本身有颜色 → 不染, 保证"自带颜色"的那批原样通过
+        return _decode_rounded(data, size, radius, dpr)
+    scaled = _decode_scaled(data, size, dpr, keep_aspect=False)
+    if scaled is None:
+        return None
+    out = _new_dpr_pixmap(size, dpr)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, size, size, radius, radius)
+    p.setClipPath(path)
+    off = int(round((size - scaled.width() / dpr) / 2.0))
+    p.drawPixmap(off, off, scaled)
+    # 关键: 以原图 alpha 为遮罩铺纯色 —— 只换颜色, 形状/抗锯齿边缘完全保留
+    p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    p.fillRect(0, 0, size, size, QColor(color))
+    p.end()
+    return out
+
+
 def icon_to_pixmap(icon, size, widget=None, dpr=None):
     """QIcon → DPR 感知 QPixmap(侧边栏三态图标缓存用)。
 
@@ -443,28 +586,6 @@ def icon_chart(color=None):
             p.drawRoundedRect(QRectF(x - w / 2.0, y, w, base - y), 1.5, 1.5)
         # 基线
         p.drawLine(int(m), int(base), int(s - m), int(base))
-    return _draw_icon(32, draw, c)
-
-def icon_info(color=None):
-    """关于 - 圆环内的信息符号(i: 上点 + 下竖线, 描线风格)。
-
-    v4.5.0: 「关于」页的侧边栏图标。笔宽/线帽走 _icon_pen, 与其余线性图标一致;
-    圆环留 m=s*0.20 的余量, 保证在 16/20/22/32 四档缩放后都不触边。
-    """
-    c = color or Glass.TEXT_MUTED
-    def draw(p, s):
-        m = s * 0.20
-        p.setPen(_icon_pen(c))
-        p.setBrush(Qt.NoBrush)
-        # 外圆环
-        p.drawEllipse(QRectF(m, m, s - 2 * m, s - 2 * m))
-        # i 的上点(实心小圆)
-        r = max(1.0, s * 0.045)
-        p.setBrush(QBrush(QColor(c)))
-        p.drawEllipse(QRectF(s / 2.0 - r, s * 0.30 - r, r * 2, r * 2))
-        # i 的下竖线
-        p.setBrush(Qt.NoBrush)
-        p.drawLine(int(s / 2), int(s * 0.44), int(s / 2), int(s * 0.72))
     return _draw_icon(32, draw, c)
 
 # ========== 功能图标 ==========

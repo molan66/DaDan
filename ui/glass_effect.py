@@ -85,14 +85,11 @@ class WINDOW_COMPOSITION_ATTRIBUTES(ctypes.Structure):
     ]
 
 
-class MARGINS(ctypes.Structure):
-    _fields_ = [
-        ("cxLeftWidth", ctypes.c_int),
-        ("cxRightWidth", ctypes.c_int),
-        ("cyTopHeight", ctypes.c_int),
-        ("cyBottomHeight", ctypes.c_int),
-    ]
-
+# v4.9.3: 删除 `class MARGINS(ctypes.Structure)` —— 它是
+# `DwmExtendFrameIntoClientArea` 的入参结构体，而该 API 在本文件**只在注释里被提到**
+# （见文件头第 11 行，讲的是"为什么放弃那条路线"），实际代码一次都没调用。
+# 全项目 grep 零引用。一个"看起来准备调用某 API"的结构体，只会让后来人误以为还有
+# 第二套玻璃实现。
 
 def _dwm_attr(hwnd, attr, val):
     """设置 DWM 属性。返回 HRESULT(0=成功); 任何异常返回 -1。

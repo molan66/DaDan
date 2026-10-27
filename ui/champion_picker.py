@@ -120,11 +120,17 @@ class ChampionCard(QPushButton):
         painter.end()
 
     def mousePressEvent(self, event):
+        # v4.9.3 修: 原为 `event.pos() if ... else None` + 后面 `if self._sel and
+        # self._drag_start and ...` —— `QPoint(0,0)` 的布尔值是 **False**,
+        # 而点在卡片**左上角那一个像素**时偏移正好是 (0,0)，于是拖拽失效。
+        # 这与 window_base 里记录的同款 `_drag_pos` 假值坑是同一个错误，
+        # 只是这里漏改了。改用显式 `is not None`。
         self._drag_start = event.pos() if event.button() == Qt.LeftButton else None
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._sel and self._drag_start and (event.buttons() & Qt.LeftButton):
+        if (self._sel and self._drag_start is not None
+                and (event.buttons() & Qt.LeftButton)):
             if (event.pos() - self._drag_start).manhattanLength() > 20:
                 from PyQt5.QtGui import QDrag, QMimeData
                 drag = QDrag(self)

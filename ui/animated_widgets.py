@@ -16,8 +16,13 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, QPointF
 from PyQt5.QtGui import QColor, QPainter, QPainterPath, QLinearGradient
 
-from .window_base import ui_slot
+# v4.6.11: 用主题令牌替代硬编码的 '#6366f1' —— 该值与 Glass.PRIMARY 同色,
+# 各写一份会让"改主色"漏掉这里(PulseGlow 的默认值)。
+# v4.9.3: 原来上面这行下面还重复了一次 `from .styles import Glass`（两行相邻、
+# 完全一样）。无害但是纯噪音, 已删。
 from .styles import Glass
+
+from .window_base import ui_slot
 
 
 def paint_window_backdrop(p, w, h):
@@ -323,7 +328,7 @@ class GlassCard(QWidget):
 class PulseGlow(QWidget):
     """脉冲发光边框动画组件"""
 
-    def __init__(self, color='#6366f1', parent=None):
+    def __init__(self, color=Glass.PRIMARY, parent=None):
         super().__init__(parent)
         self._color = QColor(color)
         self._pulse_value = 0.0
