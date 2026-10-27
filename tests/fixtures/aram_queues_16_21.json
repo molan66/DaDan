@@ -1,0 +1,231 @@
+{
+  "_note": "大蛋小助手测试夹具：LOL 16.21 国服 queues.json 的「白名单判据相关切片」。含所有 kARAM 队列、所有 AllRandomPickStrategy 队列、以及 EXTRA_ALLOWED 备案的 id。**按判据抓，不按名字抓** —— 第一版按名字抓漏了 451/452/720/721，导致全覆盖测试假通过。勿手改；游戏更新后用 tools/refresh_queue_fixture.py 重生成。",
+  "_source": "LCU /lol-game-data/assets/v1/queues.json  (build 16.21.8299102+branch.releases-16-21.code.publictencent.content.release)",
+  "_captured_at": "2026-10-22",
+  "queues": [
+    {
+      "id": 0,
+      "name": "",
+      "pickMode": "",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 450,
+      "name": "极地大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 451,
+      "name": "3v3",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 452,
+      "name": "1v1",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 720,
+      "name": "冠军杯赛",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 721,
+      "name": "冠军杯赛",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 860,
+      "name": "极地大乱斗 5v5 人机",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kVersusAI",
+      "roster_size": 173
+    },
+    {
+      "id": 861,
+      "name": "极地大乱斗 1v1 人机",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 862,
+      "name": "",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 865,
+      "name": "",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 900,
+      "name": "无限乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 901,
+      "name": "测试：无限乱斗 1v1",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 902,
+      "name": "测试：无限乱斗 2v2",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 903,
+      "name": "测试：无限乱斗 3v3",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 904,
+      "name": "测试：无限乱斗 4v4",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 930,
+      "name": "极地大乱斗",
+      "pickMode": "",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 931,
+      "name": "极地大乱斗",
+      "pickMode": "",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 2400,
+      "name": "海克斯大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 2401,
+      "name": "海克斯大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 2403,
+      "name": "海克斯大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 2405,
+      "name": "海克斯大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 2410,
+      "name": "海克斯大乱斗 巅峰赛",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 2450,
+      "name": "海克斯大乱斗 经典模式版",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 60
+    },
+    {
+      "id": 3120,
+      "name": "召唤师峡谷 全随机",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 3220,
+      "name": "嚎哭深渊 全随机",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kPvP",
+      "roster_size": 173
+    },
+    {
+      "id": 3240,
+      "name": "海克斯大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kCustom",
+      "roster_size": 173
+    },
+    {
+      "id": 3270,
+      "name": "海克斯大乱斗",
+      "pickMode": "AllRandomPickStrategy",
+      "gameSelectModeGroup": "kAlternativeLeagueGameModes",
+      "gameSelectCategory": "kCustom",
+      "roster_size": 173
+    },
+    {
+      "id": 3280,
+      "name": "海克斯大乱斗 经典模式版",
+      "pickMode": "",
+      "gameSelectModeGroup": "kARAM",
+      "gameSelectCategory": "kCustom",
+      "roster_size": 60
+    }
+  ]
+}

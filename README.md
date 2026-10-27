@@ -7,7 +7,8 @@
 只把客户端里的重复点击自动化。
 
 功能：自动匹配 / 自动接受 / 自动返回 / 自动选英雄 / 自动换英雄 / 自动点赞，  
-另有首页账号卡与「战绩」页（近期对局列表，点整行可看本局 10 人完整详情）。
+另有首页账号卡与「战绩」页（近期对局列表，点整行可看本局 10 人完整详情）、  
+设置页的「清理缓存」（图标/头像/日志/英雄数据，先显示实际占用再让你选）与授权状态卡。
 
 - 运行环境：Windows 10/11，Python 3.14（实测 3.14.7）+ PyQt5 5.15.11
 - 界面：无边框毛玻璃（Windows Mica/Acrylic），侧边栏六页（首页/设置/英雄/战绩/日志/关于）
@@ -18,6 +19,31 @@
 > （按 League of Legends 安装目录特征逐盘查找，最多几十秒、只在后台线程执行），  
 > 连接阶段有「单飞」去重，不会并发多次扫描；一旦客户端启动并缓存了端口/token，  
 > 后续连接即走缓存校验，不再重复扫盘。
+
+## 关于授权（本仓库不含出码工具）
+
+程序内置一套**离线授权**（机器绑定 + Ed25519 验签），源码在
+`core/licensing.py` 与 `core/license_crypto.py`，激活界面在 `ui/activation_dialog.py`。
+
+设计要点：**exe 里只有公钥，没有私钥**。私钥由作者本机保管（项目目录之外），
+所以公钥公开无害 —— 没有私钥就签不出有效授权码。
+
+因此本仓库**有意不包含**以下卖家专用工具：
+
+| 不包含 | 原因 |
+| --- | --- |
+| `tools/make_license.py` | 用私钥签发授权码（出码工具） |
+| `tools/gen_keys.py` | 生成密钥对 |
+| `tools/reset_license_state.py` | 重置本机授权状态（调试用） |
+| 离线发卡器 HTML | 内部使用的出码界面 |
+
+由此产生一个**预期行为**：`tests/test_licensing.py` 里有 4 个用例会显示
+`skipped "无法导入签发工具"`——它们验证的是出码工具的换算逻辑，缺文件即跳过，
+不是失败。其余 **199 个用例应当全绿**。
+
+自己从源码运行时会处于「未激活」状态，有 7 天试用期（`licensing.TRIAL_DAYS`，
+设为 0 可关闭）。想跳过授权做本地开发，可临时把 `main.py` 里 `_license_ok()`
+的调用注释掉 —— 那只影响你自己构建的这份源码，不会影响任何发布产物。
 
 ## AI 开发声明
 
@@ -49,13 +75,34 @@ python -m PyInstaller --noconfirm build.spec       # 产物: dist/大蛋小助�
 ## 目录结构
 
 ```
-main.py              程序入口 + AppController（探活/图标缓存）
-core/                script_core 自动化状态机、日志、updater 版本号
-lcu/                 connector 客户端发现、api REST 封装、clicker 模拟点击
-ui/                  主窗/小窗/选择器/战绩页/关于页 等界面
+main.py              程序入口 + AppController（探活/图标缓存/授权门禁/崩溃兜底）
+core/                script_core 自动化状态机、logger 日志轮转与脱敏、
+                     icon_cache 四类图标缓存、cache_cleaner 清理逻辑、
+                     licensing / license_crypto 授权验签、updater 版本号
+lcu/                 connector 客户端发现、api REST 封装、clicker 模拟点击、launcher 启动器
+ui/                  主窗/小窗/选择器/战绩页/详情页/激活窗/须知 等界面
 data/                程序图标、英雄元数据；图标缓存在运行时生成
+tests/               回归测试（Python unittest，零额外依赖）
 docs/PROVENANCE.md   上游来源与改写范围的逐项说明
 ```
+
+## 跑测试
+
+```bash
+python -m unittest tests.test_licensing tests.test_license_gate \
+                   tests.test_license_card tests.test_regressions \
+                   tests.test_v493_fixes
+```
+
+预期：**199 passed**（另有 4 个 skipped，见上面「关于授权」一节 —— 缺出码工具所致）。
+
+跑 UI 相关用例需要 Qt 能创建窗口；无显示环境时设 `QT_QPA_PLATFORM=offscreen`。
+
+> ⚠️ 本项目历史上出现过多次「逻辑对但没接线」的缺陷（比如三态指示器实现了
+> connected 分支却从没人推过；授权门禁的三行代码被删掉而 73 个测试全绿）。
+> 所以 `tests/test_license_gate.py` 里有一批**源码级断言**（门禁必须排在线程派发
+> 之前、`self._core.start()` 全项目只能有一个调用点），它们不测行为、
+> 只防结构被改坏 —— 看着"不像测试"，但正是它们能挡住白送。
 
 ## 许可证
 

@@ -34,9 +34,29 @@ data/x/
 *.log
 crash.log
 
+# 授权状态与资产版本标记（运行时生成，跟具体机器绑定，绝不能入库）
+data/.assets_version
+clock_watermark.json
+trial.json
+.trial_state
+.trial_watermark
+license.json
+
+# ---- 授权/密钥材料（永不入库）----
+# 私钥 = 印钞机：泄露即别人能造授权码。
+# 本仓库不含出码工具，但这条规则防的是"有人图省事把密钥存进目录"。
+private_key*
+server_secrets*
+*.secret
+secrets*.txt
+*.pem
+*.key
+
 # ---- 本机/个人环境 ----
 .workbuddy/
 _shots/
+_shots_v*/
+_promo_src/
 .idea/
 .vscode/
 *.swp
