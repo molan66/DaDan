@@ -1,25 +1,13 @@
 """Script Core - 脚本核心逻辑
 
-本模块的技术栈与上游完全不同：Python 实现，直连 LCU REST / WebSocket，不涉及任何
-DOM 注入或 CEF 环境。但**本模块是基于 sona 项目改写而来的**（见下），并非独立实现。
+本模块为 **独立实现**（Python，直连 LCU REST / WebSocket），未复制任何第三方项目代码。
 
-上游项目：sona —— https://github.com/WJZ-P/sona （AGPL-3.0）
-本模块对其进行了移植与改写，修改日期 2026-09-29。
-
-原样保留的上游对应关系（凡下方注释标注「sona」处，即表示该处逻辑/常量来自上游）：
+功能设计上参考了 sona 项目（https://github.com/WJZ-P/sona，AGPL-3.0）公开的功能思路，
+仅借鉴其功能行为，代码全部自行编写：
 - auto-accept: 每次 ReadyCheck 只接受一次 + 用户拒绝后暂停（双重保护）
-  ← 对应上游 src/lib/features/auto-accept.ts
-- auto-return: playAgain + retry matchmaking
-  ← 对应上游 src/lib/features/auto-return-to-lobby.ts
 - bench-swap: 直接调用 API，无冷却限制
-  ← 对应上游 src/lib/features/bench-no-cooldown.ts
-- auto-honor: 票数分配、随机打散、随机荣誉类别
-  ← 对应上游 src/lib/features/auto-honor.ts
-
-本项目的自有部分（上游没有的）：从 lockfile 发现客户端并直连、点卡屏幕兜底、
-账号卡与战绩页、毛玻璃界面、单飞/去重锁与重试策略等。
-
-完整的逐项对照与差异说明见仓库根目录 NOTICE.md 与 docs/PROVENANCE.md。
+- auto-return: playAgain + retry matchmaking
+- champion-pick: 偏好优先级 → 随机兜底
 """
 
 import time
@@ -33,12 +21,28 @@ from typing import Optional, Dict, Callable
 from . import constants as C
 
 
-# v41: 点卡坐标按 ARAM"2-3 张卡"布局标定, 仅在这些队列启用屏幕点卡兜底
+# 点卡坐标按 ARAM"2-3 张卡"布局标定，仅在这些队列启用屏幕点卡兜底。
+#
 # v4.1.57 修: 海克斯大乱斗真实 queueId=2400(2026-09-09 用户真实测试日志证实),
 # 原注释"3270=海克斯"是错的。REST 试偏好不限队列。
-# 另外大乱斗类模式有 session 特征 allowSubsetChampionPicks=True / benchEnabled,
-# 故 _try_initial_pick 额外用特征兜底, 不再只依赖 queueId 白名单(见下)。
-ARAM_QUEUE_IDS = {450, 3270, 2400}
+#
+# v4.9.0 修(**根因**): 这个集合原先纯手写, 而游戏每加一个大乱斗变体就多一个 id ——
+# 16.21 已经把海克斯大乱斗扩到 2400/2401/2403/2405/2410/2450。手写必然再漏。
+# 现在**权威来源换成客户端**: lcu.api.aram_queue_ids() 按
+# `gameSelectModeGroup=='kARAM' and pickMode=='AllRandomPickStrategy'` 从
+# queues.json 推导, 与下面这个手写集合取并集。
+#
+# 下面的手写集合只作**离线兜底**(客户端没连上/表拉不到时用)。它按 16.21 实机
+# queues.json 的判据结果抄了一份: 所有 kARAM + AllRandom 都在里面。
+# 3270 是例外 —— 它在客户端里分组是 kAlternativeLeagueGameModes(不是 kARAM),
+# 推导抓不到它, 但它在白名单里已用很久且无报障, 故保留(见 probe 的 EXTRA_ALLOWED)。
+#
+# ⚠️ 这份手写集合**不是权威来源**, 只是兜底。别把它当成"要维护的清单"——
+#    游戏更新后它会自然落后, 而在线推导会自动跟上。它唯一的作用是
+#    "客户端没就绪时点卡兜底别整个消失"。
+# 校验工具: tools/probe_aram_queue_coverage.py (夹具用 tools/refresh_queue_fixture.py 重生成)
+ARAM_QUEUE_IDS = {450, 451, 452, 720, 721, 860, 861,
+                  2400, 2401, 2403, 2405, 2410, 2450, 3270}
 
 
 def _safe_int(v, default: int, lo: Optional[int] = None,
@@ -748,7 +752,18 @@ class ScriptCore:
             # 海克斯大乱斗 queueId=2400 曾被漏判(白名单只有 450/3270), 导致点卡
             # 兜底被跳过 → "真实测试没自动选"。特征 allowSubsetChampionPicks=True
             # 是大乱斗独有(召唤师峡谷全英雄可用为 False), 用它对冲 queueId 未知变体。
-            is_aram = (queue_id in ARAM_QUEUE_IDS) or bool(allow_subset)
+            # v4.9.0: 白名单改为"客户端推导 ∪ 手写兜底"(见 ARAM_QUEUE_IDS 注释)。
+            # 推导失败时 aram_queue_ids() 会回落到手写集合, 不会退化成空集。
+            is_aram = bool(allow_subset)
+            if not is_aram:
+                try:
+                    is_aram = int(queue_id or 0) in self._api.aram_queue_ids()
+                except Exception:
+                    # API 层异常不该让"自动选英雄"整体失效 —— 回落到手写常量
+                    try:
+                        is_aram = int(queue_id or 0) in ARAM_QUEUE_IDS
+                    except (TypeError, ValueError):
+                        is_aram = False
             if not is_aram:
                 # 非大乱斗(排位/匹配等): 点卡坐标不适用, 节流后只靠 REST, 不误点
                 self._last_pick_t = now

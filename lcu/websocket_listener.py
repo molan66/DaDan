@@ -26,7 +26,8 @@ class WebSocketListener:
         self._manual_close = False
         self._on_disconnected: Optional[Callable] = None
         self._on_connected: Optional[Callable] = None  # WS 真正建立连接(on_open)后的回调
-        self._last_uri: str = ''  # 避免重复处理相同URI
+        # v4.6.11 删除 self._last_uri —— 全项目只在这一行赋值、从无读取
+        # (注释写"避免重复处理相同URI", 但去重逻辑并未实现), 属死状态。
         # v4.4.2(P1-19): connect()/disconnect() 的进程级单飞锁。原 :72-73 的
         # "检查 is_alive → 再 _ensure_consumer + 构造 WebSocketApp → start" 之间
         # 无锁, 两个调用方(main.py:1594 受 _connecting 保护 / main.py:2000 受
@@ -43,7 +44,9 @@ class WebSocketListener:
         # 线上无法定位。改为至少打印一次（避免刷屏），降低排障成本。
         # v4.4.2(P1-7): 由一次性闸门改为 60s 时间窗 —— 原 `_err_reported` 置 True
         # 后永不复位, 第一条之后的完全不同异常被永久静音。
-        self._last_err_t = 0.0
+        # v4.6.10: 时间戳**按类别**分别记录(dict) —— 单一全局时间戳会把窗口内
+        # 完全不同的异常一并静音, 与"每类一次"的承诺不符(见 _report_error)。
+        self._last_err_t = {}
         self._err_window_s = 60.0
         self._q_dropped = 0
         self._q_drop_reported = False
@@ -285,20 +288,30 @@ class WebSocketListener:
             if not self._q_drop_reported:
                 self._q_drop_reported = True
                 self._report_error(f'[WS] 事件队列已满({self._Q_MAXSIZE}), 开始丢弃'
-                                   f'积压事件(消费线程被慢处理器卡住)')
+                                   f'积压事件(消费线程被慢处理器卡住)', kind='qfull')
         except Exception as e:
-            self._report_error(f'[WS] 事件入队失败: {type(e).__name__}: {e}')
+            self._report_error(f'[WS] 事件入队失败: {type(e).__name__}: {e}',
+                               kind='enqueue')
 
-    def _report_error(self, msg):
-        """异常按 60s 时间窗节流打印, 避免高频事件把日志刷爆(但保证窗口内可见)。
+    def _report_error(self, msg, kind=None):
+        """异常按 60s 时间窗**按类别**节流, 避免高频事件把日志刷爆。
 
         v4.4.2(P1-7): 原一次性闸门(_err_reported 置 True 后永不复位)会让第一条
-        之后**完全不同**的异常被永久静音。改为时间窗: 每类窗口内打一次。
+        之后**完全不同**的异常被永久静音。改为时间窗。
+
+        v4.6.10 修: 上一条改动**没做到注释承诺的"每类窗口内一次"** —— 实测原实现
+        只有一个全局 `self._last_err_t`, 于是第一条异常之后 60s 内, 队列读取异常/
+        分发异常/处理器异常这些**完全不同**的故障全被静音, 与 P1-7 想修的行为
+        实质相同(只是窗口从"永久"变成"60 秒")。
+        现在按 `kind`(或消息首段)分别记时间戳 —— 每类各自享有一次窗口额度。
+        WS 是实时通道, "队列满/处理器卡死"这类现场必须留得下来。
         """
         try:
             now = time.monotonic()
-            if now - self._last_err_t >= self._err_window_s:
-                self._last_err_t = now
+            key = kind if kind is not None else str(msg)[:40]
+            last = self._last_err_t.get(key)
+            if last is None or now - last >= self._err_window_s:
+                self._last_err_t[key] = now
                 print(msg)
         except Exception:
             pass

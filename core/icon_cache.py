@@ -64,6 +64,50 @@ def is_valid_image(data) -> bool:
 # 100 字节足以滤掉空响应与 HTML 错误页,又不会误杀小图。
 MIN_BYTES = 100
 
+# v4.6.3: 资产版本标记文件名(侧车文件, 放在各缓存目录内)。
+#
+# 起因: 图标按纯 id 落盘({id}.png), 命中即用 —— 游戏更新换了图标后,
+# 只要 id 还在缓存里就**永远不会重新下载**。实测证据: 本机 icon_cache
+# 236 张的 mtime 全部停在同一天, 之后再没变过。
+#
+# 做法: 记住"这批图是哪个游戏版本下载的"。版本一变, 清空该目录重下。
+# 用侧车文件而不是把版本写进目录名, 是为了**保持既有路径不变** ——
+# 目录名一改, _get_icon_cache_dir / 头像落盘 / 各处诊断路径全要跟着动,
+# 迁移风险大于收益。
+VERSION_STAMP = '.assets_version'
+
+
+def is_temp_file(name: str) -> bool:
+    """v4.6.10: 判断文件名是不是 `_write_atomic` 留下的临时文件。
+
+    🔴 为什么需要这个函数(实测复现的缺陷): `_write_atomic` 把临时文件命名为
+    `{path}.tmp.{pid}.{tid}`(见下方 548 行), 例如 `2503.png.tmp.12345.678` ——
+    它**既不以 `.tmp` 结尾、也不以 `.png` 结尾**。而原先三处"清理 .tmp"的判据
+    写的都是 `endswith('.tmp')` 或把 `.tmp` 塞进图片后缀白名单里:
+      · `clear_images()` —— 实测: 造一个真实命名的孤儿 tmp, 清理后它**仍然在**,
+        即文档承诺的"删除残留 .tmp"是死代码;
+      · `trim_disk()` 的 `if f.endswith('.tmp')` 分支**永不进入**(两个分支体
+        还完全相同, 属纯死代码);
+      · `main._cleanable_file()` 同样匹配不到 → 设置页「清理缓存」也删不掉。
+    目前没有造成无界增长(只被 trim_disk 的总数上限间接兜住), 但"清理"名不
+    副实 —— 这里统一判据, 三处共用, 杜绝再次写歪。
+
+    判据同时接受两种形态: 中间含 `.tmp.`(当前命名) 或 以 `.tmp` 结尾(旧命名,
+    兼容历史残留)。
+    """
+    n = name or ''
+    return '.tmp.' in n or n.endswith('.tmp')
+
+
+# v4.6.10: 图片类文件后缀(清理时用)。**唯一来源** ——
+# 原先 `icon_cache.clear_images()` 与 `main._cleanable_file()` 各写一份,
+# 且已经漂移(main 那份还含 .log/.log.1)。两处口径不一致的后果是"某一类文件
+# 清点算得到、清理删不掉"这种极难复现的差异(icon_cache 的旧注释自己就写过
+# 这个风险, 只是没落实到代码)。
+# ⚠️ 注意: 临时文件 `{key}.png.tmp.{pid}.{tid}` **不在**这个白名单里(它不以
+# 任何图片后缀结尾), 需用上面的 is_temp_file() 单独判。
+IMAGE_SUFFIXES = ('.png', '.jpg', '.jpeg', '.webp', '.img')
+
 
 def app_data_dir(sub: str = '') -> str:
     """exe 同级(打包后)或项目根(源码运行)的 data 目录。
@@ -197,7 +241,20 @@ class IconCache:
         return data
 
     def is_failed(self, key) -> bool:
-        return int(key) in self._failed
+        """该 key 是否在失败黑名单里。
+
+        v4.6.10 修: 原先只有一行 `return int(key) in self._failed` —— 既**不加锁**
+        (而兄弟方法 is_downloading/has 都加了, `_failed` 又是被多线程写集合),
+        也**没有类型保护**(传个非数字字符串会直接抛 ValueError)。
+        当前两个调用点恰好都先 int() 过, 所以没有现场故障, 但接口不对称 ——
+        下一个调用者很容易踩。这里照 is_downloading 的三段式对齐。
+        """
+        try:
+            key = int(key)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            return key in self._failed
 
     def is_downloading(self, key) -> bool:
         """该 key 是否有下载正在后台进行。
@@ -212,10 +269,8 @@ class IconCache:
         with self._lock:
             return key in self._downloading
 
-    def has(self, key) -> bool:
-        """仅内存命中判断(不碰磁盘)。用于"已缓存就别再提交下载"。"""
-        with self._lock:
-            return int(key) in self._mem
+    # v4.6.11 删除 has(): 全项目零调用。request() 内的"命中就别再提交下载"是
+    # 直接 hit() 实现的, 这个"仅内存命中"的窄版本从未被用上。
 
     # ---------------- 写 ----------------
 
@@ -380,6 +435,90 @@ class IconCache:
             print(f'{self.log_tag} 预热失败: {type(e).__name__}: {e}')
         return added
 
+    # ---------------- v4.6.3: 资产版本 ----------------
+
+    @property
+    def _stamp_path(self) -> str:
+        return os.path.join(self._dir, VERSION_STAMP)
+
+    def assets_version(self) -> str:
+        """读回"本目录里的图是哪个游戏版本下的"。没记录过返回 ''。"""
+        try:
+            with open(self._stamp_path, encoding='utf-8') as f:
+                return (f.read() or '').strip()
+        except Exception:
+            return ''
+
+    def apply_assets_version(self, version: str) -> int:
+        """版本对齐: 与记录一致 → 什么都不做; 不一致 → 清空本目录并记新版本。
+
+        返回被删掉的图片数(0 = 无需清理)。
+
+        ⚠️ 三条安全约束(每条都对应一个真实踩过的坑):
+        1. `version` 为空 → **直接返回 0, 不清任何东西**。
+           客户端没启动时 get_game_version() 拿不到版本, 若把它当成"版本变了",
+           每次离线启动都会把好端端的缓存清空, 反而制造故障。
+        2. 首次运行(无标记) → **只记版本, 不清**。
+           老用户升到本版本时目录里已有可用图标, 没有理由让他们重下。
+           真正要防的是"记着 16.20 却来了 16.21"。
+        3. 清空前先比对, 一致就短路 —— 这是常态路径(每次启动都会调),
+           必须零开销。
+        """
+        v = (version or '').strip()
+        if not v:
+            return 0
+        old = self.assets_version()
+        if old == v:
+            return 0
+        removed = 0
+        if old:
+            removed = self.clear_images()
+            print(f'{self.log_tag} 游戏版本 {old} → {v}, 已清理旧图标 {removed} 张'
+                  f'({self.dir_name}), 将按需重新下载')
+        if self._write_atomic(self._stamp_path, v.encode('utf-8')):
+            pass
+        else:
+            # 标记写不进去(只读目录等): 不致命, 但下次启动还会再判一次"变了"。
+            # 记一条即可 —— 这属于环境异常, 与图标功能本身无关。
+            print(f'{self.log_tag} ⚠️ 资产版本标记写入失败({self.dir_name}), '
+                  f'下次启动会重新判定')
+        return removed
+
+    def clear_images(self) -> int:
+        """删除本目录里所有图片与残留 .tmp, 保留目录本身。返回删除数。
+
+        v4.6.3: 供"版本变化自动清理"与设置页「清理缓存」共用 ——
+        两处必须同一套实现, 否则将来一处改了另一处漏改, 表现是
+        "手动清能清掉、自动清清不干净"这种极难复现的差异。
+
+        只删本目录内的常规文件, 不递归、不跟随符号链接 —— 目录由
+        app_data_dir 拼出, 永远不会是用户指定的任意路径。
+        顺带把内存缓存一并清空, 否则"磁盘删了、内存还留着旧图",
+        界面在本次会话里仍显示旧图标(与版本清理的初衷矛盾)。
+        """
+        removed = 0
+        try:
+            for f in os.listdir(self._dir):
+                p = os.path.join(self._dir, f)
+                try:
+                    if not os.path.isfile(p):
+                        continue
+                    # v4.6.10 修: 临时文件判据独立 —— 实测 `{key}.png.tmp.{pid}.{tid}`
+                    # 既不匹配图片后缀、也不 endswith('.tmp'), 原先这里根本删不掉它
+                    # (文档却承诺"删除残留 .tmp")。现用 is_temp_file() 显式覆盖。
+                    if is_temp_file(f) or f.lower().endswith(IMAGE_SUFFIXES):
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    continue
+        except Exception:
+            pass
+        with self._lock:
+            self._mem.clear()
+            self._order.clear()
+            self._failed.clear()
+        return removed
+
     def trim_disk(self) -> int:
         """按 mtime 保留最新 max_disk 张,返回删除数。启动后调一次即可。
 
@@ -387,33 +526,51 @@ class IconCache:
         `_write_atomic` 的 except 分支来不及跑, 残留 `{key}.png.tmp` 会永久累积、
         无上限。tmp 名带 pid+线程 id, 属"不再可能被恢复"的孤儿文件, 按 mtime
         一并删除。
+
+        v4.6.8: 全程持锁。原实现**无锁**(只有 put/hit/request 加锁), 而 main.py
+        在提交预热任务时注释声称"IconCache 内部锁串行化" —— 注释与实现不符。
+        真实窗口: 预热线程在这里 listdir/删文件, 同时下载线程在 put() 落盘,
+        两者并发操作同一目录。危害有限(最坏是刚下好的图被当"最旧"删掉, 下次
+        重新下载), 但既然对外承诺了串行化就该兑现 —— 而且本函数只做
+        listdir/getmtime/remove, 持锁时间在毫秒级, 不会拖慢下载。
+        锁内**没有**再获取同一把锁的调用, 无死锁风险。
         """
         if not self.max_disk:
             return 0
         removed = 0
         try:
-            files = []
-            for f in os.listdir(self._dir):
-                p = os.path.join(self._dir, f)
-                try:
-                    if not os.path.isfile(p):
+            with self._lock:
+                files = []
+                for f in os.listdir(self._dir):
+                    # v4.6.3: **必须排除资产版本标记** —— 它是最早写入的文件,
+                    # 按 mtime 淘汰时必然排在最前, 不排除的话每轮清理都会先把它删掉,
+                    # 于是下次启动又判成"首次运行/版本未知", 版本感知直接失效。
+                    if f == VERSION_STAMP:
                         continue
-                    if f.endswith('.tmp'):
-                        # v4.4.2(P1-9): 过期 .tmp 也纳入, 与正常文件同按 mtime 淘汰
+                    p = os.path.join(self._dir, f)
+                    try:
+                        if not os.path.isfile(p):
+                            continue
+                        # v4.6.10 修死代码: 原先是
+                        #     if f.endswith('.tmp'): files.append(...)
+                        #     else:                  files.append(...)
+                        # 两个分支体**完全相同**, 且 if 的条件**永不为真** ——
+                        # _write_atomic 写的是 `{path}.tmp.{pid}.{tid}`, 不以 `.tmp`
+                        # 结尾(实测确认)。也就是说注释声称的"tmp 与正常文件同按
+                        # mtime 淘汰"结论没错, 但靠的是 else 兜底, if 是纯死代码。
+                        # 现在正常文件与临时文件一视同仁地纳入 mtime 排序。
                         files.append((os.path.getmtime(p), p))
-                    else:
-                        files.append((os.path.getmtime(p), p))
-                except OSError:
-                    continue
-            if len(files) <= self.max_disk:
-                return 0
-            files.sort()
-            for _, p in files[:len(files) - self.max_disk]:
-                try:
-                    os.remove(p)
-                    removed += 1
-                except OSError:
-                    continue
+                    except OSError:
+                        continue
+                if len(files) <= self.max_disk:
+                    return 0
+                files.sort()
+                for _, p in files[:len(files) - self.max_disk]:
+                    try:
+                        os.remove(p)
+                        removed += 1
+                    except OSError:
+                        continue
         except Exception:
             pass
         return removed

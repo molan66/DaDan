@@ -1,6 +1,7 @@
 """LCU API - 英雄联盟客户端 REST API 封装"""
 
 import json
+import re
 import threading
 import requests
 import urllib3
@@ -47,9 +48,63 @@ _ALIAS_CACHE: Dict[int, str] = {}
 # 写入值一致, 但"查 → 算 → 写"三步存在重复计算窗口; 加锁消除重复计算与 import 竞争。
 _ALIAS_LOCK = threading.Lock()
 
+# v4.6.3: **来自 LCU 的动态别名**(权威、随版本更新), 优先于下面那份硬编码表。
+#
+# 起因: 硬编码表 data/champion_aliases.py 是静态的 —— 官方出新英雄后表里没有,
+# 于是 `_champion_alias()` 返回空, CDN 备用源拼不出 URL, **新英雄图标在客户端
+# 未启动时永远取不到**(客户端开着时能走 LCU 本地路径, 所以症状是"时好时坏")。
+# 而 LCU 的 champion-summary.json 每条都带 `alias` 字段, 本地、权威、随版本更新。
+#
+# 由 main 在拿到英雄数据后调 remember_champion_aliases() 灌入。
+_ALIAS_DYNAMIC: Dict[int, str] = {}
+
+
+def remember_champion_aliases(champs) -> int:
+    """把 LCU 给的英雄数据里的 alias 灌进动态别名表。返回新增/更新条数。
+
+    champs: get_champion_data() 的返回(列表, 每条含 id 与 alias 字段)。
+
+    为什么单独存一份而不是直接改 CHAMPION_ALIASES: 那份表还兼职"中文名/外号
+    搜索索引", 结构是 {id: [中文名, 英文名, 外号...]}, 语义不同; 混写会让
+    搜索行为跟着下载逻辑漂移。这里只维护"id → 英文别名"这一件事。
+    """
+    n = 0
+    try:
+        for c in champs or []:
+            try:
+                cid = int(c.get('id') or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid <= 0:
+                continue
+            alias = str(c.get('alias') or '').strip()
+            if not alias or alias.lower() == 'none':
+                continue
+            with _ALIAS_LOCK:
+                if _ALIAS_DYNAMIC.get(cid) != alias:
+                    _ALIAS_DYNAMIC[cid] = alias
+                    # v4.6.10 修 🔴: **必须同时失效一次性查询缓存**。
+                    # _champion_alias() 会把结果存进 _ALIAS_CACHE 并优先命中它;
+                    # 而本函数只写 _ALIAS_DYNAMIC —— 于是时序不利时(动态数据是
+                    # 异步灌入的, 见 main._refresh_champ_remote), 早期一次查询
+                    # 命中硬编码兜底并缓存后, 权威别名**永远翻不了身**,
+                    # 而 _champion_alias 的文档明确承诺"动态(LCU)优先"。
+                    # 这直接关系到新英雄图标的 CDN URL 能否拼出来 —— 与 v4.6.3
+                    # 修这个坑的初衷相反, 属"修了一半"。
+                    _ALIAS_CACHE.pop(cid, None)
+                    n += 1
+    except Exception:
+        pass
+    return n
+
 
 def _champion_alias(champion_id) -> str:
-    """取英雄英文别名。取不到返回 ''(绝不抛异常, 调用方在下载降级链里)。"""
+    """取英雄英文别名。取不到返回 ''(绝不抛异常, 调用方在下载降级链里)。
+
+    v4.6.3: 查找顺序改为**动态(LCU)优先 → 硬编码表兜底**。
+    动态表随游戏版本更新(新英雄天然有别名), 硬编码表在客户端从未连上过时
+    仍能兜住老英雄 —— 两者互补, 不是替换关系。
+    """
     try:
         cid = int(champion_id)
     except Exception:
@@ -57,17 +112,23 @@ def _champion_alias(champion_id) -> str:
     with _ALIAS_LOCK:
         if cid in _ALIAS_CACHE:
             return _ALIAS_CACHE[cid]
-        alias = ''
-        try:
-            from data.champion_aliases import CHAMPION_ALIASES
-            v = CHAMPION_ALIASES.get(cid)
-            if isinstance(v, (list, tuple)) and len(v) >= 2:
-                alias = str(v[1]).strip()
-        except Exception:
-            pass
+        # ① 动态表(权威)
+        alias = _ALIAS_DYNAMIC.get(cid, '')
+        # ② 硬编码表兜底
+        if not alias:
+            try:
+                from data.champion_aliases import CHAMPION_ALIASES
+                v = CHAMPION_ALIASES.get(cid)
+                if isinstance(v, (list, tuple)) and len(v) >= 2:
+                    alias = str(v[1]).strip()
+            except Exception:
+                pass
         # v4.4.2(P2-37): 原无条件写缓存 —— 一次瞬时 import 失败会把该英雄永久
         # 钉成空别名(进程生命周期内), 图标下载链随后一直走不到别名分支。
         # 只在取到非空别名时才缓存; 空值不缓存, 下次重试仍有翻身机会。
+        # ⚠️ v4.6.3 要点: 动态表可能是"稍后才灌入"的(英雄数据是异步拉的),
+        #    因此这里空值**绝不能缓存** —— 否则早期一次查询就把该 id 钉死成空,
+        #    等动态别名到位也翻不了身, 新英雄图标依旧取不到。
         if alias:
             _ALIAS_CACHE[cid] = alias
         return alias
@@ -707,6 +768,39 @@ class LCUAPI:
         # 真实结果未知，返回 None 让上层决定（绝不谎报成功）。
         return None
 
+    # ==================== v4.6.3: 游戏版本 ====================
+    def get_game_version(self, short: bool = True) -> str:
+        """取当前游戏版本。失败返回 ''(绝不抛 —— 调用方在启动关键路径上)。
+
+        端点实测(本机 16.20):
+            /lol-patch/v1/game-version
+                -> "16.20.8248524+branch.releases-16-20.code.publictencent..."
+            /system/v1/builds
+                -> {"branch":"Releases/16.20","version":"16.20.824.8524",...}
+
+        short=True 返回**大版本号**(如 "16.20"): 图标/表结构只在大版本更新时
+        才会变, 而 build 号每次小补丁都动 —— 用大版本当缓存命名空间, 既能
+        保证"版本一变就失效", 又不会因为一个 build 号变化就清空全部缓存重下。
+        """
+        raw = ''
+        for ep in ('/lol-patch/v1/game-version', '/system/v1/builds'):
+            try:
+                v = self.get(ep)
+            except Exception:
+                continue
+            if isinstance(v, dict):
+                v = v.get('version') or v.get('branch') or ''
+            raw = str(v or '')
+            if raw:
+                break
+        if not raw:
+            return ''
+        # "16.20.8248524+branch..." -> "16.20"
+        m = re.match(r'^\s*"?\s*(\d+)\.(\d+)', raw)
+        if not m:
+            return ''
+        return f'{m.group(1)}.{m.group(2)}' if short else raw
+
     # ==================== 英雄数据 ====================
     def get_champion_data(self) -> List[Dict]:
         """取全部英雄基础数据(选人界面/英雄选择器用)。
@@ -764,15 +858,25 @@ class LCUAPI:
     #   技能表   /lol-game-data/assets/v1/summoner-spells.json (39 条)
     #            → [{'id':4,'name':'闪现','iconPath':'/lol-game-data/assets/DATA/
     #               Spells/Icons2D/Summoner_flash.png'}, ...]
-    #   海克斯表 /lol-game-data/assets/v1/cherry-augments.json (552 条, 含竞技场/
-    #            海克斯大乱斗全部强化) → id / nameTRA / augmentSmallIconPath
+    #   海克斯表 /lol-game-data/assets/v1/cherry-augments.json (16.21 为 594 条,
+    #            含竞技场/海克斯大乱斗全部强化) → id / nameTRA / augmentSmallIconPath
+    #            ⚠️ 条数随版本变（16.20 是 554，16.21 是 594），**别把条数当常量**；
+    #               注释里凡是写死数字的地方都已改成"约"或删掉，见下面 rarity 说明。
     #            ⚠️ `/augments.json`(不带 cherry-) 会 400, 必须用 cherry-augments。
     #            ⚠️ KIWI 特有强化(如 1151 面包和奶酪)iconPath 指向 Kiwi/Augments
     #               目录, 同样在本地资源里, 一并可取。
     # 映射表与图标都在进程内缓存 —— 表只拉一次。
 
     _SPELL_TABLE = None      # {id: (中文名, iconPath)}
-    _AUGMENT_TABLE = None    # {id: (中文名, iconPath)}
+    # v4.4.20: 海克斯表多存一列 rarity(kSilver/kGold/kPrismatic/kEventChoice)。
+    # 起因: 用户反馈"海克斯好多没有颜色"。实测 cherry-augments.json 里绝大多数
+    # augmentSmallIconPath 是**纯白剪影蒙版**(整图只有 #ffffff + 透明), 官方客户端
+    # 把它当遮罩、按稀有度现染色; 我们原样贴图 → 九成格子是白的。
+    # ⚠️ 比例随版本走(16.21 实测 594 条里 527 条白蒙版, 约九成), 而且**不是全部**:
+    #    仍有约 67 条自带颜色, 其中 5 条 kEventChoice 也是白蒙版 —— 所以判据必须
+    #    逐图判断(icons._is_white_mask_image), 不能按 rarity 一刀切。
+    # rarity 本来就在表里(此前只读了 nameTRA / 图标路径), 现在留下供 UI 着色。
+    _AUGMENT_TABLE = None    # {id: (中文名, iconPath, rarity)}
     # v4.3.10: 保护两张类级表的并发加载。首次加载含网络请求(连接2s/读5s),
     # 详情弹窗可能多行同时触发 spell_info/augment_info → 多个线程并发进入
     # _load_*_table, 无锁时可能重复拉取同一份表并竞争写类级缓存。
@@ -825,7 +929,15 @@ class LCUAPI:
                         continue
                     icon = str(a.get('augmentSmallIconPath') or '')
                     if aid > 0 and icon:
-                        table[aid] = (str(a.get('nameTRA') or ''), icon)
+                        # v4.4.20: 第三列 rarity —— UI 层据此给纯白蒙版上色。
+                        # 表里偶有缺字段, 缺失归 '' 由 UI 层回退成不上色(原样白图)。
+                        # v4.9.0: 名字过一遍 _clean_augment_name —— 16.21 起有官方
+                        # 未本地化的条目(nameTRA 直接是内部标识符), 原样透出去会
+                        # 在下划线串上翻车。表本身不动, 只在读出口清洗。
+                        raw_name = str(a.get('nameTRA') or '')
+                        name = self._clean_augment_name(
+                            raw_name, str(a.get('augmentNameId') or ''))
+                        table[aid] = (name, icon, str(a.get('rarity') or ''))
             except Exception as e:
                 # v4.3.10: 同 _load_spell_table —— 失败/空表都不写类级缓存, 保留重试机会
                 print(f'[详情] 海克斯强化表读取失败(不缓存, 下次重试): '
@@ -836,6 +948,40 @@ class LCUAPI:
             LCUAPI._AUGMENT_TABLE = table
             return table
 
+    @staticmethod
+    def _clean_augment_name(name: str, name_id: str = '') -> str:
+        """把"内部标识符"形态的名字换成空串(由调用方回退成不显示名字)。
+
+        v4.9.0 新增, 修 LOL 16.21 起的未本地化条目:
+            id=3176  augmentNameId=GoH_PentakillAug_Generic
+                     nameTRA=GoH_PentakillAug_Generic_BlankName
+        官方漏了这条的翻译, 直接把内部标识符当名字发了。本程序目前只在详情窗
+        画图标(不显示名字), 所以它**还不是线上可见缺陷**; 但完整链路
+        (main._do_fetch_game_detail → augment_names) 已经把名字算出来了,
+        只要以后有人在图标上加 tooltip 就会当场露馅。这里先兜住。
+
+        为什么返回空串而不是改写成人话: 我们不知道这条强化中文叫什么, 编一个
+        假名字比不显示更糟(用户会以为是官方名)。空串在上层的语义是"没有名字",
+        与"查不到该 id"走同一条路, 已有成熟回退。
+
+        ⚠️ 判据必须同时满足两条, 否则会误伤合法英文名:
+          · `ADAPt` / `escAPADe` / `BONK!` 这类官方英文名**没有下划线** ——
+            所以"纯 ASCII"本身不是判据, 必须带上"含下划线"或"与 nameId 撞车"。
+          · 名字里带空格/中文的一律不碰(如 `404 强化符文未找到`、`En Passant`)。
+        """
+        s = (name or '').strip()
+        if not s:
+            return ''
+        nid = (name_id or '').strip()
+        if nid:
+            # 与 augmentNameId 完全相同, 或以它开头(BlankName / _V2 之类的后缀)
+            if s == nid or s.lower().startswith(nid.lower()):
+                return ''
+        # 纯 ASCII + 含下划线 = 内部标识符形态(合法英文名里没有下划线)
+        if '_' in s and re.fullmatch(r'[A-Za-z0-9_]+', s):
+            return ''
+        return s
+
     def spell_info(self, spell_id) -> tuple:
         """技能 id → (中文名, iconPath); 查不到返回 ('', '')。"""
         try:
@@ -844,11 +990,83 @@ class LCUAPI:
             return ('', '')
 
     def augment_info(self, augment_id) -> tuple:
-        """海克斯 id → (中文名, iconPath); 查不到返回 ('', '')。"""
+        """海克斯 id → (中文名, iconPath); 查不到返回 ('', '')。
+
+        ⚠️ 保持 **2 元组**不变: main._aux_fetch 里是 `name, icon_path = ...`
+        两变量解包, 擅自加宽会直接把详情窗的图标下载打挂。
+        需要稀有度请用 augment_rarity(), 它走同一张已缓存的表, 不额外发请求。
+        """
         try:
-            return self._load_augment_table().get(int(augment_id), ('', ''))
+            v = self._load_augment_table().get(int(augment_id))
+            return (v[0], v[1]) if v else ('', '')
         except (TypeError, ValueError):
             return ('', '')
+
+    def augment_rarity(self, augment_id) -> str:
+        """海克斯 id → 稀有度字符串(kSilver/kGold/kPrismatic/kEventChoice)。
+
+        v4.4.20 新增。返回 '' 表示查不到(客户端未就绪/不在表里) —— 调用方按
+        "没有稀有度" 处理, 不要把空串当成某种颜色。
+        """
+        try:
+            v = self._load_augment_table().get(int(augment_id))
+            return v[2] if v else ''
+        except (TypeError, ValueError):
+            return ''
+
+    # ==================== v4.9.0: ARAM 队列白名单(按客户端数据推导) ====================
+    # 为什么要有它: core/script_core.ARAM_QUEUE_IDS 是个**手写常量**, 而游戏每加一个
+    # 大乱斗变体就多一个 queueId。v4.1.57 已经因为漏了 2400 出过一次事(点卡兜底被
+    # 跳过 → "没自动选"), 16.21 又把海克斯大乱斗扩到 2400/2401/2403/2405/2410/2450。
+    # 手写常量必然再漏。这里改成从客户端自己的 queues.json 推导, 手写常量降级为
+    # **离线兜底**(客户端没连上时用), 两者取并集。
+    #
+    # 判据(与 tools/probe_aram_queue_coverage.py 完全一致, 改一处必须同步另一处):
+    #     gameSelectModeGroup == 'kARAM'  且  pickMode == 'AllRandomPickStrategy'
+    #   · kARAM   = 嚎哭深渊那条线(大乱斗家族)
+    #   · AllRandom = 全随机发牌, 所以才有"2-3 张卡"给你点
+    # 两个条件缺一不可: 只看 AllRandom 会把召唤师峡谷全随机(3120)、无限乱斗(900~)
+    # 也拉进来, 而那些界面**不是** 2-3 张卡布局, 点上去会乱点。
+    _ARAM_QUEUE_IDS_LIVE = None   # None = 尚未从客户端推导; set() = 推导过但为空(不缓存)
+
+    def aram_queue_ids(self, refresh: bool = False) -> set:
+        """返回当前应启用点卡兜底的 queueId 集合(客户端推导 ∪ 手写兜底)。
+
+        失败/未连接时返回手写兜底集合并打一行日志 —— **绝不返回空集**, 否则
+        "客户端刚好没就绪"会让点卡兜底整个消失, 表现和没修一样。
+        """
+        from_hand = set()
+        try:
+            from core.script_core import ARAM_QUEUE_IDS as _HAND
+            from_hand = set(int(x) for x in _HAND)
+        except Exception:
+            pass
+        if not refresh and LCUAPI._ARAM_QUEUE_IDS_LIVE is not None:
+            return set(LCUAPI._ARAM_QUEUE_IDS_LIVE) | from_hand
+        live = set()
+        try:
+            raw = self.get('/lol-game-data/assets/v1/queues.json') or []
+            for q in raw:
+                try:
+                    if (q.get('gameSelectModeGroup') == 'kARAM'
+                            and q.get('pickMode') == 'AllRandomPickStrategy'):
+                        qid = int(q.get('id') or 0)
+                        if qid > 0:
+                            live.add(qid)
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            print(f'[点卡] 队列白名单推导失败(用手写兜底): {type(e).__name__}: {e}')
+            return from_hand
+        if live:
+            LCUAPI._ARAM_QUEUE_IDS_LIVE = live
+            added = sorted(live - from_hand)
+            if added:
+                print(f'[点卡] 客户端新增的大乱斗队列已自动纳入: {added}')
+        else:
+            # 空结果不缓存 —— 客户端未就绪时表可能为空, 下次要能重试
+            print('[点卡] 队列表为空(客户端未就绪?), 本次用手写兜底')
+        return live | from_hand
 
     def download_lcu_asset(self, path: str, timeout=(2.0, 6.0)) -> Optional[bytes]:
         """按 LCU 本地资源路径取图(技能/海克斯图标等)。

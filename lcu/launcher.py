@@ -1,13 +1,12 @@
-"""lcu.launcher —— 一键启动 LOL(跳过 WeGame 主面板)
+"""lcu.launcher —— 启动 LOL(跳过 WeGame 主面板)
 
 背景(2026-10 需求): 用户希望不打开 WeGame 主程序, 直接从大蛋小助手启动英雄联盟。
 
-v4.4.15 行为定义(用户明确要求, 两种模式):
-    ① **没录制过**(默认) → 只把登录器打开、跳过 WeGame, 界面交给用户自己操作,
-       **不做任何模拟点击**; 因此也不需要管理员权限。
-    ② **录过屏**(设置页「开始录制」) → 启动登录器后, 按录制内容自动模拟点击,
-       复刻用户当时的手动操作。
-    ⚠️ 不再有任何"内置默认步骤" —— 猜坐标这条路已被实测证伪(见下)。
+v4.8.0 行为定义(用户明确要求, 只有一种):
+    **只把登录器打开**(跳过 WeGame), 然后什么都不做 —— 界面完全交给用户自己操作。
+    ⚠️ 本模块**不含任何模拟点击代码**: 录制回放功能已于 v4.8.0 整体移除
+    (F9 录制器、lcu/recorder.py、回放分支、相关设置项与提权原因一并删除)。
+    ⚠️ 因此本模块也不再需要管理员权限: 只启动登录器是 ShellExecuteW 的正常启动路径。
 
 v4.4.6 关键修正(用户实测反馈, 本模块最重要的教训):
     v4.4.5 启动的是 `WeGameLauncher\\launcher.exe` —— 用户点了之后 **WeGame 主程序
@@ -22,12 +21,13 @@ v4.4.6 关键修正(用户实测反馈, 本模块最重要的教训):
     ❌ <根>\\WeGameLauncher\\launcher.exe → wegame.exe(主面板) → tcls_core → 客户端
     ✅ <根>\\TCLS\\client.exe             → (腾讯统一登录) → tcls_core → 客户端
 
-为什么最终选择"录制"而不是内置坐标(重要教训):
+为什么最终选择"只启动"而不是内置坐标或录制回放(重要教训):
     v4.4.9~v4.4.13 曾内置一套靠**截图逐像素实测**得出的默认步骤(QQ登录 → 切换快速
     登录 → 我已阅读 → 进入游戏 → 服务器列表 → 大区 → 确认选择)。结果连续多版都卡在
     "某一步点空"上 —— 用户原话:"我已阅读那里没点好, 导致后边也点不到了"。原因不是
     坐标测不准, 而是**界面状态无法判定**: 同一坐标在不同页面含义完全不同, 盲点必然
-    会在某一步错位。录制把"猜"换成"抄"(用户的真实操作即标准答案), 遂彻底删掉默认步骤。
+    会在某一步错位。v4.4.12 曾改成"录制回放"绕开猜坐标, 但 v4.8.0 用户明确要求
+    把这个功能整个去掉 —— 自动点击这条路彻底放弃, 只保留"把登录器打开"。
 
 其它实现要点:
     - 登录器是腾讯 TPF 自绘 UI(**无标准 Win32 控件**, UIA 也拿不到按钮)。
@@ -47,8 +47,9 @@ import ctypes
 from ctypes import wintypes
 from typing import Optional, Dict, Callable, Tuple, List
 
-# 复用 clicker 的点击/置顶能力(三机制降级 + UIPI 侦查 + 前台锁绕过)
-from .clicker import click_at, bring_to_front
+# 复用它做窗口置顶(三机制降级 + 前台锁绕过), 让登录器出现在用户眼前。
+# v4.8.0: 不再复用 click_at —— 本模块已无任何点击。
+from .clicker import bring_to_front
 
 # v4.4.6: LOL 安装根下的登录器候选(按优先级)。
 # ⚠️ 明确**不用** WeGameLauncher\launcher.exe —— 它启动后会拉起 wegame.exe 主程序,
@@ -76,6 +77,21 @@ _MIN_H = 200
 # 用户实测: 登录器窗口虽然很快就出现, 但客户端启动/资源加载还没完成, 界面上
 # 的按钮此时点不动(点空)。从点按钮算起留足 15s, 界面才真正可点。
 LAUNCH_SETTLE_S = 15.0
+
+# v4.6.2: "窗口已出现"之后**至少**再等的秒数。
+# 起因(日志实测): 原实现只按"从点一键启动起算总时长"倒扣, 于是 launch()+等窗口
+# 若已耗掉 10s, 就只再等 5s —— 日志里出现过「稳定(5s)」「稳定(3s)」, 紧接着就是
+# 「『录制步骤2』点击失败(point-not-over-client)」。登录器是自绘 UI, 按钮可点性
+# 与进程存活时长不严格相关, 慢机器上窗口出现≠界面就绪, 点早了必然落空。
+SETTLE_MIN_AFTER_WINDOW_S = 10.0
+
+# v4.6.2: 单步点击落空(point-not-over-client)时的重试次数。
+# 该失败几乎都是"点击瞬间登录器不在最上层"(被其它窗口/系统提示条遮住),
+# 而不是坐标错。原来直接跳过该步 —— 关键步骤一丢, 整个流程就断。
+# 现在先置顶再重试, 仍失败才放弃(并记明原因, 便于区分"被遮挡"与"坐标不对")。
+#
+# v4.8.0: 已无任何点击, 这两个常量随之失效。**保留为空占位会误导后来人**
+# (看起来还有重试机制), 故明确删除。
 
 
 # ==================== 窗口枚举(精简自 clicker, 独立模块不耦合其私有成员) ====================
@@ -403,113 +419,66 @@ def launch() -> Tuple[bool, str]:
         return False, f'启动登录器失败: {type(e).__name__}: {e}'
 
 
-def click_frac(hwnd: int, fx: float, fy: float) -> Tuple[bool, str]:
-    """按窗口内相对比例(fx, fy ∈ 0~1)计算绝对坐标并点击。
-
-    返回 (ok, detail)。detail 含 click_at 的机制名或失败原因。
-    """
-    if not hwnd:
-        return False, '无窗口句柄'
-    r = wintypes.RECT()
-    if not _user32.GetWindowRect(wintypes.HWND(int(hwnd)), ctypes.byref(r)):
-        return False, 'GetWindowRect 失败'
-    w = r.right - r.left
-    h = r.bottom - r.top
-    if w <= 0 or h <= 0:
-        return False, '窗口尺寸异常'
-    x = r.left + int(w * fx)
-    y = r.top + int(h * fy)
-    # require_over=True: 注入前确认该屏幕点落在目标窗口上, 避免误点桌面/其它窗口
-    return click_at(x, y, hwnd=int(hwnd), require_over=True)
-
-
-def client_launched() -> bool:
-    """LOL 客户端进程(LeagueClient.exe / LeagueClientUx.exe)是否已拉起。
-
-    v4.4.8: 这是"登录成功"的客观信号 —— 登录器上的「进入游戏」与登录后选区
-    界面的「开始游戏」是**两屏不同界面**, 必须据此切换点击坐标, 否则拿登录
-    按钮的坐标去点选区界面只会点空。
-    """
-    try:
-        import psutil
-    except ImportError:
-        return False
-    for proc in psutil.process_iter(['name']):
-        try:
-            n = (proc.info.get('name') or '').lower()
-        except Exception:
-            continue
-        if n in ('leagueclient.exe', 'leagueclientux.exe'):
-            return True
-    return False
-
-
-def prepare_for_recording(timeout_s: float = 60.0,
-                          on_status: Optional[Callable[[str], None]] = None
-                          ) -> Optional[Dict]:
-    """录制前的准备: 保证登录器已起来并拿到它的窗口矩形(**不做任何点击**)。
-
-    v4.4.13: 之前让用户"先去点首页按钮把登录器拉起来"再录音 —— 但首页那个按钮会
-    直接跑完整套自动化步骤, 把界面点乱, 用户反而没东西可录。这个函数只负责
-    "启动 + 等窗口 + 置顶 + 等界面稳定", 一个按钮都不点。
-
-    返回登录器窗口 dict(含 left/top/right/bottom), 失败返回 None。
-    """
-    def say(m):
-        if on_status:
-            try:
-                on_status(m)
-            except Exception:
-                pass
-
-    t_start = time.monotonic()
-    ok, msg = launch()
-    say(msg)
-    if not ok:
-        return None
-    w = wait_window(timeout_s)
-    if not w:
-        return None
-    try:
-        bring_to_front(int(w['hwnd']))
-    except Exception:
-        pass
-    # 与回放同口径: 界面稳定期(录制要按稳定后的窗口矩形换算坐标)
-    _wait_settle(t_start, say)
-    # 稳定期过后重新取一次窗口(尺寸/位置可能在这期间才最终落定)
-    w2 = wait_window(5.0)
-    return w2 or w
-
-
 def lcu_ready(connector) -> bool:
-    """大厅是否就绪(LCU 已连上)。"""
-    try:
-        if connector.is_connected:
+    """大厅是否就绪(LCU 已真正连上)。**必须真探活, 不能只看有没有参数。**
+
+    v4.6.2 修复(用户反馈"一键启动有时能成功有时不能"):
+
+    原实现是
+        if connector.is_connected:      # ← 只判 port/token 非空, 不发请求
             return True
+    而 `is_connected` 是纯属性判空。后果: 本会话里只要**曾经**连上过 LOL, 之后
+    用户把 LOL 关掉, 连接器仍留着旧 port/token, 这里就恒为 True →
+    run_flow 第 0 步直接报"已在游戏大厅, 无需启动"并 return True,
+    **一次都不尝试启动**。用户看到 ✅ 成功, 但 LOL 压根没开。
+
+    日志实锤(app.log:716-726): 同一进程里一边打印"已在游戏大厅", 紧接着又连打
+    5 行"日志兜底参数已失效(LOL 未启动或端口已变)" —— 自相矛盾。共出现 4 次。
+
+    这解释了"有时成功有时不能": 差别只在于**本次会话是否曾连上过客户端**。
+
+    修法: 有参数时必须真发一次 REST 探活(probe_alive)。探活不过就**继续走
+    find_client** —— 它会 reset 掉脏参数并重新发现(即"自愈"): 客户端真的开着
+    时照样立刻找回, 真的没开时正确返回 False, 而不是拿旧参数谎报就绪。
+    """
+    try:
+        if connector.is_connected and connector.probe_alive():
+            return True
+        # 参数不存在, 或存在但已失效(残留/客户端刚重启) → 走完整发现链路自愈
         return connector.find_client(quick=True)
     except Exception:
         return False
 
 
 # ==================== 一键流程 ====================
-# v4.4.15(用户明确要求): **不再内置任何默认点击步骤**。
-#     点「一键启动 LOL」的默认行为 = 只把登录器拉起来(跳过 WeGame), 然后什么都不做,
-#     把界面留给用户自己操作;
-#     **只有**在设置页录过屏(lol_steps 非空)之后, 才会自动模拟点击复刻录制内容。
+# v4.8.0(用户明确要求): **彻底取消一切自动点击**, 只保留"打开登录器"。
+#     点「启动 LOL」= 把登录器拉起来(跳过 WeGame), 然后什么都不做,
+#     界面完全交给用户自己操作。
 #
-# 历史教训: v4.4.9~4.4.13 曾内置一套"靠截图像素实测猜出来"的默认步骤, 结果连续多版
-# 都卡在"某一步点空"(用户原话:"我已阅读那里没点好, 导致后边也点不到了")。猜坐标这
-# 条路已被证明不可靠, 故彻底删掉默认步骤, 只保留录制回放这一条正确路径。
+# 历史: v4.4.9~4.4.13 曾内置一套"靠截图像素实测猜出来"的默认步骤, 连续多版都卡在
+#     "某一步点空"(用户原话:"我已阅读那里没点好, 导致后边也点不到了");
+#     v4.4.12 改成"录制回放"来绕开猜坐标; v4.8.0 用户要求把这个功能整个去掉 ——
+#     录制器(F9 全局钩子 + lcu/recorder.py)、回放分支、相关设置项与提权原因全部移除。
+#
+# ⚠️ 为什么"只启动"这件事仍需要 _wait_settle: 它不是为了点击, 而是为了让
+#     run_flow 在窗口出现后能稳定地探测一次"客户端是否自己起来了", 避免
+#     窗口一出现就误判。见该函数说明。
 
 
 def _wait_settle(t_start: float, say=None, total_s: float = LAUNCH_SETTLE_S) -> None:
-    """确保从"点一键启动"起至少过了 total_s 秒再开始点击。
+    """确保从"点启动"起至少过了 total_s 秒, 再去探测客户端状态。
 
-    v4.4.10: 用户实测 —— 登录器窗口很快出现, 但客户端启动/资源加载尚未完成,
-    此时界面上的按钮点不动(点空)。按"从启动起算总时长"补齐, 而不是窗口出现后
-    再固定等 15s(后者在窗口本身出现慢时会白等更久)。
+    v4.4.10: 用户实测 —— 登录器窗口很快出现, 但客户端启动/资源加载尚未完成。
+    v4.6.2: 按"从启动起算总时长"补齐, 并把最小值抬到 SETTLE_MIN_AFTER_WINDOW_S
+    (登录器是腾讯 TPF 自绘 UI, 按钮可点性与"进程跑了多久"并不严格相关)。
+
+    v4.8.0: 不再有点击了, 但这段等待**仍然保留** —— 作用变成: 窗口刚出现时
+    `lcu_ready()` 一定还是 False(客户端进程尚未拉起), 若不等就立即探测会得到
+    一个必然为假的结论, 让 run_flow 过早返回"未进入大厅"。等一段之后探测才有意义。
     """
     remain = total_s - (time.monotonic() - t_start)
+    if remain < SETTLE_MIN_AFTER_WINDOW_S:
+        remain = SETTLE_MIN_AFTER_WINDOW_S
     if remain > 0:
         if say:
             say(f'等待登录器界面稳定({remain:.0f}s)…')
@@ -517,18 +486,19 @@ def _wait_settle(t_start: float, say=None, total_s: float = LAUNCH_SETTLE_S) -> 
 
 
 def run_flow(connector,
-             steps=None,
              on_status: Optional[Callable[[str], None]] = None,
              timeout_s: float = 150.0) -> Tuple[bool, str]:
-    """一键启动 LOL。
+    """启动 LOL：只把原生登录器打开(跳过 WeGame), **不做任何模拟点击**。
 
-    v4.4.15 语义(用户要求):
-        steps 为空/None → **只启动登录器, 不做任何模拟点击**(停在登录界面交给用户);
-        steps 非空      → 启动后按录制内容自动模拟点击, 复刻用户操作。
-        ⚠️ 没有任何"内置默认步骤"兜底 —— 没录制就不点击, 不再瞎猜坐标。
+    v4.8.0 语义(用户要求):
+        登录器打开后流程就结束, 界面交给用户自己操作。
+        ⚠️ 没有任何点击步骤参数 —— 录制回放功能已整体移除。
 
-    steps: [(名称, fx, fy, 点后等待秒), ...] 或 None。
-    on_status: 进度回调(线程安全由调用方保证), 每步报告中文进度。
+    为什么仍要等一段(见 _wait_settle 与下面第 3 步):
+        登录器可能记住登录态, 自己就把客户端拉起来了。等一段再探测, 才能如实
+        报告"已进入大厅"还是"停在登录器"。这段探测**只读状态, 不点任何东西**。
+
+    on_status: 进度回调(线程安全由调用方保证), 报告中文进度。
 
     返回 (ok, msg)。
     """
@@ -545,7 +515,7 @@ def run_flow(connector,
         return True, '已在游戏大厅'
 
     # 1. 启动原生登录器(跳过 WeGame)
-    t_start = time.monotonic()   # v4.4.10: 从"点一键启动"起算界面稳定期
+    t_start = time.monotonic()   # v4.4.10: 从"点启动"起算界面稳定期
     ok, msg = launch()
     say(msg)
     if not ok:
@@ -563,62 +533,19 @@ def run_flow(connector,
         # 窗口没出现不一定失败: 登录器可能识别到已登录, 直接拉起客户端
         say('未等到登录器窗口, 继续等客户端连接…')
 
-    # 2b. 界面稳定期 —— 窗口出现 ≠ 界面就绪(用户实测需约 15s)
+    # 3. 界面稳定期 —— 窗口出现 ≠ 客户端就绪。等完再探测一次真实状态。
     _wait_settle(t_start, say)
 
-    seq = list(steps) if steps else []
-
-    # 3a. 没录制 → 只管把登录器打开, 一个按钮都不点(用户要求的默认行为)
-    if not seq:
-        say('未录制过点击流程 → 只启动登录器, 不做任何模拟点击')
-        # 仍然给一小段窗口等客户端自己起来(登录器可能记住登录态直接进)
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline:
-            if lcu_ready(connector):
-                say('已连接客户端, 进入大厅')
-                return True, '已进入大厅'
-            if not find_window():
-                break
-            time.sleep(1.0)
-        return True, '登录器已打开(未录制点击流程, 未做任何模拟点击)'
-
-    # 3b. 录过 → 按录制内容复刻点击
-    for name, fx, fy, wait_s in seq:
-        if lcu_ready(connector):
-            say('已连接客户端, 进入大厅')
-            return True, '已进入大厅'
-        # v4.4.11: 客户端进程一旦被拉起("确认选择"已生效、或本来就是登录态),
-        # 登录器已经让位, 继续按老坐标盲点只会打到客户端界面上 —— 立即停手。
-        if client_launched():
-            say(f'客户端已启动, 停止后续点击(停在「{name}」之前)')
-            break
-        w2 = find_window()
-        if not w2:
-            say(f'「{name}」跳过(登录器窗口已消失)')
-            break
-        okc, detail = click_frac(int(w2['hwnd']), fx, fy)
-        if okc:
-            say(f'点击「{name}」…')
-        else:
-            say(f'「{name}」点击失败({detail})')
-        try:
-            time.sleep(max(0.2, float(wait_s)))
-        except Exception:
-            time.sleep(1.0)
-
-    # 4. 步骤跑完, 等客户端起来(登录/授权/资源加载都需要时间)
-    deadline = time.monotonic() + timeout_s
+    say('登录器已打开, 后续操作交给你自己完成')
+    deadline = time.monotonic() + 20.0
     while time.monotonic() < deadline:
         if lcu_ready(connector):
             say('已连接客户端, 进入大厅')
             return True, '已进入大厅'
+        if not find_window():
+            # 登录器窗口消失通常意味着它把客户端拉起并让位了
+            break
         time.sleep(1.0)
 
-    if lcu_ready(connector):
-        say('已连接客户端, 进入大厅')
-        return True, '已进入大厅'
-    hint = ('客户端进程已拉起, 但大厅尚未就绪(可能仍在加载)' if client_launched()
-            else '登录器仍停在登录/选区界面')
-    return False, (f'未在时限内进入大厅 —— {hint}。'
-                   f'若界面要求扫码/验证码, 请手动完成一次; '
-                   f'若点击位置不对, 可在设置页重新录制一遍。')
+    return True, '登录器已打开(不做任何模拟点击, 后续请自行操作)'
+

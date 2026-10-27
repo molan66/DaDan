@@ -195,8 +195,12 @@ class LogCapture:
           sys.stdout 上 —— 否则交接后新进程/后续代码写出的东西会进到一个
           已关闭文件的捕获器里(或被静默丢弃);
         - 关闭文件句柄, 让 Windows 能立刻删除/重命名 app.log。
-        注意: main.py 的 _quit() 目前**没有**调本方法(见交付报告的协调事项),
-        所以这里不依赖"一定有人调"来保证落盘完整 —— _to_file 每行都 flush。
+
+        v4.6.10 更正: 这里原先写着"main.py 的 _quit() 目前**没有**调本方法" ——
+        与实现相反。实测 main.py 的退出路径**确实调用**了 `log_capture.stop()`,
+        所以退出时是有收尾的。本方法不依赖"一定有人调"来保证落盘完整这一点
+        仍然成立(_to_file 每行都 flush), 但上面那句结论必须删掉 —— 本项目已
+        多次出现"注释与实现相反"误导排查(见各版本 changelog)。
         """
         if not self._active:
             return
@@ -274,9 +278,25 @@ class LogCapture:
         except Exception:
             return
         with self._file_lock:
+            # v4.6.10 修 🔴 竞态(实测复现): **必须在锁内重新取一次句柄**。
+            # 原实现在锁外判 `self._fh is None`(上面 265 行), 然后锁内直接
+            # `self._fh.write(...)` —— 这两步之间句柄可能被别的线程置 None:
+            # `close_for_cleanup()`(清理缓存时关句柄)与 `_rotate_locked()`
+            # (日志轮转)都在持锁状态下把 `self._fh = None`。
+            # 后果(实测): 4 个写线程 + 1 个反复 close/reopen 的线程跑 4 秒,
+            # 打出 39 行 "落盘中断: AttributeError: 'NoneType' object has no
+            # attribute 'write'" —— 每一行都会把 `_file_failed` 置 True,
+            # 而这会让**之后所有日志立即 return**(见 263 行), 即本次会话日志
+            # 永久停写。本次侥幸因为随后的 reopen 成功、且 _file_failed 又被
+            # `start()` 之外的路径复位过才没恶化, 但只要 reopen 也失败一次,
+            # 用户的表现就是"界面有日志、文件不再更新", 且无从取证。
+            # 修法: 锁内取局部引用并再判一次 None, 是原子且零成本的做法。
+            fh = self._fh
+            if fh is None:
+                return
             try:
-                self._fh.write(line)
-                self._fh.flush()
+                fh.write(line)
+                fh.flush()
                 self._file_size += len(data)
                 if self._file_size >= LOG_MAX_BYTES:
                     self._rotate_locked()
@@ -352,6 +372,59 @@ class LogCapture:
     def log_path(self) -> Optional[str]:
         """当前日志文件路径(None = 落盘不可用)。供"导出日志"之类的功能用。"""
         return self._log_path
+
+    # ---------------- v4.6.3: 供「清理缓存」安全删日志 ----------------
+
+    def close_for_cleanup(self):
+        """关闭日志文件句柄, 让调用方能安全删除 app.log。返回被关掉的路径。
+
+        为什么必须这样: 本类长期持有 app.log 的写句柄。Windows 上带着句柄
+        os.remove 会抛 PermissionError; 即便删掉了, 句柄仍指向那个已无名字的
+        文件, 之后的日志全部写进黑洞 —— 用户以为"清干净了", 实际日志从此
+        静默丢失, 下次报 bug 时一行都拿不到。
+        先关句柄 → 删文件 → reopen_after_cleanup() 重开, 才是完整闭环。
+        """
+        path = self._log_path
+        try:
+            with self._file_lock:
+                if self._fh is not None:
+                    try:
+                        self._fh.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self._fh.close()
+                    except Exception:
+                        pass
+                    self._fh = None
+                self._file_size = 0
+        except Exception:
+            pass
+        return path
+
+    def reopen_after_cleanup(self) -> bool:
+        """清理完成后重开日志。返回是否重开成功。
+
+        不直接复用 _try_reopen(): 它用非阻塞 acquire 且"句柄非 None 就返回",
+        语义是"写入前的顺手补开"; 这里需要的是**确定性**重开(用户刚点了清理,
+        必须立刻恢复落盘), 故独立实现并返回结果。
+        """
+        try:
+            if not self._log_path:
+                return False
+            with self._file_lock:
+                if self._fh is not None:
+                    return True
+                try:
+                    self._fh = open(self._log_path, 'a', encoding='utf-8')
+                    self._file_size = os.path.getsize(self._log_path)
+                    self._file_failed = False
+                    return True
+                except Exception:
+                    self._fh = None
+                    return False
+        except Exception:
+            return False
 
     class _Writer:
         def __init__(self, orig, callback):

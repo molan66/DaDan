@@ -157,6 +157,23 @@ class LCUConnector:
         except Exception:
             return False
 
+    def probe_alive(self) -> bool:
+        """v4.6.2: 公开的"连接参数是否真的还活着"探活接口。
+
+        为什么必须有这个公开入口 —— 修的是一个**虚假成功**:
+        `is_connected` 只是属性判空(有 port 且 token 非空就 True), **不发任何
+        请求**。调用方(launcher.lcu_ready) 拿它当"大厅已就绪"用, 于是:
+        本会话里曾连上过 LOL → 用户关掉 LOL → 连接器仍残留旧 port/token →
+        `is_connected` 依旧 True → 一键启动直接报"已在游戏大厅"、**一次都不
+        启动**, 用户看到成功提示但 LOL 根本没开(日志实测 4 次)。
+
+        这是"有时成功有时不能"的真正根因: 差别只在于本次会话是否曾连上过。
+
+        本方法 = 真发一次 REST 探活。私有名 `_validate_cached_connection` 语义
+        完全一致, 这里只是把它作为**公开契约**暴露出来, 避免别的模块跨模块调私有。
+        """
+        return bool(self.is_connected) and self._validate_cached_connection()
+
     # ==================== 主入口 ====================
     def find_client(self, quick: bool = False) -> bool:
         """查找并保存 LCU 连接参数。
