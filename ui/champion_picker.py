@@ -17,6 +17,11 @@ from .icons import icon_pixmap
 SEARCH_DEBOUNCE_MS = 150        # 搜索防抖(原 0ms, 每字符全量重建网格)
 CARD_ICON_PX = 50               # 英雄卡图标边长
 LIST_ICON_PX = 28               # 右侧已选列表图标边长
+# v4.4.0 修复(P3 魔法数字): 卡片尺寸 / 图标批量加载 / 失败上限抽成模块级常量
+CARD_W = 56                     # 英雄卡宽
+CARD_H = 60                     # 英雄卡高
+ICON_TICK_BATCH = 16            # 每个 tick 最多提交的下载请求数
+ICON_FAIL_LIMIT = 8             # 连续失败上限, 超过则放弃该英雄图标
 
 # ===== 模块级一次性加载搜索数据(v17) =====
 # 旧实现在 _match 里对每个卡片每次筛选都 try import,重建网格时重复开销大。
@@ -44,7 +49,7 @@ class ChampionCard(QPushButton):
         # v4.4.0 修复(P2 死代码): 原此处 `setMinimumSize(48, 52)` 紧接
         # `setFixedSize(56, 60)` —— setFixedSize 同时设 min/max, 前一句被完全覆盖,
         # 永远不生效。已删除(确认 56×60 确实更大且是期望尺寸)。
-        self.setFixedSize(56, 60)
+        self.setFixedSize(CARD_W, CARD_H)
         self.setCursor(Qt.PointingHandCursor)
         # v17:不设 tooltip —— PyQt5 默认悬停 tooltip 是系统黑框,观感突兀
         self.setAcceptDrops(True)
@@ -67,7 +72,7 @@ class ChampionCard(QPushButton):
             self.setText('')
             self.setStyleSheet(f"""
                 QPushButton{{background:rgba(20,22,30,140);border:none;border-radius:8px;padding:1px;}}
-                QPushButton:hover{{background:rgba(99,102,241,0.06);}}
+                QPushButton:hover{{background:{Glass.PRIMARY_06};}}
             """)
         else:
             self.setText(self.name[:2] if self.name else '?')
@@ -79,8 +84,8 @@ class ChampionCard(QPushButton):
         self._sel = sel
         if sel:
             self.setStyleSheet(f"""
-                QPushButton{{background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.30);border-radius:8px;padding:1px;{self._text_qss()}}}
-                QPushButton:hover{{background:rgba(99,102,241,0.18);}}
+                QPushButton{{background:{Glass.PRIMARY_12};border:1px solid {Glass.PRIMARY_30};border-radius:8px;padding:1px;{self._text_qss()}}}
+                QPushButton:hover{{background:{Glass.PRIMARY_18};}}
             """)
         else:
             self._apply_normal()
@@ -149,15 +154,22 @@ class ChampionCard(QPushButton):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        data = event.mimeData().data('application/x-champion-id')
-        if data:
-            src_cid = int(data.data().decode())
-            if src_cid != self.cid:
-                picker = self.parent()
-                while picker and not isinstance(picker, ChampionPickerWidget):
-                    picker = picker.parent()
-                if picker:
-                    picker._swap_by_drag(src_cid, self.cid)
+        # v4.4.0 修复(P2): 拖放 MIME 数据来自外部/老版本时可能不是合法整数,
+        # 原代码直接 int() 会让整个 dropEvent 抛出并吞掉本次交互。这里先校验。
+        try:
+            data = event.mimeData().data('application/x-champion-id')
+            src_cid = int(data.data().decode()) if data else None
+        except Exception:
+            src_cid = None
+        if src_cid is None:
+            event.ignore()
+            return
+        if src_cid != self.cid:
+            picker = self.parent()
+            while picker and not isinstance(picker, ChampionPickerWidget):
+                picker = picker.parent()
+            if picker:
+                picker._swap_by_drag(src_cid, self.cid)
         event.acceptProposedAction()
 
 
@@ -295,14 +307,14 @@ class ChampionPickerWidget(QWidget):
                 font-size: {Glass.FONT_SIZE_XS};
             }}
             QListWidget::item:selected {{
-                background: rgba(99, 102, 241, 0.1);
-                border-color: rgba(99, 102, 241, 0.4);
+                background: {Glass.PRIMARY_10};
+                border-color: {Glass.PRIMARY_40};
             }}
             QListWidget::item:hover {{
-                border-color: rgba(99, 102, 241, 0.2);
+                border-color: {Glass.PRIMARY_20};
             }}
         """ + Glass.SCROLL_QSS)
-        self._sel_list.setIconSize(QSize(28, 28))
+        self._sel_list.setIconSize(QSize(LIST_ICON_PX, LIST_ICON_PX))
         self._sel_list.setSpacing(2)
         self._sel_list.model().rowsMoved.connect(self._on_drag_reorder)
         rl.addWidget(self._sel_list, 1)
@@ -317,7 +329,7 @@ class ChampionPickerWidget(QWidget):
                 border: none; border-radius: 6px;
                 font-size: {Glass.FONT_SIZE_LG}; font-weight: bold; min-width: 28px;
             }}
-            QPushButton:hover{{ border-color: rgba(99,102,241,0.3); color: {Glass.TEXT_PRIMARY}; }}
+            QPushButton:hover{{ border-color: {Glass.PRIMARY_30}; color: {Glass.TEXT_PRIMARY}; }}
             QPushButton:pressed{{ padding-top: 1px; }}
         """
 
@@ -342,7 +354,7 @@ class ChampionPickerWidget(QWidget):
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.setStyleSheet(f"""
             QPushButton{{background:transparent;color:{Glass.TEXT_MUTED};border:1px solid rgba(255,255,255,0.04);border-radius:6px;font-size:{Glass.FONT_SIZE_XS};padding:0 6px;}}
-            QPushButton:hover{{color:{Glass.DANGER};border-color:rgba(248,113,113,0.3);}}
+            QPushButton:hover{{color:{Glass.DANGER};border-color:{Glass.DANGER_30};}}
         """)
         clear_btn.clicked.connect(self._clear)
         sort_row.addWidget(clear_btn)
@@ -385,7 +397,7 @@ class ChampionPickerWidget(QWidget):
                 background: transparent; color: {Glass.TEXT_SECONDARY};
                 border: none; border-radius: 6px; font-size: {Glass.FONT_SIZE_XS}; padding: 0 6px;
             }}
-            QPushButton:hover{{ border-color: rgba(99,102,241,0.3); color: {Glass.TEXT_PRIMARY}; }}
+            QPushButton:hover{{ border-color: {Glass.PRIMARY_30}; color: {Glass.TEXT_PRIMARY}; }}
         """
 
     @ui_slot
@@ -424,15 +436,16 @@ class ChampionPickerWidget(QWidget):
         self._search = text
         self._rebuild_grid()
 
-    def _match(self, cid):
+    def _match(self, cid, q=''):
         """命中规则(v17): 官方名 / 别名(中英文外号) / 拼音(全拼或缩写)
         覆盖 女枪、文森特、delaiwen、dlw、gailun、gl 这类输入:
         - 中文词(官方名/别名): 子串匹配,宽容
         - 拼音全拼 f / 缩写 a: 前缀匹配,避免子串跨音节误命中(如 'gl' 不应命中一大片)
+
+        q 为预小写化的搜索词(见 _rebuild_grid), 避免每张卡重复 lower()。
         """
-        if not self._search:
+        if not q:
             return True
-        q = self._search.lower()
         name = self._data.get(cid, '').lower()
         if q in name:
             return True
@@ -474,26 +487,25 @@ class ChampionPickerWidget(QWidget):
         """
         shown = set()
         r = c = 0
+        q = (self._search or '').lower()
         for cid in self._all_ids:
-            if self._match(cid) and self._match_role(cid) and cid in self._cards:
+            if self._match(cid, q) and self._match_role(cid) and cid in self._cards:
                 self._gl.addWidget(self._cards[cid], r, c)
-                self._cards[cid].show()
                 shown.add(cid)
                 c += 1
                 if c >= self.MAX_COLS:
                     c = 0
                     r += 1
-        prev_shown = getattr(self, '_shown_ids', None)
+        # _shown_ids/_sel_state 已在 __init__ 初始化, 这里直接增量更新可见性
         for cid, card in self._cards.items():
             should_show = cid in shown
-            if prev_shown is None or should_show != (cid in prev_shown):
+            if should_show != (cid in self._shown_ids):
                 card.setVisible(should_show)
         self._shown_ids = shown
         # 选中态: 仅与上次不同时重写样式
-        prev_sel = getattr(self, '_sel_state', None)
         for cid, card in self._cards.items():
             sel = cid in self._preferred
-            if prev_sel is None or prev_sel.get(cid) != sel:
+            if self._sel_state.get(cid) != sel:
                 card.set_selected(sel)
         self._sel_state = {cid: (cid in self._preferred) for cid in self._cards}
 
@@ -594,11 +606,14 @@ class ChampionPickerWidget(QWidget):
         self._refresh_sel_list()
 
     def _tick_icon_load(self):
-        try:
-            loaded = 0
-            new_dl = 0
-            remaining = []
-            for cid in self._retry_ids:
+        # v4.4.0 修复(P2): 原来整段大 try 包住所有卡片 —— 任何一张卡片的
+        # _icon_cb/_apply_icon 抛异常都会跳出整个 tick, 后续卡片的图标被"饿死"。
+        # 现在把 try/except 收窄到单张卡片, 单卡异常只跳过它、其余照常加载。
+        loaded = 0
+        new_dl = 0
+        remaining = []
+        for cid in self._retry_ids:
+            try:
                 if self._icon_cb:
                     d = self._icon_cb(cid)
                     if d and isinstance(d, (bytes, bytearray)):
@@ -607,43 +622,43 @@ class ChampionPickerWidget(QWidget):
                         self._fail_count.pop(cid, None)
                         loaded += 1
                         continue
-                remaining.append(cid)
-            self._retry_ids = remaining
-            drops = []
-            for cid in self._retry_ids[:16]:
-                # G2:持续拿不到(下载真的失败)达上限就放弃该英雄, 避免 1s/16 个的
-                # 网络请求无限重试到程序退出。
-                # v4.3.10 修复: 原来**每 tick 无条件 +1** —— 网络慢时单张下载
-                # 超过 8 秒就会被记满 8 次而"永久放弃", 本会话内该英雄图标再也
-                # 不加载(用户看到的是"部分英雄没有图标")。现在只在
-                # **确实没有下载在途**时才计失败, 慢速下载不计。
-                if self._is_dl_inflight and self._is_dl_inflight(cid):
-                    new_dl += 1          # 仍在下载中, 不算失败也不重复提交
-                    continue
-                self._fail_count[cid] = self._fail_count.get(cid, 0) + 1
-                if self._fail_count[cid] >= 8:
-                    drops.append(cid)
-                elif self._dl_cb:
-                    try:
-                        self._dl_cb(cid)
-                    except Exception:
-                        pass
-                    new_dl += 1
-            if drops:
-                for cid in drops:
-                    try:
-                        self._retry_ids.remove(cid)
-                    except ValueError:
-                        pass
-                    self._fail_count.pop(cid, None)
-                print(f'[Picker] {len(drops)}个图标下载超限放弃: {drops}')
-            if loaded > 0 or new_dl > 0:
-                print(f'[Picker] 加载{loaded}个 下载{new_dl}个 剩余{len(self._retry_ids)}个')
-            if not self._retry_ids:
-                self._it.stop()
-                print('[Picker] 所有图标加载完毕')
-        except Exception as e:
-            print(f'[Picker] _tick_icon_load错误: {e}')
+            except Exception as e:
+                print(f'[Picker] 图标加载异常 cid={cid}: {type(e).__name__}: {e}')
+            remaining.append(cid)
+        self._retry_ids = remaining
+        drops = []
+        for cid in self._retry_ids[:ICON_TICK_BATCH]:
+            # G2:持续拿不到(下载真的失败)达上限就放弃该英雄, 避免 1s/16 个的
+            # 网络请求无限重试到程序退出。
+            # v4.3.10 修复: 原来**每 tick 无条件 +1** —— 网络慢时单张下载
+            # 超过 8 秒就会被记满 8 次而"永久放弃", 本会话内该英雄图标再也
+            # 不加载(用户看到的是"部分英雄没有图标")。现在只在
+            # **确实没有下载在途**时才计失败, 慢速下载不计。
+            if self._is_dl_inflight and self._is_dl_inflight(cid):
+                new_dl += 1          # 仍在下载中, 不算失败也不重复提交
+                continue
+            self._fail_count[cid] = self._fail_count.get(cid, 0) + 1
+            if self._fail_count[cid] >= ICON_FAIL_LIMIT:
+                drops.append(cid)
+            elif self._dl_cb:
+                try:
+                    self._dl_cb(cid)
+                except Exception:
+                    pass
+                new_dl += 1
+        if drops:
+            for cid in drops:
+                try:
+                    self._retry_ids.remove(cid)
+                except ValueError:
+                    pass
+                self._fail_count.pop(cid, None)
+            print(f'[Picker] {len(drops)}个图标下载超限放弃: {drops}')
+        if loaded > 0 or new_dl > 0:
+            print(f'[Picker] 加载{loaded}个 下载{new_dl}个 剩余{len(self._retry_ids)}个')
+        if not self._retry_ids:
+            self._it.stop()
+            print('[Picker] 所有图标加载完毕')
 
     def _refresh_sel_icon(self, cid, data):
         if cid not in self._preferred:

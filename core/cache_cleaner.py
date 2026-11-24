@@ -27,8 +27,9 @@
       必须先关句柄 → 删 → 重开。
     · 统计**就地累加**优先于"两次扫描差值"：日志重开后会新建一个空 app.log、
       英雄数据删完立刻起后台重拉可能赶在扫描前写回来 —— 这两类用差值法都会少算
-      （实测：日志实删 2 个却报 1 个）。图标/头像没有"删完立刻重建"行为，
-      继续用差值，口径更稳。
+      （实测：日志实删 2 个却报 1 个）。图标/头像原先继续用差值，但下载线程可能在
+      "清前清后两次扫描"之间又写入新文件，差值法同样会失真；现在改为**清理前
+      暂存待删文件快照、按快照累加**，与"清点"共用同一份判据。
 """
 import os
 
@@ -168,20 +169,54 @@ class CacheCleaner:
         # 就地累加量（不走结尾差值，原因见文件头设计纪律）
         logs_removed = logs_freed = 0
         data_removed = data_freed = 0
-        try:
-            before = self.scan()
-        except Exception:
-            before = {}
+        icon_removed = icon_freed = av_removed = av_freed = 0
 
         # ---- 1) 图标 / 头像：走 IconCache.clear_images（磁盘 + 内存一起清）----
         # 头像与英雄图标同在 icon_cache 目录，无法只清其一；任一被勾选即清
         # （界面上已注明"英雄头像与图标同目录，一并清理"）。
+        #
+        # P3: 统计不再用"清前清后两次扫描差值" —— 下载线程可能在两次扫描之间
+        # 又写入新文件, 差值会把新写入的图也算进"本次释放"。改为**清理前**按
+        # 同一套判据(_classify / is_cleanable_file)暂存待删文件快照并累加大小,
+        # 清完后按快照报数 —— 与"清点"同源, 且对并发写入免疫。
         if targets & {'icons', 'avatars'}:
+            seen = set()
+            snapshot = []   # (kind, size)
+            for c in self._caches_provider():
+                d = c.dir
+                if d in seen:
+                    continue
+                seen.add(d)
+                try:
+                    for f in os.listdir(d):
+                        p = os.path.join(d, f)
+                        try:
+                            if not os.path.isfile(p):
+                                continue
+                            kind = None
+                            if f.startswith('avatar_'):
+                                kind = 'avatars'
+                            elif is_cleanable_file(f):
+                                kind = 'icons'
+                            if kind is None:
+                                continue
+                            snapshot.append((kind, os.path.getsize(p)))
+                        except OSError:
+                            continue
+                except Exception:
+                    continue
             for c in self._caches_provider():
                 try:
                     c.clear_images()
                 except Exception as e:
                     notes.append(f'{c.dir_name}: {type(e).__name__}')
+            for kind, sz in snapshot:
+                if kind == 'icons':
+                    icon_removed += 1
+                    icon_freed += sz
+                else:
+                    av_removed += 1
+                    av_freed += sz
 
         # ---- 2) 日志：先关句柄 → 删 → 重开 ----
         if 'logs' in targets:
@@ -250,22 +285,13 @@ class CacheCleaner:
                 notes.append(f'对局记录: {type(e).__name__}')
 
         # ---- 统计 ----
-        try:
-            after = self.scan()
-        except Exception:
-            after = {}
-
-        def _delta(key, idx):
-            b = before.get(key, (0, 0))
-            a = after.get(key, (0, 0))
-            return max(0, b[idx] - a[idx])
-
-        stat_keys = []
+        # 头像与英雄图标同目录、一并清理(见上方"任一被勾选即清"), 因此统计也要
+        # 同进同出: 勾了 icons 或 avatars 任一时, 两者都要计入, 否则报数漏掉
+        # 头像那 1 个文件(回归测试 test_clean_icons_only_does_not_touch_logs 钉死)。
+        removed = freed = 0
         if targets & {'icons', 'avatars'}:
-            stat_keys += ['icons', 'avatars']
-        # logs / data 不进这里 —— 用上面的就地累加值（差值法对这两类会少算）
-        removed = sum(_delta(k, 0) for k in stat_keys)
-        freed = sum(_delta(k, 1) for k in stat_keys)
+            removed += icon_removed + av_removed
+            freed += icon_freed + av_freed
         if 'logs' in targets:
             removed += logs_removed
             freed += logs_freed

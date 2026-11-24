@@ -8,11 +8,9 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QFrame
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QPainter
 
-from .window_base import ui_slot
+from .window_base import ui_slot, GlassPanel, glass_hline
 from .styles import Glass
-from .animated_widgets import paint_window_backdrop
 # v4.4.0 修复(P1-15): 定位统一走 screen_utils(QApplication 在本文件已不再需要)
 from . import screen_utils
 
@@ -67,6 +65,8 @@ class AgreementDialog(QWidget):
         super().__init__(parent)
         self._remaining = self._COUNTDOWN
         self._accepted = False
+        self._started = False          # v4.4.0(P3): 倒计时移到 showEvent 首次触发
+        self._btn_style_enabled = None  # v4.4.0(P3): 记忆当前按钮 enabled 态, 只在翻转时重设 QSS
         self.setWindowTitle('大蛋小助手 · 使用须知')
         # v4.4.2(P2-5): 原 Qt.Dialog 会带 WS_EX_DLGMODALFRAME 并重置 DWM backdrop,
         # 与主窗/详情弹窗的玻璃路线冲突(同项目 recent_detail.py 已改用 Qt.Window)。
@@ -89,7 +89,8 @@ class AgreementDialog(QWidget):
         # 倒计时
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(1000)
+        # v4.4.0(P3): 原来 __init__ 里就 start(1000) —— 构造到真正 show 之间可能
+        # 隔很久(例如先弹别的窗), 计时被白白吃掉。改到 showEvent 首次触发(见 _start_timer)。
 
         # v4.4.2(P2-16): 玻璃应用统一交给 showEvent(单次)。原来这里排一次
         # singleShot(60) + showEvent 里再排两次(60/300ms) = 一次显示打 3 次 DWM,
@@ -113,7 +114,7 @@ class AgreementDialog(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        panel = _GlassPanel()
+        panel = GlassPanel()
         outer.addWidget(panel)
 
         lay = QVBoxLayout(panel)
@@ -132,10 +133,7 @@ class AgreementDialog(QWidget):
         lay.addWidget(sub)
 
         # 分隔线
-        line = QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet('background:rgba(99,102,241,0.22);border:none;')
-        lay.addWidget(line)
+        lay.addWidget(glass_hline())
 
         # 滚动正文
         scroll = QScrollArea()
@@ -184,13 +182,19 @@ class AgreementDialog(QWidget):
                 f"font-size:{Glass.FONT_SIZE_MD};color:{Glass.SUCCESS};background:transparent;font-weight:600;")
             self._btn.setText('我已知晓')
             self._btn.setEnabled(True)
+            # v4.4.0(P3): 倒计时结束设为 default 按钮(视觉上的强调; 回车确认由
+            # 下方 keyPressEvent 显式处理 —— QWidget 不自动触发 default 按钮)
+            self._btn.setDefault(True)
         else:
             self._hint.setText(f'请完整阅读 · {self._remaining}s')
             self._btn.setText(f'我已知晓（{self._remaining}s）')
-        self._refresh_btn_style()
+        # v4.4.0(P3): 只在 enabled 态翻转时才重设整套 QSS, 不再每秒整段 setStyleSheet
+        if self._btn.isEnabled() != self._btn_style_enabled:
+            self._refresh_btn_style()
 
     def _refresh_btn_style(self):
-        if self._btn.isEnabled():
+        self._btn_style_enabled = self._btn.isEnabled()
+        if self._btn_style_enabled:
             self._btn.setStyleSheet(f"""
                 QPushButton {{
                     background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
@@ -229,15 +233,28 @@ class AgreementDialog(QWidget):
         else:
             e.ignore()
 
+    # v4.4.0 修复(P3): 倒计时结束后回车确认。
+    # 本窗口是 Qt.Window(为保 DWM backdrop, 见 __init__ 注释), **不是 QDialog**,
+    # 实测 QWidget 的 setDefault 不会让回车触发 default 按钮 —— 所以这里显式
+    # 放行: 倒计时未结束吞掉 Enter/Esc, 结束后 Enter 直接确认(与 _accept 等效)。
     def keyPressEvent(self, e):
-        if e.key() in (Qt.Key_Escape, Qt.Key_Enter, Qt.Key_Return):
-            # 未倒计时结束前吞掉 Esc/回车，禁止绕过
-            if not getattr(self, '_accepted', False):
+        if e.key() == Qt.Key_Escape:
+            # Esc 始终禁止绕过(倒计时结束前/后都靠按钮确认)
+            return
+        if e.key() in (Qt.Key_Enter, Qt.Key_Return):
+            if self._remaining > 0:
                 return
+            self._accept()
+            return
         super().keyPressEvent(e)
 
     def showEvent(self, e):
         super().showEvent(e)
+        # v4.4.0(P3): 倒计时从"首次真正显示"才开始计时(加 _started 防重入)
+        if not self._started:
+            self._started = True
+            self._refresh_btn_style()
+            self._timer.start(1000)
         # v4.4.2(P2-16): 一次显示只打一次 DWM。原这里还排 60ms + 300ms 两发,
         # 加上 __init__ 里的 60ms 共 3 发, 本类又无 GlassEffectMixin 去重。
         # 玻璃需在窗口真正可见后才能打(否则 SetWindowPos 会把窗口弹出来),
@@ -245,13 +262,5 @@ class AgreementDialog(QWidget):
         QTimer.singleShot(60, self._apply_glass)
 
 
-class _GlassPanel(QWidget):
-    """玻璃背景容器（与主窗一致的半透明着色 + 顶部柔光）"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        paint_window_backdrop(p, self.width(), self.height())
-        p.end()
+# v4.4.0 修复(P2): 原 `_GlassPanel` 与 activation_dialog 的重复, 已抽到
+# ui/window_base.py 的 GlassPanel(含玻璃面板 + glass_hline 分隔线), 两文件复用。

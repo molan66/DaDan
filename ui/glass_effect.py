@@ -26,9 +26,12 @@ user32 = ctypes.WinDLL('user32', use_last_error=True)
 dwmapi = ctypes.WinDLL('dwmapi', use_last_error=True)
 
 # v4.4.2(P1-14/P2-3): 补 argtypes/restype —— 对照 lcu/clicker.py 的严格声明。
-# 64 位下 HWND/LONG 是 64 位, 不声明会走 ctypes 默认 c_int(32 位) 截断,
-# 高位被丢弃后 SetWindowLongW/SetWindowPos 拿到错误句柄。use_last_error=True
-# 只有配合 restype 才能正确捕获失败(见 _dwm_attr 的返回值检查)。
+# 注意: 64 位 Windows 下指针宽度是 64 位(HWND 在 ctypes 里由 wintypes.HWND
+# 声明的 c_void_p 承载, 不会截断); 而 `LONG` 在 Win32/Win64 上**恒为 32 位**,
+# GetWindowLongW/SetWindowLongW 的第 3 参数与返回值用 c_long 正是正确的 32 位
+# 类型。若不声明 argtypes/restype, ctypes 会按默认 c_int(同为 32 位, 宽度无误)
+# 但会丢掉"错误检查 + 返回类型语义"; use_last_error=True 也只有在 restype
+# 正确时才能配合 ctypes.get_last_error 捕获失败(见 _dwm_attr 的返回值检查)。
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongW.restype = ctypes.c_long
 user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
@@ -147,12 +150,17 @@ def _apply_native_rounded(widget, enable_shadow=False):
         return False
     _clear_shadow_styles(hwnd)
     # 深色模式/圆角失败不致命(降级为原生外观), 但 Acrylic 失败要如实上报。
-    _dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
+    # 失败也打印 debug: 静默丢弃返回值会让"深色/圆角没生效"无从排查。
+    hr_dark = _dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
+    if hr_dark not in (0,):
+        print(f'[Glass] 深色模式应用失败: hwnd={hwnd}, HRESULT={hr_dark}')
     # 先重置再应用：窗口 hide/show 后 DWM 会清除 backdrop，
     # 不重置直接设 Acrylic 可能不生效（表现为关闭再打开后玻璃效果丢失）
     _dwm_attr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE)
     hr = _dwm_attr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)  # Acrylic
-    _dwm_attr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)            # 圆角
+    hr_corner = _dwm_attr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)  # 圆角
+    if hr_corner not in (0,):
+        print(f'[Glass] 系统圆角应用失败: hwnd={hwnd}, HRESULT={hr_corner}')
     if hr not in (0,):
         print(f'[Glass] Acrylic 应用失败: hwnd={hwnd}, HRESULT={hr}')
         return False

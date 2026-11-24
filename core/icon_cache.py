@@ -280,13 +280,22 @@ class IconCache:
             return
         key = int(key)
         with self._lock:
-            if len(self._mem) >= self.max_mem and self._order:
-                old = self._order.pop(0)
-                self._mem.pop(old, None)
-            self._mem[key] = data
-            if key in self._order:
-                self._order.remove(key)
-            self._order.append(key)
+            # P3: 更新已存在的 key 时不应触发淘汰。原实现在满员时先 pop(0) 再
+            # 写入 —— 若 pop 出来的正好是同一个 key(它处于队首)就被误淘汰,
+            # 更常见的是满员更新一个非队首 key 时, 白白把最旧的那个踢掉。
+            if key in self._mem:
+                self._mem[key] = data
+                try:
+                    self._order.remove(key)
+                except ValueError:
+                    pass
+                self._order.append(key)
+            else:
+                if len(self._mem) >= self.max_mem and self._order:
+                    old = self._order.pop(0)
+                    self._mem.pop(old, None)
+                self._mem[key] = data
+                self._order.append(key)
         if persist:
             # v4.4.0(P2-11): 忽略返回值即可 —— 内存已写入, 落盘失败不影响本进程
             # 显示; 失败细节通过 self.write_fail_count/_reason 查询。

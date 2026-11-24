@@ -137,7 +137,6 @@ _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 _user32.GetAncestor.restype = wintypes.HWND
 _user32.WindowFromPoint.argtypes = [wintypes.POINT]
 _user32.WindowFromPoint.restype = wintypes.HWND
-_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 _user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD,
                                 wintypes.DWORD, wintypes.DWORD,
                                 ctypes.c_size_t]
@@ -203,6 +202,12 @@ def _cached_process_elevated(pid: int) -> Optional[bool]:
         ent = _elev_cache.get(int(pid))
         if ent is not None and now - ent[0] < _ELEV_CACHE_TTL_S:
             return ent[1]
+        # v4.4.x(P3): 写入前顺手清理过期条目 —— 缓存只增不减时, 客户端反复重启
+        # (PID 不断变化)会让 _elev_cache 无界增长, 且旧 PID 被复用前也无需再占位。
+        stale = [p for p, (ts, _v) in _elev_cache.items()
+                 if now - ts >= _ELEV_CACHE_TTL_S]
+        for p in stale:
+            _elev_cache.pop(p, None)
     res = process_elevated(int(pid))
     if res is not None:
         with _elev_cache_lock:
@@ -368,14 +373,30 @@ def find_client_windows() -> List[Dict[str, Any]]:
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL,
                                      wintypes.HWND, wintypes.LPARAM)
 
+    # v4.4.x(P3): 先在回调外一次性建好 pid→name 映射, 回调里只查表 ——
+    # 原实现每枚举到一个可见窗口就 psutil.Process(pid) 一次, 窗口多时
+    # (EnumWindows 会遍历所有顶层窗口) 反复开进程句柄, 又慢又易 AccessDenied。
+    pid_name: Dict[int, str] = {}
+    try:
+        for p in psutil.process_iter(['pid', 'name']):
+            try:
+                _nm = (p.info.get('name') or '').lower()
+            except Exception:
+                continue
+            try:
+                pid_name[int(p.info['pid'])] = _nm
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     def cb(hwnd, _lp):
         if not _user32.IsWindowVisible(hwnd):
             return True
         pid = wintypes.DWORD()
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        try:
-            name = (psutil.Process(pid.value).name() or '').lower()
-        except Exception:
+        name = pid_name.get(int(pid.value), '')
+        if not name:
             return True
         if 'league' in name:  # LeagueClient.exe / LeagueClientUx.exe 都命中
             # v4.3.15: 必须排除游戏本体 "League of Legends.exe" —— 它的进程名同样
@@ -555,8 +576,11 @@ def _sendinput_click(x: int, y: int) -> bool:
         if vw <= 1 or vh <= 1:
             return False
         # 相对虚拟桌面左上的偏移, 再归一化到 0..65535
-        nx = int((x - vx) * 65535 // max(1, vw - 1))
-        ny = int((y - vy) * 65535 // max(1, vh - 1))
+        # v4.4.x(P3): 原 int((x - vx) * 65535 // max(1, vw - 1)) 的截断除法在
+        # 边缘坐标上会引入最大 1 个单位的误差(如恰落在屏幕右缘时)。改四舍五入
+        # 再 clamp, 消除边缘误差。
+        nx = round((x - vx) * 65536.0 / max(1, vw))
+        ny = round((y - vy) * 65536.0 / max(1, vh))
         nx = max(0, min(65535, nx))
         ny = max(0, min(65535, ny))
 

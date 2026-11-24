@@ -92,14 +92,19 @@ _thread_warned = [False]
 
 
 def _assert_gui_thread():
-    """非 GUI 线程返回 False(调用方据此绕过缓存)。只警告一次, 不刷屏。"""
+    """非 GUI 线程返回 False(调用方据此绕过缓存)。只警告一次, 不刷屏。
+
+    无 QApplication 实例同样返回 False: 此时连 GUI 线程上下文都不存在,
+    谈不上"正在 GUI 线程", 缓存 QPixmap 更是不安全。
+    """
     try:
         app = QApplication.instance()
         if app is None:
-            return True
+            return False
         return QThread.currentThread() is app.thread()
     except Exception:
-        return True
+        # instance()/thread() 异常时无法确认线程归属, 保守按非 GUI 线程处理
+        return False
 
 
 def _warn_once_non_gui():
@@ -166,11 +171,17 @@ def _cache_put(key, pm):
 
 
 def _digest(data):
-    """sha1 前 16 字节十六进制 —— 够区分内容, 比存整个 bytes 当键省内存。"""
+    """sha1 前 16 字节十六进制 —— 够区分内容, 比存整个 bytes 当键省内存。
+
+    不可哈希的输入返回 None: 调用方据此**跳过缓存**。原来的回退 `id(data)`
+    不稳定(对象回收后 id 会被复用), 可能把不同图片串进同一缓存格。
+    """
     try:
+        if isinstance(data, str):
+            data = data.encode('utf-8')
         return hashlib.sha1(data).hexdigest()[:32]
     except Exception:
-        return repr(id(data))
+        return None
 
 
 def _new_dpr_pixmap(size, dpr):
@@ -187,10 +198,14 @@ def _new_dpr_pixmap(size, dpr):
     return pm
 
 
-def _decode_scaled(data, size, dpr, keep_aspect=True):
-    """字节 → 按 DPR 缩放的 QPixmap(未做圆角)。失败返回 None。"""
-    img = QImage()
-    if not img.loadFromData(data or b''):
+def _decode_scaled_from_image(img, size, dpr, keep_aspect=True):
+    """QImage → 按 DPR 缩放的 QPixmap(未做圆角)。失败返回 None。
+
+    与 _decode_scaled 的区别: 接收**已解码**的 QImage, 不再碰字节 —— 供
+    已经解码过一次的调用方(_tint_rounded)复用同一张图, 避免同一份 PNG
+    被解码两遍。
+    """
+    if img is None or img.isNull():
         return None
     # v4.4.0: 缩放目标按 dpr 放大, 否则等于"先缩小再被系统放大"=双倍模糊
     target = max(1, int(round(size * dpr)))
@@ -199,6 +214,14 @@ def _decode_scaled(data, size, dpr, keep_aspect=True):
     scaled = src.scaled(target, target, mode, Qt.SmoothTransformation)
     scaled.setDevicePixelRatio(dpr)
     return scaled
+
+
+def _decode_scaled(data, size, dpr, keep_aspect=True):
+    """字节 → 按 DPR 缩放的 QPixmap(未做圆角)。失败返回 None。"""
+    img = QImage()
+    if not img.loadFromData(data or b''):
+        return None
+    return _decode_scaled_from_image(img, size, dpr, keep_aspect)
 
 
 def icon_pixmap(data, size, widget=None, dpr=None, keep_aspect=True,
@@ -217,8 +240,10 @@ def icon_pixmap(data, size, widget=None, dpr=None, keep_aspect=True,
         except Exception:
             return None
     d = _resolve_dpr(widget, dpr)
-    key = ('sq', _digest(data), int(size), round(d, 3), 1 if keep_aspect else 0)
-    if cache:
+    dig = _digest(data)
+    key = (('sq', dig, int(size), round(d, 3), 1 if keep_aspect else 0)
+           if dig is not None else None)
+    if cache and key is not None:
         hit = _cache_get(key)
         if hit is not None:
             return hit
@@ -226,7 +251,7 @@ def icon_pixmap(data, size, widget=None, dpr=None, keep_aspect=True,
         pm = _decode_scaled(data, size, d, keep_aspect)
     except Exception:
         return None
-    return _cache_put(key, pm) if cache else pm
+    return _cache_put(key, pm) if (cache and key is not None) else pm
 
 
 def rounded_pixmap(data, size, radius=6, widget=None, dpr=None, cache=True):
@@ -249,8 +274,10 @@ def rounded_pixmap(data, size, radius=6, widget=None, dpr=None, cache=True):
             return None
     d = _resolve_dpr(widget, dpr)
     # radius 也进键: 同一份字节 24px 圆角 r=4 与 50px 圆角 r=6 不能互串
-    key = ('rr', _digest(data), int(size), round(d, 3), int(radius))
-    if cache:
+    dig = _digest(data)
+    key = (('rr', dig, int(size), round(d, 3), int(radius))
+           if dig is not None else None)
+    if cache and key is not None:
         hit = _cache_get(key)
         if hit is not None:
             return hit
@@ -258,7 +285,7 @@ def rounded_pixmap(data, size, radius=6, widget=None, dpr=None, cache=True):
         pm = _decode_rounded(data, size, radius, d)
     except Exception:
         return None
-    return _cache_put(key, pm) if cache else pm
+    return _cache_put(key, pm) if (cache and key is not None) else pm
 
 
 def _decode_rounded(data, size, radius, dpr):
@@ -272,11 +299,11 @@ def _decode_rounded(data, size, radius, dpr):
     path = QPainterPath()
     path.addRoundedRect(0, 0, size, size, radius, radius)
     p.setClipPath(path)
-    # scaled 的逻辑尺寸可能因 KeepAspectRatioByExpanding 稍大于 size, 居中裁。
-    # v4.4.2(P0-4): 原先直接 `(size - scaled.width()) // 2`, 但 scaled.width()
-    # 是**物理**宽度(设过 setDevicePixelRatio(dpr) 后返回物理像素), 与逻辑
-    # 坐标系的 size 相减把偏移多算了 dpr 倍 —— 高缩放下头像歪斜、200% 时
-    # 整个元素被裁出画布。改按逻辑宽度(物理 / dpr)算居中偏移。
+    # 居中偏移说明: _decode_scaled 里 QPixmap.scaled(target, target,
+    # Qt.KeepAspectRatioByExpanding) 返回的位图尺寸**精确等于 target×target**
+    # (超出部分由 Qt 裁掉), 而 target == size*dpr → 逻辑宽度恒等于 size,
+    # 故 off 恒为 0。保留计算式只是防御式兜底(不依赖 scaled 的隐式行为),
+    # 并避免将来有人改掉目标尺寸时把居中逻辑也悄悄改没。
     off = int(round((size - scaled.width() / dpr) / 2.0))
     p.drawPixmap(off, off, scaled)
     p.end()
@@ -383,8 +410,10 @@ def augment_pixmap(data, size, rarity='', radius=None, widget=None, dpr=None,
             return None
     d = _resolve_dpr(widget, dpr)
     r = int(radius) if radius is not None else 4
-    key = ('aug', _digest(data), int(size), round(d, 3), r, color)
-    if cache:
+    dig = _digest(data)
+    key = (('aug', dig, int(size), round(d, 3), r, color)
+           if dig is not None else None)
+    if cache and key is not None:
         hit = _cache_get(key)
         if hit is not None:
             return hit
@@ -392,7 +421,7 @@ def augment_pixmap(data, size, rarity='', radius=None, widget=None, dpr=None,
         pm = _tint_rounded(data, size, r, color, d)
     except Exception:
         return None
-    return _cache_put(key, pm) if cache else pm
+    return _cache_put(key, pm) if (cache and key is not None) else pm
 
 
 def _tint_rounded(data, size, radius, color, dpr):
@@ -406,9 +435,12 @@ def _tint_rounded(data, size, radius, color, dpr):
     if not img.loadFromData(data or b''):
         return None
     if not _is_white_mask_image(img):
-        # 图本身有颜色 → 不染, 保证"自带颜色"的那批原样通过
+        # 图本身有颜色 → 不染, 保证"自带颜色"的那批原样通过。
+        # 注: 这里仍从 data 再解码一次(而非复用上面的 img)。_decode_rounded
+        # 只接受字节入口; 自带颜色的图占少数、多解一次码的成本可忽略,
+        # 保守起见不为它重构 _decode_rounded, 以免动到圆角裁剪路径的正确性。
         return _decode_rounded(data, size, radius, dpr)
-    scaled = _decode_scaled(data, size, dpr, keep_aspect=False)
+    scaled = _decode_scaled_from_image(img, size, dpr, keep_aspect=False)
     if scaled is None:
         return None
     out = _new_dpr_pixmap(size, dpr)
@@ -719,6 +751,30 @@ class _TitleBtn(QPushButton):
     def leaveEvent(self, e):
         self.setIcon(self._ic_n); super().leaveEvent(e)
 
+
+def _title_btn(icon_n, icon_h, hover_bg, pressed_bg='rgba(255,255,255,0.20)'):
+    """私有工厂: 建一枚 30×26 的标题栏按钮并套统一 QSS。
+
+    v4.6.x 抽取: minimize/main/close 三处原本复制粘贴同一份 QSS(仅 hover/pressed
+    底色不同), 已收敛到这里。normal 底色 / 圆角三处完全一致。
+    """
+    btn = _TitleBtn(icon_n, icon_h)
+    btn.setFixedSize(30, 26)
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background: rgba(255,255,255,0.04);
+            border: none; border-radius: {Glass.RADIUS_SM}px;
+        }}
+        QPushButton:hover {{
+            background: {hover_bg};
+        }}
+        QPushButton:pressed {{
+            background: {pressed_bg};
+        }}
+    """)
+    return btn
+
+
 def make_title_buttons(minimize_cb=None, close_cb=None, main_cb=None):
     """统一样式的标题栏控制按钮(主窗口/小窗共用,v15.2 矢量图标版)
     - 30×26 / RADIUS_SM 圆角 / 微弱 normal 底色
@@ -736,60 +792,22 @@ def make_title_buttons(minimize_cb=None, close_cb=None, main_cb=None):
     """
     btns = []
     if minimize_cb is not None:
-        ic_n = icon_minimize(Glass.TEXT_MUTED)
-        ic_h = icon_minimize(Glass.TEXT_PRIMARY)
-        mb = _TitleBtn(ic_n, ic_h)
-        mb.setFixedSize(30, 26)
-        mb.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255,255,255,0.04);
-                border: none; border-radius: {Glass.RADIUS_SM}px;
-            }}
-            QPushButton:hover {{
-                background: rgba(255,255,255,0.12);
-            }}
-            QPushButton:pressed {{
-                background: rgba(255,255,255,0.20);
-            }}
-        """)
+        mb = _title_btn(icon_minimize(Glass.TEXT_MUTED),
+                        icon_minimize(Glass.TEXT_PRIMARY),
+                        'rgba(255,255,255,0.12)')
         mb.clicked.connect(minimize_cb)
         btns.append(mb)
     if main_cb is not None:
-        ic_n = icon_back_to_main(Glass.TEXT_MUTED)
-        ic_h = icon_back_to_main(Glass.TEXT_PRIMARY)
-        rb = _TitleBtn(ic_n, ic_h)
-        rb.setFixedSize(30, 26)
-        rb.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255,255,255,0.04);
-                border: none; border-radius: {Glass.RADIUS_SM}px;
-            }}
-            QPushButton:hover {{
-                background: rgba(255,255,255,0.12);
-            }}
-            QPushButton:pressed {{
-                background: rgba(255,255,255,0.20);
-            }}
-        """)
+        rb = _title_btn(icon_back_to_main(Glass.TEXT_MUTED),
+                        icon_back_to_main(Glass.TEXT_PRIMARY),
+                        'rgba(255,255,255,0.12)')
         rb.clicked.connect(main_cb)
         btns.append(rb)
     if close_cb is not None:
-        ic_n = icon_close(Glass.TEXT_MUTED)
-        ic_h = icon_close('#ffffff')  # 红底上必须白图标,跟着 hover 切
-        cb = _TitleBtn(ic_n, ic_h)
-        cb.setFixedSize(30, 26)
-        cb.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255,255,255,0.04);
-                border: none; border-radius: {Glass.RADIUS_SM}px;
-            }}
-            QPushButton:hover {{
-                background: {Glass.DANGER};
-            }}
-            QPushButton:pressed {{
-                background: #dc2626;
-            }}
-        """)
+        cb = _title_btn(icon_close(Glass.TEXT_MUTED),
+                        icon_close('#ffffff'),  # 红底上必须白图标,跟着 hover 切
+                        Glass.DANGER,
+                        pressed_bg='#dc2626')
         cb.clicked.connect(close_cb)
         btns.append(cb)
     return btns
@@ -799,24 +817,49 @@ def make_title_buttons(minimize_cb=None, close_cb=None, main_cb=None):
 
 class AnimatedToggle(QPushButton):
     """带动画的开关按钮 - hover高亮 + pressed缩小反馈"""
+    # 视觉常量集中在这里, 别在方法里散落魔法数字。
+    # 行程由控件宽度动态推导: 左右端点 = 边距 + 半径, 与固定尺寸解耦,
+    # 但固定 42×22 下推导结果与旧硬编码(11.0/31.0)逐像素一致, 视觉不变。
+    _THUMB_RADIUS = 8            # 圆点基准半径(逻辑 px)
+    _THUMB_MARGIN = 3.0          # 圆点中心距轨道两端的留白
+    _PRESS_SCALE = 0.80          # 按压时圆点收缩比例
+    _ANIM_MS = 220               # 圆点滑动动画时长
+    _PRESS_ANIM_MS = 130         # 按压收缩动画时长
+    _TRACK_OFF_TOP = (58, 58, 70)
+    _TRACK_OFF_BOT = (40, 40, 52)
+    _TRACK_ON_TOP = (129, 140, 248)
+    _TRACK_ON_BOT = (99, 102, 241)
+
+    def _thumb_x_unchecked(self):
+        """关态圆点中心 x(贴左端)。"""
+        return self._THUMB_MARGIN + self._THUMB_RADIUS
+
+    def _thumb_x_checked(self):
+        """开态圆点中心 x(贴右端), 由控件实际宽度推导。"""
+        return float(self.width()) - self._THUMB_MARGIN - self._THUMB_RADIUS
+
+    def _thumb_travel(self):
+        """圆点中心从关态到开态的行程。"""
+        return max(1.0, self._thumb_x_checked() - self._thumb_x_unchecked())
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
         self.setFixedSize(42, 22)
         self.setCursor(Qt.PointingHandCursor)
-        self._circle_x = 31.0
+        self._circle_x = self._thumb_x_checked()
         self._thumb_scale = 1.0
         self._hovered = False
         self._pressed = False
         # 圆点滑动动画（OutBack 轻微回弹，更灵动）
         self._anim = QPropertyAnimation(self, b'circle_x')
-        self._anim.setDuration(220)
+        self._anim.setDuration(self._ANIM_MS)
         _bounce = QEasingCurve(QEasingCurve.OutBack)
         _bounce.setOvershoot(0.9)
         self._anim.setEasingCurve(_bounce)
         # 按压收缩动画
         self._press_anim = QPropertyAnimation(self, b'thumb_scale')
-        self._press_anim.setDuration(130)
+        self._press_anim.setDuration(self._PRESS_ANIM_MS)
         self._press_anim.setEasingCurve(QEasingCurve.InOutCubic)
         self.setChecked(True)
         self.clicked.connect(self._on_clicked)
@@ -834,7 +877,7 @@ class AnimatedToggle(QPushButton):
 
     def mousePressEvent(self, e):
         self._pressed = True
-        self._scale_to(0.80)
+        self._scale_to(self._PRESS_SCALE)
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
@@ -853,7 +896,7 @@ class AnimatedToggle(QPushButton):
         self._animate_to(self.isChecked())
 
     def _animate_to(self, checked):
-        target = 31.0 if checked else 11.0
+        target = self._thumb_x_checked() if checked else self._thumb_x_unchecked()
         self._anim.stop()
         self._anim.setStartValue(self._circle_x)
         self._anim.setEndValue(target)
@@ -880,7 +923,8 @@ class AnimatedToggle(QPushButton):
 
     def setChecked(self, v):
         super().setChecked(v)
-        self._circle_x = 31.0 if v else 11.0
+        self._circle_x = (self._thumb_x_checked() if v
+                          else self._thumb_x_unchecked())
         self._thumb_scale = 1.0
         self.update()
 
@@ -888,16 +932,17 @@ class AnimatedToggle(QPushButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        r = 8  # 圆点基准半径
+        r = self._THUMB_RADIUS  # 圆点基准半径
 
         # 轨道混色进度：跟随圆点滑动平滑切换 灰 <-> 靛蓝
-        prog = max(0.0, min(1.0, (self._circle_x - 11.0) / 20.0))
+        x0 = self._thumb_x_unchecked()
+        prog = max(0.0, min(1.0, (self._circle_x - x0) / self._thumb_travel()))
 
         def _mix(c1, c2, t):
             return int(c1[0] + (c2[0] - c1[0]) * t), int(c1[1] + (c2[1] - c1[1]) * t), int(c1[2] + (c2[2] - c1[2]) * t)
 
-        off_top, off_bot = (58, 58, 70), (40, 40, 52)
-        on_top, on_bot = (129, 140, 248), (99, 102, 241)
+        off_top, off_bot = self._TRACK_OFF_TOP, self._TRACK_OFF_BOT
+        on_top, on_bot = self._TRACK_ON_TOP, self._TRACK_ON_BOT
         top_c = _mix(off_top, on_top, prog)
         bot_c = _mix(off_bot, on_bot, prog)
         a = 255 if self._hovered else 235

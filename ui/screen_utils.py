@@ -7,8 +7,10 @@
     问题有两层:
     1) **坐标系混用**。`QScreen.geometry()` 返回的是**设备像素**(physical),
        而 `QWidget.move()` 接受的是**逻辑像素**(logical)。125% 缩放下二者差
-       1.25 倍 → 窗口偏出去一截; 150% 偏差更大。必须用
-       `QScreen.availableGeometry()`, 它和新版 Qt 的 move() 同处逻辑坐标系。
+       1.25 倍 → 窗口偏出去一截; 150% 偏差更大。Qt 的几何换算要用逻辑坐标:
+       `QScreen.geometry()` / `availableGeometry()` 才是逻辑坐标(后者额外扣除
+       任务栏区域), 与 `QWidget.move()` 同坐标系; 需要设备像素时才用
+       `QScreen.size()` / `availableSize()`。
     2) **硬绑主屏**。偏移量 30/120 是"贴着主屏右下角"量出来的。副屏在主屏
        **左侧**时副屏的 x 坐标是负数, 用主屏坐标算出来的位置会把窗口甩到
        屏外(或者落在两屏之间的缝里, 用户看不到窗口但进程还在跑)。
@@ -71,7 +73,8 @@ def screen_for_window(widget, point=None):
 def available_rect(widget=None, point=None, screen=None):
     """逻辑坐标的可用区域(已扣除任务栏)。
 
-    始终返回一个 QRect; 取不到屏时给一个 1920x1080 的安全兜底,
+    始终返回一个 QRect。取不到给定屏时优先用 `QGuiApplication.primaryScreen()`
+    的真实可用几何兜底; 连主屏都拿不到(理论上无屏环境)才降级 1920x1080,
     避免调用方在 `rect.width()` 上崩掉。
     """
     scr = screen or screen_for_window(widget, point)
@@ -82,6 +85,16 @@ def available_rect(widget=None, point=None, screen=None):
                 return rect
         except Exception:
             pass
+    # v4.6.x: 兜底优先取主屏实际几何, 而不是固定 1920x1080 ——
+    # 多屏/高 DPI 下固定值会让窗口摆到与实际分辨率不符的位置。
+    try:
+        primary = QGuiApplication.primaryScreen()
+        if primary is not None:
+            rect = primary.availableGeometry()
+            if rect.width() > 0 and rect.height() > 0:
+                return rect
+    except Exception:
+        pass
     return QRect(0, 0, 1920, 1080)
 
 

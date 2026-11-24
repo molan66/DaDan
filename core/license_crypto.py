@@ -143,9 +143,15 @@ def b32d(text):
         raise ValueError('授权码为空')
     pad = (-len(t)) % 8
     try:
-        return base64.b32decode(t + '=' * pad)
+        raw = base64.b32decode(t + '=' * pad)
     except (binascii.Error, ValueError) as e:
         raise ValueError(f'授权码含有非法字符或长度不对（{e}）')
+    # P3: Python 的 b32decode 会**忽略非法字符与多余填充**, 例如 'A' 与 'AA'、
+    # 'AAAA' 都解码成同一字节, 导致非规范码也能混进来(影响解码唯一性)。
+    # 解码后回编比较: 回编结果与规范化输入不一致 → 判格式错。
+    if base64.b32encode(raw).decode('ascii').rstrip('=') != t:
+        raise ValueError('授权码不是规范的 base32（存在多余字符或填充）')
+    return raw
 
 
 # ---------------------------------------------------------------- 授权码

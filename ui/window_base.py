@@ -51,10 +51,19 @@ import sys
 import traceback
 
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QPainter
+from PyQt5.QtWidgets import QFrame, QWidget
 
 # PyQt5 的默认 hook 收到槽异常会走 qFatal(abort) —— 绝不能转交给它。
 # 只认"被替换过的" hook(main.py 会在 QApplication 之前装自定义的)。
-_DEFAULT_EXCEPTHOOK = sys.excepthook
+#
+# v4.4.0 修复(P2): 原 `_DEFAULT_EXCEPTHOOK = sys.excepthook` 是**导入期快照**,
+# 依赖"window_base 先于 main.py 装 hook 被 import"这一顺序 —— 一旦顺序变化,
+# 快照就是 main.py 的自定义 hook, 后续任何 hook 都判成"相等"而永不转交。
+# 这里改为运行时比较: 每次 _report_slot_exception 现场取 `sys.excepthook`,
+# 与 `sys.__excepthook__`(Python 内置, 永不随 sys.excepthook 变化)比较。
+# 默认 hook 恒等于内置 __excepthook__; main.py 装的 hook 是自定义闭包, 必不等。
+_DEFAULT_EXCEPTHOOK = sys.__excepthook__
 
 
 def _positional_arity(fn):
@@ -91,6 +100,9 @@ def _report_slot_exception(fn, exc):
     若全局 hook 仍是 Python/PyQt5 默认的那一个(没被 main.py 替换, 例如单独跑
     某个 ui 模块), 就**不要**转交 —— 默认 hook 对槽异常会 qFatal 直接 abort,
     那反倒是把"已经被拦下的异常"重新变成崩溃。此时只打印 traceback。
+
+    v4.4.0 修复(P2): 判断改为**运行时读** `sys.excepthook` 与内置
+    `sys.__excepthook__` 比较, 不再依赖导入期快照(见模块级 _DEFAULT_EXCEPTHOOK)。
     """
     hook = sys.excepthook
     if hook is not _DEFAULT_EXCEPTHOOK:
@@ -160,7 +172,18 @@ class DragMixin:
         self._drag_pos = None
 
     def _install_drag(self, widget):
-        """把整块 widget 变成本窗口的拖拽把手。"""
+        """把整块 widget 变成本窗口的拖拽把手。
+
+        v4.4.0 修复(P3, 保留行为不变): 这里用 monkey-patch 直接替换三个
+        mouse*Event —— 而不是走 eventFilter, 是**有意取舍**:
+          · 标题栏/把手 widget 常常还挂着其它 eventFilter(玻璃、悬浮高亮等),
+            再插一个过滤器要在里面绕"该不该放行给原对象"的判断, 极易互相踩脚;
+          · 直接替换事件方法是 Qt 内建的虚函数覆盖机制, 与 PyQt5 的信号/槽
+            无冲突, 且只影响被指定的把手 widget, 作用面最小。
+        代价是**每 widget 只能装一个把手**(后装的覆盖先装的), 目前各窗口
+        恰好都只有一个把手, 故维持现状。不要无谓改成 eventFilter ——
+        风险高于收益。
+        """
         widget.mousePressEvent = self._drag_mouse_press
         widget.mouseMoveEvent = self._drag_mouse_move
         widget.mouseReleaseEvent = self._drag_mouse_release
@@ -246,3 +269,34 @@ class GlassEffectMixin:
         """showEvent 里调用: 排首次 + 兜底两次调度(命中脏标志则只做一次)。"""
         QTimer.singleShot(self._GLASS_FIRST_DELAY, self._apply_glass_effect)
         QTimer.singleShot(self._GLASS_RETRY_DELAY, self._apply_glass_effect)
+
+
+# ============================================================
+# 弹窗玻璃面板 / 分隔线 (activation_dialog 与 agreement_dialog 共用)
+# ============================================================
+class GlassPanel(QWidget):
+    """玻璃背景容器（与主窗/须知弹窗一致的半透明着色 + 顶部柔光）。
+
+    v4.4.0: 从 activation_dialog / agreement_dialog 各自私有的 `_GlassPanel`
+    抽出, 消除两份一模一样的 paintEvent。`paint_window_backdrop` 属于
+    animated_widgets, 后者会 import window_base.ui_slot —— 为杜绝环形导入,
+    这里**延迟 import**(方法内, 而不是模块级)。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        from .animated_widgets import paint_window_backdrop
+        paint_window_backdrop(p, self.width(), self.height())
+        p.end()
+
+
+def glass_hline():
+    """1px 靛蓝霓虹分隔线(activation_dialog / agreement_dialog 共用)。"""
+    line = QFrame()
+    line.setFixedHeight(1)
+    line.setStyleSheet('background:rgba(99,102,241,0.22);border:none;')
+    return line

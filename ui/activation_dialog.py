@@ -26,17 +26,19 @@
 import threading
 
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QGuiApplication, QPainter
+from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QLineEdit, QPlainTextEdit, QScrollArea
 )
 
-from .window_base import ui_slot
+from .window_base import ui_slot, GlassPanel, glass_hline
 from .styles import Glass
-from .animated_widgets import paint_window_backdrop
 from . import screen_utils
 from core import license_crypto as LC
+# v4.4.0 修复(P3): licensing 统一在模块级 import 一个别名,
+# 不再在 _start_machine_probe / _do_activate 里各自 `from core import licensing as ...`。
+from core import licensing as _lic
 
 # v4.9.3: 删除 `CARD_BYTES_LEN = 20` 与 `_HELP_ONLINE_HTML` ——
 # 它们是"在线激活（卡密 → 服务器换码）"这条路径的产物。按用户要求整个在线
@@ -70,6 +72,10 @@ class ActivationDialog(QWidget):
     # v4.9.3: 机器码采集在后台线程完成 → 经本信号回主线程填控件。
     # 用信号而不是直接 setText：Qt 控件只能在 GUI 线程碰。
     _machine_ready = pyqtSignal(str)
+    # v4.4.0 修复(P2): 试用状态 check() 与验签 try_activate() 都搬到后台线程,
+    # 结果经本信号回主线程(参数字典封装状态对象, 避免跨线程传递复杂对象)。
+    _lic_ready = pyqtSignal(dict)
+    _activate_finished = pyqtSignal(dict)
 
     # v: 为了不打断"先试用后激活"的流程，提供"暂不激活"入口；
     #    是否允许跳过由调用方（main.py）决定，见 allow_skip 参数。
@@ -100,27 +106,44 @@ class ActivationDialog(QWidget):
         # "不能阻塞 GUI 线程"是同一条纪律，激活窗这条路径原来漏了。
         # 改为：先显示占位，再后台采集，最后经信号回填主线程。
         self._machine_ready.connect(self._on_machine_ready)
+        self._lic_ready.connect(self._on_lic_ready)
+        self._activate_finished.connect(self._finish_activate_result)
         self._mid_edit.setText('读取中…')
         QTimer.singleShot(0, self._start_machine_probe)
 
     def _start_machine_probe(self):
-        """后台线程采集机器码，结果经信号回主线程（不阻塞 GUI）。
+        """后台线程采集机器码 + 试用状态 check()，结果经信号回主线程（不阻塞 GUI）。
 
-        v4.9.3 新增。`machine_id()` 内部会走 `collect_components()` →
-        PowerShell 子进程；采集完后 `_CACHE` 里就有值，后续调用是纯内存。
+        v4.9.3: `machine_id()` 内部会走 `collect_components()` → PowerShell 子进程
+        （实测冷启动 1.51 s），GUI 线程同步跑会白屏、被标"未响应"。
+        v4.4.0 修复(P1): 原 `_init_ui` 里同步调 `licensing.check()`（内含同一次
+        collect_components + One-shot Ed25519 验签，实测 129.4 ms）—— 现在并入
+        同一后台线程，一次采集两次复用，结果经 `_lic_ready` 信号回填试用横幅。
         """
         def worker():
+            mid = ''
+            snapshot = None
             try:
-                from core import licensing as _L
-                mid = self._machine_id or _L.machine_id_grouped()
+                mid = self._machine_id or _lic.machine_id_grouped()
             except Exception as e:
-                mid = ''
                 try:
                     print(f'[Activation] 机器码采集失败: {type(e).__name__}: {e}')
                 except Exception:
                     pass
+            # 机器码采集失败也不影响试用状态读取 —— check() 内部会自行兜底
+            try:
+                snapshot = _lic.check()
+            except Exception as e:
+                try:
+                    print(f'[Activation] 试用状态读取失败: {type(e).__name__}: {e}')
+                except Exception:
+                    pass
             try:
                 self._machine_ready.emit(str(mid or ''))
+            except Exception:
+                pass
+            try:
+                self._lic_ready.emit({'snapshot': snapshot, 'ok': True})
             except Exception:
                 pass
 
@@ -129,6 +152,7 @@ class ActivationDialog(QWidget):
         except Exception as e:
             print(f'[Activation] 机器码采集线程启动失败: {type(e).__name__}: {e}')
             self._on_machine_ready('')
+            self._on_lic_ready({'snapshot': None, 'ok': False})
 
     @ui_slot
     def _on_machine_ready(self, mid):
@@ -139,9 +163,28 @@ class ActivationDialog(QWidget):
             self._mid_edit.setText('')
             return
         self._mid_edit.setText(mid)
+        self._mid_edit.setToolTip(mid)   # v4.4.0(P3): 单行框长码横向滚动, tooltip 展示完整值
         self._mid_edit.setCursorPosition(0)
         n = len(mid.replace('-', ''))
         self._sub.setText(f'本软件需激活后使用 · 机器码 {n} 字符，与本机绑定')
+
+    @ui_slot
+    def _on_lic_ready(self, payload):
+        """主线程：用后台线程拿到的试用快照更新试用横幅与状态提示。"""
+        snapshot = (payload or {}).get('snapshot')
+        self._lic_snapshot = snapshot
+        try:
+            if snapshot is not None and snapshot.trial and snapshot.usable:
+                self._sub.setText(
+                    f'试用中 · 还可使用 {snapshot.trial_days_left:.1f} 天（激活为长期使用）')
+                self._sub.setStyleSheet(
+                    f"font-size:{Glass.FONT_SIZE_SM};color:{Glass.WARNING};"
+                    f"background:transparent;font-weight:600;")
+                self._set_status(
+                    f'试用中：还可使用 {snapshot.trial_days_left:.1f} 天。'
+                    '现在激活即可长期使用（激活后不受网络影响）。', 'info')
+        except Exception as e:
+            print(f'[Activation] 试用横幅更新失败: {type(e).__name__}: {e}')
 
     # ------------------------------------------------------------ UI
 
@@ -149,7 +192,7 @@ class ActivationDialog(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(_GlassPanel())
+        outer.addWidget(GlassPanel())
 
         panel = outer.itemAt(0).widget()
         lay = QVBoxLayout(panel)
@@ -172,28 +215,12 @@ class ActivationDialog(QWidget):
         # 试用期横幅：明确告诉买家"现在还能用"，把"必须立刻激活"的压力去掉。
         # 这也降低了老用户升级后被门禁吓到的概率。
         #
-        # v4.9.3: 原来这里和 :280 各调一次 `licensing.check()` —— 两次都完整跑
-        #   `collect_components()`（每次 spawn PowerShell，实测冷启动 1.51 s）
-        #   + One-shot 纯 Python Ed25519 验签（实测 129.4 ms）。主线程连续两次，
-        #   首开激活窗最坏 3 s+ 白屏。现在**一次 check() 结果复用两次**。
+        # v4.4.0 修复(P1): check() 已并入 _start_machine_probe 后台线程, 这里只
+        # 置 None 占位, 结果经 _lic_ready 信号在 _on_lic_ready 里回填横幅 ——
+        # GUI 线程不再跑 collect_components() + Ed25519 验签(不再白屏)。
         self._lic_snapshot = None
-        try:
-            from core import licensing as _Lc
-            self._lic_snapshot = _Lc.check()
-        except Exception as e:
-            print(f'[Activation] 试用状态读取失败: {type(e).__name__}: {e}')
-        try:
-            _s = self._lic_snapshot
-            if _s is not None and _s.trial and _s.usable:
-                self._sub.setText(
-                    f'试用中 · 还可使用 {_s.trial_days_left:.1f} 天（激活为长期使用）')
-                self._sub.setStyleSheet(
-                    f"font-size:{Glass.FONT_SIZE_SM};color:{Glass.WARNING};"
-                    f"background:transparent;font-weight:600;")
-        except Exception:
-            pass
 
-        lay.addWidget(_hline())
+        lay.addWidget(glass_hline())
 
         # ---- 机器码 ----
         # v4.9.3: 机器码是**必经步骤** —— 买家要把它发给卖家，卖家才能签出
@@ -264,15 +291,8 @@ class ActivationDialog(QWidget):
 
         # 试用期提示：告诉买家"你现在还能用"，避免他以为必须马上激活。
         # 这条信息对转化很关键 —— 用户知道有缓冲，才不会因为激活麻烦而退款。
-        # v4.9.3: 复用上面那份 `_lic_snapshot`，不再第二次调 check()（见那处说明）。
-        try:
-            _st = getattr(self, '_lic_snapshot', None)
-            if _st is not None and _st.trial and _st.usable:
-                self._set_status(
-                    f'试用中：还可使用 {_st.trial_days_left:.1f} 天。'
-                    '现在激活即可长期使用（激活后不受网络影响）。', 'info')
-        except Exception as e:
-            print(f'[Activation] 试用状态展示失败: {type(e).__name__}: {e}')
+        # v4.4.0 修复(P1): 快照在 _start_machine_probe 后台线程里才拿到,
+        # 这条状态提示已并入 _on_lic_ready 回填(见该方法), 这里不再同步读。
 
         # ---- 说明（可滚动，避免小屏被挤扁） ----
         scroll = QScrollArea()
@@ -384,22 +404,18 @@ class ActivationDialog(QWidget):
         # 复制**不含连字符**的纯码 —— 连字符只是显示用的分组，
         # 卖家那边两种都能解析，但纯码更不容易在微信里被自动换行截断。
         cb.setText(txt.replace('-', ''))
-        self._set_status('机器码已复制 ✓ 现在把它发给卖家，等他把授权码发回给你。', 'ok')
+        self._set_status(
+            '机器码已复制 ✓ 现在把它发给卖家，等他把授权码发回给你。'
+            '（为保护隐私，复制内容会在本窗口关闭后从剪贴板清除）', 'ok')
 
     @ui_slot
     def _do_activate(self):
-        """点「激活」。
+        """点「激活」。纯离线验签（唯一路径）。
 
-        两条路径：
-          · 配了在线服务 → 走后台线程联网（**不能占 GUI 线程**，否则界面假死），
-            拿到授权码后本地验签再落盘。
-          · 没配 → 纯离线验签（同步即可，只算哈希，几毫秒）。
-
-        两条路径最终都落到同一套存储与校验上，所以离线激活的码
-        和在线激活的码在后续使用时完全等价。
+        v4.4.0 修复(P2): try_activate() 会再次 collect_components() —— 若机器码
+        缓存未命中会 spawn PowerShell 子进程, 在 GUI 线程同步执行会卡界面。
+        现在把验签放进后台线程, 结果经 _activate_finished 信号回主线程收尾。
         """
-        from core import licensing as L
-
         raw = self._code_edit.toPlainText().strip()
         if not raw:
             self._set_status('请先粘贴授权码。', 'warn')
@@ -409,8 +425,9 @@ class ActivationDialog(QWidget):
         # 先做一次本地格式预检，能立刻拦掉"明显抄错"
         try:
             blob = LC.b32d(raw)
-        except ValueError as e:
-            self._set_status(f'内容格式不对：{e}', 'err')
+        except ValueError:
+            self._set_status(
+                '内容格式不对：请确认整段授权码都复制到了，并且没有多出空格或换行。', 'err')
             return
         if len(blob) != LC.BLOB_LEN:
             self._set_status(
@@ -423,20 +440,40 @@ class ActivationDialog(QWidget):
         # ---- 离线验签（唯一路径）----
         self._btn_ok.setEnabled(False)
         self._btn_ok.setText('校验中…')
+        self._btn_skip.setEnabled(False)
+
+        def worker():
+            try:
+                st = _lic.try_activate(raw)
+                payload = {'ok': True, 'st': st}
+            except Exception as e:
+                # 异常细节只进日志, 用户侧固定文案
+                print(f'[Activation] 激活异常: {type(e).__name__}: {e}')
+                payload = {'ok': False}
+            try:
+                self._activate_finished.emit(payload)
+            except Exception:
+                pass
+
         try:
-            st = L.try_activate(raw)
+            threading.Thread(target=worker, daemon=True, name='lic-activate').start()
         except Exception as e:
-            self._set_status(f'激活过程出错：{type(e).__name__}: {e}', 'err')
+            print(f'[Activation] 激活线程启动失败: {type(e).__name__}: {e}')
+            self._set_status('激活服务暂时不可用，请稍后重试。', 'err')
             self._reset_ok_btn()
-            return
-        self._finish_activate_result(st)
 
     # v4.9.3: 删除 _start_online_activate() 与 _on_online_result() ——
     # 它们是"卡密 → 联网换授权码"的实现（内含一个 QThread 子类）。
     # 在线服务端已整体移除，这两条路径永远不会被调用。
 
-    def _finish_activate_result(self, st):
-        """两条路径共用的收尾：成功则提示+发信号，失败则原地可重试。"""
+    @ui_slot
+    def _finish_activate_result(self, payload):
+        """激活线程共用收尾：成功则提示+发信号，失败则原地可重试。"""
+        st = (payload or {}).get('st')
+        if st is None:
+            self._set_status('激活过程出错，请稍后重试。', 'err')
+            self._reset_ok_btn()
+            return
         if st.activated:
             self._done = True
             self._set_status(
@@ -446,7 +483,6 @@ class ActivationDialog(QWidget):
             self._btn_ok.setText('已完成')
             self.activated.emit()
             # 稍等一下再关，让用户看清"激活成功"（立即关会像是没反应）
-            from PyQt5.QtCore import QTimer
             QTimer.singleShot(700, self._finish_close)
             return
         self._set_status(st.reason, 'err')
@@ -457,6 +493,7 @@ class ActivationDialog(QWidget):
     def _reset_ok_btn(self):
         self._btn_ok.setEnabled(True)
         self._btn_ok.setText('立即激活')
+        self._btn_skip.setEnabled(True)
 
     @ui_slot
     def _skip(self):
@@ -470,6 +507,13 @@ class ActivationDialog(QWidget):
     def closeEvent(self, e):
         # 关窗即视为"未激活离开"；已激活时 activated 信号早已发出，
         # 调用方不该依赖 closeEvent 来判断结果（见更早那段注释的取舍 3）。
+        # v4.4.0 修复(P3): 关闭时清掉可能残留的机器码剪贴板(见 _copy_machine_id)。
+        try:
+            cb = QGuiApplication.clipboard()
+            if cb is not None and cb.text().replace('-', '') == self._mid_edit.text().replace('-', ''):
+                cb.clear()
+        except Exception:
+            pass
         e.accept()
 
     def keyPressEvent(self, e):
@@ -503,29 +547,12 @@ class ActivationDialog(QWidget):
 
 # ---------------------------------------------------------------- 小组件
 
-def _hline():
-    line = QFrame()
-    line.setFixedHeight(1)
-    line.setStyleSheet('background:rgba(99,102,241,0.22);border:none;')
-    return line
-
-
+# v4.4.0 修复(P2): `_hline` / `_GlassPanel` 与 agreement_dialog 完全重复,
+# 已抽到 ui/window_base.py 的 glass_hline() / GlassPanel, 两文件复用。
+# 这里只保留 activation_dialog 特有的 section 标题。
 def _section_label(text):
     lb = QLabel(text)
     lb.setStyleSheet(
         f"font-size:{Glass.FONT_SIZE_SM};color:{Glass.TEXT_SECONDARY};"
         f"background:transparent;font-weight:600;")
     return lb
-
-
-class _GlassPanel(QWidget):
-    """玻璃背景容器（与主窗/须知弹窗一致的半透明着色 + 顶部柔光）"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        paint_window_backdrop(p, self.width(), self.height())
-        p.end()

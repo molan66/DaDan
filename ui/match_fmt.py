@@ -18,6 +18,10 @@ GAME_MODE_CN = {
     'CLASSIC': '经典', 'ARAM': '大乱斗', 'URF': '无限火力',
     'NEXUSBLITZ': '极限闪击', 'ONEFORALL': '克隆大作战',
     'TUTORIAL': '新手教程', 'PRACTICETOOL': '训练模式',
+    # v4.9.x: EOG 即时战绩路径没有 queueId, mode 直接是 gameMode 英文串。
+    # KIWI=海克斯大乱斗(2400)、CHERRY=斗魂竞技场(1700) —— 与 QUEUE_CN 对齐,
+    # 否则 EOG 秒出的那一行会显示成英文(用户实测反馈)。
+    'KIWI': '海克斯大乱斗', 'CHERRY': '斗魂竞技场',
 }
 
 LANE_CN = {'TOP': '上单', 'JUNGLE': '打野', 'MIDDLE': '中单',
@@ -53,22 +57,28 @@ def game_mode_text(game):
     if t:
         return t
     gm = str(game.get('mode') or '').upper()
-    return GAME_MODE_CN.get(gm, gm or '未知模式')
+    return GAME_MODE_CN.get(gm, '未知模式')
 
 
 def dur_text(sec):
-    """对局时长 → '23分12秒'(缺失返回空串)"""
+    """对局时长 → '23分12秒'(缺失返回空串); 超 1 小时 → '1小时20分03秒'"""
     try:
         sec = int(sec or 0)
     except (TypeError, ValueError):
         sec = 0
     if sec <= 0:
         return ''
+    # v4.4.0 修复(P3): 原 `{sec//60}分` 在 7200s 时显示 '120分00秒';
+    # >=1 小时补小时段, 时长表达更符合国服习惯
+    if sec >= 3600:
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        return f'{h}小时{m}分{s:02d}秒'
     return f'{sec // 60}分{sec % 60:02d}秒'
 
 
 def time_text(ms):
-    """开局时间戳(ms) → '今天 21:03' / '昨天 20:41' / '09-12 19:22'"""
+    """开局时间戳(ms) → '今天 21:03' / '昨天 20:41' / '09-12 19:22' / '2025-12-31 19:22'"""
     try:
         ms = int(ms or 0)
     except (TypeError, ValueError):
@@ -85,6 +95,9 @@ def time_text(ms):
         return f'今天 {dt:%H:%M}'
     if delta_days == 1:
         return f'昨天 {dt:%H:%M}'
+    # v4.10.x: 跨年显示年份 —— 今年只看 MM-DD, 跨年补 YYYY 防止误读
+    if dt.year != now.year:
+        return f'{dt:%Y-%m-%d %H:%M}'
     return f'{dt:%m-%d %H:%M}'
 
 
@@ -130,6 +143,25 @@ def wan_text(n, dash='—'):
         return dash
     if n <= 0:
         return dash
+    if n >= 10000:
+        return f'{n / 10000:.1f}万'
+    return str(n)
+
+
+def wan_compact(n, dash='—'):
+    """战绩列表指标列专用紧凑格式: ≥100万 时取整('123.5万'→'123万')。
+
+    v4.10.x: 列表行输出列定宽 64px, '123.5万' 实测 72px 放不下会裁切;
+    百万级场景取整损失的信息无意义(本就是概览), 换取必不溢出。
+    """
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return dash
+    if n <= 0:
+        return dash
+    if n >= 1000000:
+        return f'{n // 10000}万'
     if n >= 10000:
         return f'{n / 10000:.1f}万'
     return str(n)

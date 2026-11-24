@@ -50,6 +50,12 @@ from typing import Optional, Dict, Callable, Tuple, List
 # 复用它做窗口置顶(三机制降级 + 前台锁绕过), 让登录器出现在用户眼前。
 # v4.8.0: 不再复用 click_at —— 本模块已无任何点击。
 from .clicker import bring_to_front
+# v4.4.x(P3): 盘符枚举与 connector._get_drives 语义**曾**相同, 但 connector 那份
+# 仍用 os.path.exists 逐盘探测(对断连网络盘会阻塞), 本文件 _list_drives 已按
+# P1 改用 GetLogicalDrives/GetDriveTypeW 跳过 REMOTE —— 两者不再等价, 故不 import
+# 复用(复用会把慢盘阻塞缺陷带回来)。窗口尺寸阈值统一从 constants 导入。
+from .connector import make_session
+from .constants import MIN_WINDOW_W, MIN_WINDOW_H
 
 # v4.4.6: LOL 安装根下的登录器候选(按优先级)。
 # ⚠️ 明确**不用** WeGameLauncher\launcher.exe —— 它启动后会拉起 wegame.exe 主程序,
@@ -70,8 +76,9 @@ _LAUNCHER_PROC_NAMES = ('client.exe', 'tcls_core.exe')
 _LOL_PATH_HINTS = ('wegameapps', '英雄联盟', 'leagueclient', '\\tcls\\', '\\launcher\\')
 
 # 登录器窗口最小尺寸(小于此视为登录小窗/隐形窗/WebView 子窗, 跳过)
-_MIN_W = 300
-_MIN_H = 200
+# v4.4.x(P3): 与 clicker 的客户端主窗口识别阈值同源, 统一从 constants 导入
+_MIN_W = MIN_WINDOW_W
+_MIN_H = MIN_WINDOW_H
 
 # v4.4.10: 从"点一键启动"到"开始点第一个按钮"的最小等待(秒)。
 # 用户实测: 登录器窗口虽然很快就出现, 但客户端启动/资源加载还没完成, 界面上
@@ -200,12 +207,36 @@ def is_launcher_running() -> bool:
 
 # ==================== 定位登录器 exe ====================
 def _list_drives() -> List[str]:
-    """枚举所有存在的盘符。"""
-    drives = []
-    for letter in 'CDEFGHIJKLMNOPQRSTUVWXYZ':
-        d = f'{letter}:\\'
-        if os.path.exists(d):
-            drives.append(d)
+    """枚举所有存在的盘符。
+
+    v4.4.x(P1): 原实现用 os.path.exists() 逐盘探测 —— 对断连的网络映射盘
+    (Z: 之类) 该调用会阻塞数十秒, 把"点启动"卡死。改用 GetLogicalDrives +
+    GetDriveTypeW: 位图枚举逻辑盘 + 类型过滤, 跳过 DRIVE_REMOTE(网络盘),
+    保持返回结构不变(各盘根目录字符串列表, 仅本地盘)。
+    """
+    drives: List[str] = []
+    try:
+        bitmap = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        bitmap = 0
+    if not bitmap:
+        # GetLogicalDrives 失败(极罕见)回退到旧的 os.path.exists 探测
+        for letter in 'CDEFGHIJKLMNOPQRSTUVWXYZ':
+            d = f'{letter}:\\'
+            if os.path.exists(d):
+                drives.append(d)
+        return drives
+    DRIVE_REMOTE = 4
+    for i in range(26):
+        if not (bitmap >> i) & 1:
+            continue
+        d = f'{chr(65 + i)}:\\'
+        try:
+            if ctypes.windll.kernel32.GetDriveTypeW(d) == DRIVE_REMOTE:
+                continue   # 跳过断连/慢速的网络盘
+        except Exception:
+            pass
+        drives.append(d)
     return drives
 
 
@@ -286,6 +317,8 @@ _shell32.ShellExecuteW.restype = ctypes.c_size_t
 # 强杀客户端是有副作用的(可能残留 lockfile 让下次连接读到死端口), 所以顺序不能反。
 _LOL_CLIENT_PROCS = ('LeagueClientUx.exe', 'LeagueClient.exe',
                      'tcls_core.exe', 'client.exe', 'launcher.exe')
+# v4.10.x: 小写副本, _taskkill_lol 的进程名匹配用(避免每次 process_iter 都重建小写集合)
+_LOL_CLIENT_PROCS_LOWER = tuple(x.lower() for x in _LOL_CLIENT_PROCS)
 
 
 def quit_client(connector=None) -> Tuple[bool, str]:
@@ -341,14 +374,12 @@ def quit_client(connector=None) -> Tuple[bool, str]:
 
 
 def requests_session_for_quit():
-    """关闭 LOL 用的最小 requests.Session(仅本机回环, 不读系统代理)。"""
-    import requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    s = requests.Session()
-    s.verify = False
-    s.trust_env = False
-    return s
+    """关闭 LOL 用的最小 requests.Session(仅本机回环, 不读系统代理)。
+
+    v4.4.x(P3): 与 connector.make_session(verify=False) 语义完全一致
+    (verify=False + trust_env=False), 复用工厂避免两份配置漂移。
+    """
+    return make_session(verify=False)
 
 
 def _any_lol_client_running() -> bool:
@@ -379,12 +410,54 @@ def _any_lol_client_running() -> bool:
 
 
 def _taskkill_lol() -> bool:
-    """taskkill 强杀 LOL 相关进程。返回是否执行过(不代表都成功)。"""
+    """taskkill 强杀 LOL 相关进程。返回是否执行过(不代表都成功)。
+
+    v4.10.x(P0 修复): 原实现 `taskkill /F /IM client.exe` / `/IM launcher.exe` 按
+    **镜像名**强杀, 而 client.exe / launcher.exe 是极常见的进程名, 会误杀系统内
+    其它无关程序(与本模块"必须校验 exe 路径"的既定纪律自相矛盾)。改为先枚举进程、
+    按 exe 路径过滤出 PID, 再按 PID 强杀; 拿不到路径的通用名进程一律不杀。
+    """
     import subprocess
+
+    def _is_lol_proc(name: str, exe: str) -> bool:
+        n = (name or '').lower()
+        if n not in _LOL_CLIENT_PROCS_LOWER:
+            return False
+        # 名字足够独特, 直接认; client.exe / launcher.exe / tcls_core.exe 太通用,
+        # 必须校验 exe 路径落在 LOL 安装目录。
+        if n in ('leagueclientux.exe', 'leagueclient.exe'):
+            return True
+        if not exe:
+            return False
+        return any(h in exe for h in _LOL_PATH_HINTS)
+
     ok_any = False
-    for name in _LOL_CLIENT_PROCS:
+    pids = []
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name']):
+            try:
+                name = proc.info.get('name') or ''
+            except Exception:
+                continue
+            if (name or '').lower() not in _LOL_CLIENT_PROCS_LOWER:
+                continue
+            exe = ''
+            try:
+                exe = (proc.exe() or '').lower()
+            except Exception:
+                exe = ''
+            if _is_lol_proc(name, exe):
+                try:
+                    pids.append(int(proc.pid))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    for pid in pids:
         try:
-            r = subprocess.run(['taskkill', '/F', '/IM', name],
+            r = subprocess.run(['taskkill', '/F', '/PID', str(pid)],
                                capture_output=True, timeout=10,
                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             if r.returncode == 0:

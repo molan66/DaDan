@@ -6,7 +6,6 @@ import threading
 import requests
 import urllib3
 from typing import Optional, Any, Dict, List
-from urllib3.exceptions import InsecureRequestWarning
 
 # v4.4.0 修复（P2）：session 配置与 connector.py 共用同一工厂，避免两份配置漂移。
 # 另：constants.py 只放常量、无第三方依赖，import 方向 connector → constants 单向，无环。
@@ -18,14 +17,13 @@ from .constants import (
     PICK_TRY_MAX, PICK_TRY_DEADLINE_S,
 )
 
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
 # v4.4.0 修复（P0-8）：**非 loopback** 的第三方 CDN 请求必须校验证书，且不能复用
 # LCU 那个 verify=False 的 session。一个模块级懒加载 session 装两者：
 #   - verify=True（默认）：走正常 CA 校验；
 #   - trust_env=False：沿用 v20 结论，禁止系统代理劫持（否则大陆直连 CDN 会被
 #     代理拖到超时）。
-# 历史事故提醒：api.py:9 的 disable_warnings 只为 LCU 自签证书保留，不要删。
+# 警告消除统一收敛到 connector.py（import 即执行）—— 本文件不再重复调用
+# urllib3.disable_warnings，避免两处漂移（P3 收尾）。
 _CDN_SESSION: Optional[requests.Session] = None
 _CDN_LOCK = threading.Lock()
 
@@ -250,9 +248,10 @@ class LCUAPI:
             hdr = {'Accept': 'application/json',
                    'Content-Type': 'application/json',
                    'Accept-Encoding': 'identity'}
-            r2 = self._s.request(method, f'{self._c.base_url}{ep}',
-                                 auth=self._c.auth, stream=True,
-                                 headers=hdr, timeout=TIMEOUT_API)
+            r2 = self._session_for(method).request(
+                method, f'{self._c.base_url}{ep}',
+                auth=self._c.auth, stream=True,
+                headers=hdr, timeout=TIMEOUT_API)
             # v4.4.2(P1-8): 重发后先校验状态码 —— 原实现不校验, 4xx/5xx 的响应体
             # 也会被当正常 JSON 解析, 错误被错报成"解析失败"。非 2xx 直接走错误详情。
             if not (200 <= r2.status_code < 300):
@@ -393,6 +392,8 @@ class LCUAPI:
         if not isinstance(loot, list):
             return out
         for item in loot:
+            if not isinstance(item, dict):
+                continue
             if item.get('type') != 'CURRENCY':
                 continue
             ln = item.get('lootName') or ''
@@ -460,6 +461,20 @@ class LCUAPI:
             f'/lol-match-history/v1/products/lol/{puuid}/matches'
             f'?begIndex=0&endIndex={int(count)}')
 
+    def get_eog_stats_block(self) -> Optional[Dict]:
+        """对局结束统计块(结算页本地即时数据, 不走 match-history 服务端入库)。
+
+        v4.9.x: 解决"刚打完战绩页要等几分钟才显示" —— match-history 列表端点
+        依赖服务端入库(实测延迟 1~3 分钟), 而本端点在 PreEndOfGame/EndOfGame
+        阶段就由客户端本地生成, 结算即出。无对局/尚未生成时 LCU 返回 404
+        "No end of game stats available"(业务答复), 归入 _checked 的 4xx
+        分支 raise Exception —— 这里捕获并返回 None, 调用方按"暂不可用"降级。
+        """
+        try:
+            return self.get('/lol-end-of-game/v1/eog-stats-block')
+        except Exception:
+            return None
+
     def download_profile_icon(self, icon_id: int) -> Optional[bytes]:
         """下载召唤师头像 bytes（首页账号卡用）。
 
@@ -475,7 +490,7 @@ class LCUAPI:
                 try:
                     url = (f'{self._c.base_url}/lol-game-data/assets/v1/'
                            f'profileicons/{int(icon_id)}{ext}')
-                    r = self._s.get(url, auth=self._c.auth, timeout=5)
+                    r = self._s.get(url, auth=self._c.auth, timeout=TIMEOUT_ASSET)
                     if r.status_code == 200 and len(r.content) > 200:
                         return r.content
                 except Exception:
@@ -565,6 +580,17 @@ class LCUAPI:
         except Exception:
             return None
 
+    @staticmethod
+    def _champ_select_prefix(s) -> str:
+        """按会话的 isLegacyChampSelect 返回动作 PATCH 的前缀。
+
+        v4.4.x(P3): isLegacyChampSelect 判定原先在 pick_champion 与 bench_swap
+        各写一份、语义完全相同, 改一处容易漏另一处。抽成唯一判定点。
+        """
+        if s is not None and s.get('isLegacyChampSelect', True) is False:
+            return '/lol-lobby-team-builder/champ-select/v1/session'
+        return '/lol-champ-select/v1/session'
+
     def pick_champion(self, candidates: list) -> object:
         """v30 自动选英雄：按偏好顺序逐个试锁(试错法), 返回锁定的 championId 或 None。
 
@@ -591,10 +617,7 @@ class LCUAPI:
                 return None
             local_cell = s.get('localPlayerCellId')
             actions = s.get('actions') or []
-            is_legacy = s.get('isLegacyChampSelect', True) is not False
-            prefix = ('/lol-champ-select/v1/session'
-                      if is_legacy else
-                      '/lol-lobby-team-builder/champ-select/v1/session')
+            prefix = self._champ_select_prefix(s)
 
             # 找我的第一个未完成的 pick action
             target_id = None
@@ -632,17 +655,28 @@ class LCUAPI:
 
             _deadline = _t.monotonic() + PICK_TRY_DEADLINE_S
             _tried = 0
+
+            def _late():
+                """总时限是否已到(每次 _req 前 / sleep 后都要校验)。"""
+                return _t.monotonic() > _deadline
+
+            def _timeout_log():
+                print('[选人] v30 达到总时限, 本轮放弃(等下轮)')
+
             for cid in candidates:
                 if not cid:
                     continue
                 if _tried >= PICK_TRY_MAX:
                     print(f'[选人] v30 已达候选上限 {PICK_TRY_MAX}, 本轮放弃')
                     break
-                if _t.monotonic() > _deadline:
-                    print('[选人] v30 达到总时限, 本轮放弃(等下轮)')
+                if _late():
+                    _timeout_log()
                     break
                 _tried += 1
                 # 载荷A: 单步 PATCH {championId, completed:True}
+                if _late():
+                    _timeout_log()
+                    break
                 try:
                     r1 = self._req('PATCH', f'{prefix}/actions/{target_id}',
                                    data=_json.dumps({'championId': cid,
@@ -658,6 +692,9 @@ class LCUAPI:
                           f'(该候选未接受), 试下一个')
                     continue
                 _t.sleep(0.08)
+                if _late():
+                    _timeout_log()
+                    break
                 a = _read_my_action()
                 if _locked(a, cid):
                     print(f'[选人] v30 ✅ 自动锁 {cid}: 单步 PATCH HTTP '
@@ -665,10 +702,16 @@ class LCUAPI:
                     return cid
                 if a and a.get('championId') == cid and not a.get('completed'):
                     # 预选被接受但未 done → 补 POST complete
+                    if _late():
+                        _timeout_log()
+                        break
                     try:
                         r2 = self._req('POST',
                                        f'{prefix}/actions/{target_id}/complete')
                         _t.sleep(0.08)
+                        if _late():
+                            _timeout_log()
+                            break
                         a = _read_my_action()
                         if _locked(a, cid):
                             print(f'[选人] v30 ✅ 自动锁 {cid}: 单步PATCH+complete '
@@ -678,6 +721,9 @@ class LCUAPI:
                         print(f'[选人] v30 cid={cid} complete 异常: '
                               f'{type(e).__name__}: {e}')
                 # 载荷B: 两步 PATCH {championId} + POST complete
+                if _late():
+                    _timeout_log()
+                    break
                 try:
                     r1 = self._req('PATCH', f'{prefix}/actions/{target_id}',
                                    data=_json.dumps({'championId': cid}))
@@ -687,16 +733,25 @@ class LCUAPI:
                     continue
                 if 200 <= r1.status_code < 300:
                     _t.sleep(0.05)
+                    if _late():
+                        _timeout_log()
+                        break
                     a = _read_my_action()
                     if _locked(a, cid):
                         print(f'[选人] v30 ✅ 自动锁 {cid}: 两步 PATCH HTTP '
                               f'{r1.status_code}, 已 done')
                         return cid
                     if a and a.get('championId') == cid and not a.get('completed'):
+                        if _late():
+                            _timeout_log()
+                            break
                         try:
                             r2 = self._req('POST',
                                            f'{prefix}/actions/{target_id}/complete')
                             _t.sleep(0.08)
+                            if _late():
+                                _timeout_log()
+                                break
                             a = _read_my_action()
                             if _locked(a, cid):
                                 print(f'[选人] v30 ✅ 自动锁 {cid}: 两步PATCH+complete '
@@ -730,7 +785,8 @@ class LCUAPI:
         try:
             s = self.get_champ_select_session()
             if s is not None:
-                is_legacy = s.get('isLegacyChampSelect', True) is not False
+                is_legacy = self._champ_select_prefix(s) == \
+                    '/lol-champ-select/v1/session'
         except Exception:
             pass
 
@@ -1039,14 +1095,18 @@ class LCUAPI:
         try:
             from core.script_core import ARAM_QUEUE_IDS as _HAND
             from_hand = set(int(x) for x in _HAND)
-        except Exception:
-            pass
+        except Exception as e:
+            # v4.4.x(P2): import 失败不再静默 —— 手写兜底拿不到时必须留日志,
+            # 否则"客户端未就绪 + 兜底 import 失败"会让点卡兜底整个消失且无痕。
+            print(f'[点卡] 手写兜底队列 import 失败: {type(e).__name__}: {e}')
         if not refresh and LCUAPI._ARAM_QUEUE_IDS_LIVE is not None:
             return set(LCUAPI._ARAM_QUEUE_IDS_LIVE) | from_hand
         live = set()
         try:
             raw = self.get('/lol-game-data/assets/v1/queues.json') or []
             for q in raw:
+                if not isinstance(q, dict):
+                    continue
                 try:
                     if (q.get('gameSelectModeGroup') == 'kARAM'
                             and q.get('pickMode') == 'AllRandomPickStrategy'):
@@ -1066,9 +1126,14 @@ class LCUAPI:
         else:
             # 空结果不缓存 —— 客户端未就绪时表可能为空, 下次要能重试
             print('[点卡] 队列表为空(客户端未就绪?), 本次用手写兜底')
-        return live | from_hand
+        result = live | from_hand
+        if not result:
+            # 绝不静默返回空集: 客户端没就绪 + 手写兜底也拿不到时, 点卡兜底会
+            # 整体失效, 必须留一行告警。
+            print('[点卡] 队列白名单为空(客户端未就绪且手写兜底不可用), 点卡兜底将失效')
+        return result
 
-    def download_lcu_asset(self, path: str, timeout=(2.0, 6.0)) -> Optional[bytes]:
+    def download_lcu_asset(self, path: str, timeout=TIMEOUT_ASSET) -> Optional[bytes]:
         """按 LCU 本地资源路径取图(技能/海克斯图标等)。
 
         path 来自各类表的 iconPath 字段, 形如
@@ -1091,7 +1156,7 @@ class LCUAPI:
         try:
             if self._c.is_connected:
                 url = f'{self._c.base_url}/lol-game-data/assets/v1/champion-icons/{champion_id}.png'
-                r = self._s.get(url, auth=self._c.auth, timeout=5)
+                r = self._s.get(url, auth=self._c.auth, timeout=TIMEOUT_ASSET)
                 if r.status_code == 200:
                     return r.content
         except Exception:

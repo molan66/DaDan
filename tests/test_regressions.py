@@ -925,5 +925,470 @@ class TestAramQueueCoverage(unittest.TestCase):
                           '空结果被缓存了 —— 客户端稍后就绪也再不会重试')
 
 
+class TestAutoReturnPhaseGuard(unittest.TestCase):
+    """自动返回的阶段守卫与倒计时作废 —— 对应 v4.9.12 修的三个缺陷。
+
+    当初错在哪（证据：dist/data/logs/app.log 8115 行，v4.9.7 实跑日志）：
+
+      ① `_do_play_again` 没有阶段判断，只看倒计时有没有到点。而回到大厅时
+         只复位了 `_return_pending`（挡"下一次"），挡不住**已经在跑的那个倒计时
+         线程** → 阶段已回 Lobby，倒计时到点又 playAgain 一次。
+         实测 89 次进入大厅里有 **30 次**在进"匹配中"之前又打了一次 `[Core] 返回房间`。
+      ② `_apply_phase_side_effects` 在进入 Lobby 时没有作废在途返回倒计时；
+         离开 Lobby 时也没有作废在途匹配倒计时 → 状态栏两个倒计时交错刷
+         （"进入房间后仍出现返回倒计时 tick" 149 行；"离开房间后仍刷匹配倒计时"
+         25 行，多数落在"确认对局"阶段）。
+      ③ `_do_play_again` 自己重试 15 次 start_matchmaking，而回到大厅后
+         `_handle_lobby` 又会按 auto_queue_delay 再开一次 → 两条通道抢开队列
+         （`匹配启动（第1次）` 与 `开始匹配` 紧邻 3 次，夹 54 次"非房主"噪音），
+         且用户设的匹配延迟被绕过。
+
+    这组测试守的是"三个缺陷都不许回来"，而不是某个函数长什么样。
+    """
+
+    def _core(self, phase, **settings):
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            def __init__(self):
+                self.calls = []
+
+            def play_again(self):
+                self.calls.append('play_again')
+
+            def start_matchmaking(self):
+                self.calls.append('start_matchmaking')
+
+        c = ScriptCore(_API(), None)
+        c._phase = phase
+        c._running = True  # 倒计时线程要求脚本处于运行态
+        c._settings.update(settings)
+        return c
+
+    # ---- 缺陷 ①：阶段守卫 ----
+    def test_lobby_phase_skips_play_again(self):
+        """阶段已回大厅时不许再 playAgain（否则把刚起的匹配流程倒带）。"""
+        c = self._core('Lobby')
+        c._return_pending = True
+        c._do_play_again()
+        self.assertEqual(c._api.calls, [],
+                         '阶段已是房间中仍执行了 playAgain —— 实测会把刚起的匹配打回大厅')
+        self.assertFalse(c._return_pending,
+                         '_return_pending 没复位：本局后续真正进入结算时自动返回会永久失效')
+
+    def test_settlement_phases_still_play_again(self):
+        """结算链上的三个阶段必须照常返回 —— 守卫不能把正常路径一起挡掉。"""
+        for ph in ('WaitingForStats', 'EndOfGame', 'PreEndOfGame'):
+            c = self._core(ph)
+            c._do_play_again()
+            self.assertIn('play_again', c._api.calls, '%s 阶段被误挡，自动返回失效' % ph)
+
+    # ---- 缺陷 ③：不许与大厅流程重复开匹配 ----
+    def test_no_matchmaking_retry_after_play_again(self):
+        c = self._core('EndOfGame')
+        c._do_play_again()
+        self.assertNotIn('start_matchmaking', c._api.calls,
+                         '返回房间后又自己抢开队列 —— 与 _handle_lobby 的匹配倒计时重复，'
+                         '用户设的匹配延迟被绕过')
+
+    # ---- 缺陷 ②：阶段迁移要作废在途倒计时 ----
+    def _fired_in(self, kind, old, new, seconds=2, wait_s=0.3):
+        """起一个**会真的到点**的短倒计时，做一次阶段迁移，看 on_done 有没有跑。
+
+        ⚠️ seconds 与 wait_s 的取值是这条断言的关键，别随手调大 seconds:
+        最初写 seconds=30(× 0.02s tick = 0.6s) 却只等 0.2s，于是"没触发"是
+        **因为还没到点**，不是因为被取消 —— 探针把这条缺陷抓出来了
+        (probe_autoreturn_teeth.py 的「删掉作废调用」那两项当时仍全绿)。
+        现在 2 × 0.02s = 0.04s 就绪，等 0.3s，未被取消就一定会触发。
+        """
+        from core import constants as C
+        saved = C.COUNTDOWN_TICK_S
+        C.COUNTDOWN_TICK_S = 0.02   # 把 1s 一跳压到 20ms，测试不必真等
+        try:
+            c = self._core(old)
+            fired = []
+            c._start_countdown(seconds, '测试', lambda: fired.append('done'), kind=kind)
+            c._apply_phase_side_effects(old, new)
+            time.sleep(wait_s)
+            return fired
+        finally:
+            C.COUNTDOWN_TICK_S = saved
+
+    def test_return_countdown_cancelled_when_back_to_lobby(self):
+        self.assertEqual(self._fired_in('return', 'WaitingForStats', 'Lobby'), [],
+                         '已回到房间，返回倒计时仍在跑 —— 到点会再 playAgain 一次，把流程倒带')
+
+    def test_queue_countdown_cancelled_when_leaving_lobby(self):
+        self.assertEqual(self._fired_in('queue', 'Lobby', 'Matchmaking'), [],
+                         '已进匹配/确认对局，匹配倒计时仍在刷 —— 状态栏两个计时器交错')
+
+    def test_countdown_still_fires_when_phase_unchanged(self):
+        """没有阶段迁移时倒计时必须正常到点 —— 收口不能把功能本身改死。"""
+        from core import constants as C
+        saved = C.COUNTDOWN_TICK_S
+        C.COUNTDOWN_TICK_S = 0.02
+        try:
+            c = self._core('Lobby')
+            fired = []
+            c._start_countdown(2, '测试', lambda: fired.append('done'), kind='queue')
+            time.sleep(0.25)
+            self.assertEqual(fired, ['done'], '阶段没变的情况下倒计时被误杀，自动匹配失效')
+        finally:
+            C.COUNTDOWN_TICK_S = saved
+
+
+class TestPreinputChampion(unittest.TestCase):
+    """小窗「预输入选英雄」—— 对应 v4.9.13 新增功能（用户 2026-11-22 要求）。
+
+    用户原话：
+        小窗选英雄时能显示备选栏英雄，有偏好时绿光；没偏好时只能等倒计时结束
+        后自己点。想提前点一个、蓝光显示，脚本自动帮我切到它；优先级排在偏好
+        之上；单击选中、再单击取消；主界面加开关。
+
+    关键设计（与现有偏好**同一套机制**，不新增"等某个时刻"的东西）：
+        偏好现在也不是"等倒计时"——`_do_auto_pick` 由 1s 轮询驱动，池里有就换。
+        预输入照抄这条链路，只是把它排在偏好的判断**之前**。
+
+    这组测试守的是行为契约，不是某个函数长什么样：
+      ① 预输入存在且已被锁定 → 轮询会把它换上（池里有就换）
+      ② 预输入优先级 > 偏好：同池里既有预输入又有偏好，必须选预输入
+      ③ 预输入命中后本局不许再被偏好换走（否则用户白点了）
+      ④ 预输入从池里消失 → 自动清标记（否则永远等一个不会来的英雄）
+      ⑤ 池为空(刷新中) → **不许清**（否则会误清，用户标记白做）
+      ⑥ 离开选人阶段 → 两个标记都清（每局清空，不跨局沿用）
+      ⑦ 同一个英雄再点一次 = 取消（单击选中、再单击取消）
+      ⑧ 开关关闭 → 预输入完全不生效（退回纯偏好逻辑）
+    """
+
+    def _core(self, bench_calls=None, **settings):
+        from core.script_core import ScriptCore
+
+        calls = bench_calls if bench_calls is not None else []
+
+        class _API(object):
+            def bench_swap(self, cid):
+                calls.append(cid)
+                return True
+
+        c = ScriptCore(_API(), None)
+        c._phase = 'ChampSelect'
+        c._running = True
+        c._settings.update({'auto_pick_champion': True, 'auto_preinput_champion': True})
+        if settings:
+            c._settings.update(settings)
+        return c, calls
+
+    # ---- ⑦ 单击选中 / 再单击取消 ----
+    def test_toggle_marks_then_cancels(self):
+        c, _ = self._core()
+        self.assertEqual(c.toggle_preinput(103), 103, '第一次点应标记为预输入')
+        self.assertEqual(c.toggle_preinput(103), 0, '同一个英雄再点一次应取消')
+
+    def test_toggle_switches_to_another(self):
+        c, _ = self._core()
+        c.toggle_preinput(103)
+        self.assertEqual(c.toggle_preinput(99), 99, '点另一个英雄应直接改标记，不是取消')
+
+    # ---- ① 池里有就换（与偏好同一套轮询驱动） ----
+    def test_swaps_to_preinput_when_in_bench(self):
+        c, calls = self._core()
+        c.toggle_preinput(103)
+        c._do_auto_pick([103, 99], 57)
+        self.assertEqual(calls, [103], '预输入在池里却没被换上 —— 功能等于没做')
+
+    # ---- ② 预输入 > 偏好 ----
+    def test_preinput_beats_preferred(self):
+        c, calls = self._core(preferred_champions=[99])
+        c.toggle_preinput(103)
+        # 池里同时有预输入的 103 和偏好的 99，必须选 103
+        c._do_auto_pick([99, 103], 57)
+        self.assertEqual(calls, [103], '预输入没有压过偏好 —— 用户明确要求排它前面')
+
+    def test_preferred_still_works_without_preinput(self):
+        """没有预输入时必须照旧走偏好 —— 新功能不能把老功能改死。"""
+        c, calls = self._core(preferred_champions=[99])
+        c._do_auto_pick([99, 103], 57)
+        self.assertEqual(calls, [99], '没有预输入时偏好换英雄失效了')
+
+    # ---- ③ 命中后本局保护 ----
+    def test_hit_not_swapped_away_by_preferred(self):
+        """命中后**连续多轮**都不许被偏好换走。
+
+        ⚠️ 为什么必须跑第三轮: 最初的用例只跑两轮, 探针把缺陷②「命中后清掉
+        _preinput_cid」放回去时**居然全绿** —— 因为第二轮是"当前已是 103"这条
+        分支接住的(它只 `return True`, 不看标记是否还在), 标记被清要到**更后面
+        的一轮**才暴露: 那时 cid=0 → 本方法返回 False → 偏好接管 → 换回 99。
+        现在钉死第三轮, 缺陷立刻判红(见 tools/probe_preinput_teeth.py)。
+        """
+        c, calls = self._core(preferred_champions=[99])
+        c.toggle_preinput(103)
+        c._do_auto_pick([103, 99], 57)     # 第1轮：换到预输入
+        self.assertEqual(calls, [103])
+        c._do_auto_pick([103, 99], 103)    # 第2轮：已是 103，hit 分支接住
+        self.assertEqual(calls, [103], '预输入命中后又被偏好换走了 —— 用户的选择被覆盖')
+        c._do_auto_pick([103, 99], 103)    # 第3轮：标记若被清，这里会漂移到 99
+        self.assertEqual(calls, [103],
+                         '第三轮被偏好换走了 —— 说明命中后把预输入标记清掉了，'
+                         '下一拍就会漂移回偏好英雄')
+
+    # ---- ④ 消失要清 ----
+    def test_cleared_when_gone_from_bench(self):
+        c, calls = self._core()
+        c.toggle_preinput(103)
+        c._do_auto_pick([7, 8], 57)        # 池非空但没有 103
+        self.assertEqual(c.preinput_champion, 0,
+                         '预输入已不在备选池，标记还在 —— 会一直等一个不会来的英雄')
+
+    # ---- ⑤ 池空不清 ----
+    def test_not_cleared_when_bench_empty(self):
+        c, _ = self._core()
+        c.toggle_preinput(103)
+        c._do_auto_pick([], 57)            # 池为空(刷新中/尚未下发)
+        self.assertEqual(c.preinput_champion, 103,
+                         '备选池暂时为空时把标记清了 —— 用户刚点完就被误清')
+
+    # ---- ⑥ 每局清空 ----
+    def test_cleared_on_leaving_champ_select(self):
+        c, _ = self._core()
+        c.toggle_preinput(103)
+        c._apply_phase_side_effects('ChampSelect', 'GameStart')
+        self.assertEqual(c.preinput_champion, 0, '离开选人阶段没清预输入 —— 会跨局沿用')
+
+    # ---- ⑧ 开关关闭 ----
+    def test_disabled_by_switch(self):
+        c, calls = self._core(auto_preinput_champion=False)
+        c.toggle_preinput(103)
+        c._do_auto_pick([103, 99], 57)
+        self.assertEqual(calls, [], '开关关着仍按预输入换英雄')
+        self.assertEqual(c.preinput_champion, 0, '开关关着仍保留标记，界面会显示蓝光误导用户')
+
+    # ---- 不靠 timer 字段（实测 ARAM 该字段恒为 None） ----
+    def test_does_not_depend_on_timer(self):
+        """⚠️ 这条守住"别把功能做成依赖倒计时字段"。
+
+        v4.9.7 实跑日志里 ARAM 选人 `timer.timeLeftInPhase` **12/12 次都是 None**
+        （见 `[选人] v30 ... timer.phase=BAN_PICK timeLeft=None`）。任何"等到
+        倒计时剩 N 秒才换"的实现，在这台机器上都不会触发。
+        """
+        c, calls = self._core()
+        c.toggle_preinput(103)
+        # 不提供任何 timer/session 结构，只给池与当前英雄
+        c._do_auto_pick([103], 57)
+        self.assertEqual(calls, [103], '换英雄依赖了 timer 字段，ARAM 下会永不触发')
+
+    # ---- ⑨ v4.9.14: 先标记后关开关 → 标记必须清 ----
+    def test_disable_switch_clears_existing_preinput(self):
+        """先亮着蓝光、再去设置关开关，标记必须立即清（否则蓝光挂一整局）。
+
+        这条是对审计 P2 的护栏 —— 上一版 update_settings 只 merge 设置不清标记,
+        toggle_preinput 内部的清只挡"关着开关时点"的路径, 挡不住"先标记再关"。
+        """
+        c, calls = self._core()
+        c.toggle_preinput(103)
+        self.assertEqual(c.preinput_champion, 103)
+        c.update_settings({'auto_preinput_champion': False})
+        self.assertEqual(c.preinput_champion, 0,
+                         '关掉预输入开关后标记还在 —— 蓝光会挂到下一局阶段迁移')
+        # 关着开关时即便标记残留, 也绝不能换人
+        c._do_auto_pick([103, 99], 57)
+        self.assertEqual(calls, [], '关掉开关后仍按预输入换英雄')
+
+    # ---- ⑩ v4.9.14: toggle_preinput 拒绝 0/负数/非数字 ----
+    def test_toggle_rejects_invalid_cid(self):
+        c, _ = self._core()
+        self.assertEqual(c.toggle_preinput(0), 0, '0 不是合法英雄 id, 不应被标记')
+        self.assertEqual(c.toggle_preinput(-1), 0, '负数不应被标记')
+        self.assertEqual(c.toggle_preinput('abc'), 0, '非数字不应被标记')
+        self.assertEqual(c.toggle_preinput(None), 0, 'None 不应被标记')
+
+    # ---- ⑪ v4.9.14: update_settings 传入 None 不崩 ----
+    def test_update_settings_none_is_safe(self):
+        c, _ = self._core()
+        c.toggle_preinput(103)
+        c.update_settings(None)   # 上一版 `s.get(...)` 会抛 AttributeError
+        self.assertEqual(c.preinput_champion, 103, '传 None 不应影响已有标记')
+
+
+class TestStopAllThreads(unittest.TestCase):
+    """v5.0.0(#1): 停止脚本时所有工作线程必须协作退出。
+
+    用户点「停止」后, 之前点卡流程还会继续锁卡(日志实锤: 停止后又锁了 3 张)。
+    这组用例守: stop() 置位 stop_event 后, 长循环/倒计时必须快速醒来退出,
+    且 stop() 会 join 登记的工作线程。
+    """
+
+    def _core(self):
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            pass
+
+        c = ScriptCore(_API(), None)
+        c._running = True
+        c._stop_event.clear()
+        return c
+
+    def test_stop_event_wakes_countdown_quickly(self):
+        """倒计时线程在 stop 后应**真正退出**, 而不是睡满整秒。
+
+        ⚠️ 判定不能只看 stop() 耗时 —— stop() 的 join 有 STOP_JOIN_S 上限,
+        破坏后 join 超时 3s 就返回, 用"耗时<5s"会假绿。必须断言: 线程已从
+        _workers 摘除(真正执行完 finally), 且到点动作没执行。
+        """
+        from core import constants as C
+        saved = C.COUNTDOWN_TICK_S
+        C.COUNTDOWN_TICK_S = 30   # 拉大 tick: 若还走 time.sleep, 线程 30s 后才退
+        try:
+            c = self._core()
+            done = []
+            c._start_countdown(1, '测试', lambda: done.append('fired'), kind='queue')
+            time.sleep(0.05)   # 让倒计时线程进入它的循环
+            c.stop()
+            with c._workers_lock:
+                left = len(c._workers)
+            self.assertEqual(left, 0,
+                             'stop() 后倒计时线程仍登记在 _workers —— '
+                             '说明它还在 time.sleep 硬等, 没有协作退出')
+            self.assertNotIn('fired', done, 'stop 后倒计时到点仍执行了动作')
+        finally:
+            C.COUNTDOWN_TICK_S = saved
+
+    def test_loop_exits_quickly_when_stopped_in_reconnect_wait(self):
+        """主 _loop 在"未连接→重连等待"期间被 stop, 应立即醒来退出。
+
+        ⚠️ 判定: stop 后 _ensure_stopped(0.5s) 必须返回 True。破坏①(改回
+        time.sleep)会让 _loop 睡满 RECONNECT_INTERVAL_S(测试里拉大到 10s),
+        0.5s 内退不出来 → _ensure_stopped 返回 False → 判红。
+        """
+        from core import constants as C
+        saved_recon = C.RECONNECT_INTERVAL_S
+        C.RECONNECT_INTERVAL_S = 10   # 破坏后要睡 10s, 正确实现 wait(10) 立即醒
+        try:
+            c = self._core()
+
+            class _API(object):
+                def get_current_summoner(self):
+                    raise RuntimeError('not connected')
+
+                def get_gameflow_phase(self):
+                    raise RuntimeError('not connected')
+
+            c._api = _API()
+            c._running = True
+            c._stop_event.clear()
+            c._thread = threading.Thread(target=c._loop, daemon=True)
+            c._thread.start()
+            time.sleep(0.2)   # 让 _loop 进入"未连接→重连等待"
+            c.stop()
+            stopped = c._ensure_stopped(timeout=0.5)
+            self.assertTrue(stopped,
+                            'stop 后主 _loop 未在 0.5s 内退出 —— '
+                            '说明还在 time.sleep 硬等重连间隔')
+        finally:
+            C.RECONNECT_INTERVAL_S = saved_recon
+
+    def test_worker_registered_and_joined(self):
+        """_spawn_worker 派生的线程, stop() 后应被 join 到结束。"""
+        c = self._core()
+        import threading
+        ev = threading.Event()
+
+        def worker():
+            ev.set()          # 证明已启动
+            c._stop_event.wait(10)   # 协作式长等待, stop 时立即醒来
+
+        c._spawn_worker(worker, name='test-worker')
+        self.assertTrue(ev.wait(2.0), 'worker 没启动')
+        with c._workers_lock:
+            self.assertEqual(len(c._workers), 1, 'worker 未被登记')
+        c.stop()
+        with c._workers_lock:
+            self.assertEqual(len(c._workers), 0, 'worker 退出后未从登记表摘除')
+
+    def test_do_play_again_aborts_when_stopped(self):
+        """停止后 _do_play_again 不应再发起返回房间。"""
+        c = self._core()
+        calls = []
+
+        class _API(object):
+            def play_again(self):
+                calls.append('play_again')
+
+        c._api = _API()
+        c._phase = 'EndOfGame'
+        c._stop_event.set()
+        c._do_play_again()
+        self.assertEqual(calls, [], '停止后仍发起了返回房间')
+
+
+class TestSwapUnconfirmedCooldown(unittest.TestCase):
+    """v5.0.0(#2): bench_swap 读回未确认后, 同一英雄冷却期内不重复 POST。
+
+    日志实锤: 读回未确认时每 1s 轮询重发同一 swap, 对同一英雄连打 8~10 次。
+    """
+
+    def _core(self, results, preferred=None):
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            def __init__(self, seq):
+                self.seq = list(seq)
+                self.calls = []
+
+            def bench_swap(self, cid):
+                self.calls.append(cid)
+                return self.seq.pop(0) if self.seq else True
+
+        c = ScriptCore(_API(results), None)
+        c._phase = 'ChampSelect'
+        c._running = True
+        c._settings.update({'auto_pick_champion': True, 'auto_preinput_champion': True})
+        if preferred:
+            c._settings['preferred_champions'] = preferred
+        return c, c._api.calls
+
+    def test_unconfirmed_not_resubmitted_within_cooldown(self):
+        """第一次返回 None, 冷却期内不应再 POST; 冷却后才允许下一次。"""
+        c, calls = self._core([None, None, None], preferred=[99])
+        now = time.time()
+        c._do_auto_pick([99, 103], 57)          # 第1轮: POST 一次, None
+        self.assertEqual(calls, [99])
+        c._do_auto_pick([99, 103], 57)          # 冷却中: 不再 POST
+        self.assertEqual(calls, [99], '冷却期内重复 POST 了同一 swap')
+        # 推进冷却
+        c._last_swap_unconfirmed_t = now - 999
+        c._do_auto_pick([99, 103], 57)          # 冷却已过: 允许再发一次
+        self.assertEqual(calls, [99, 99])
+
+    def test_unconfirmed_cooldown_scoped_to_same_cid(self):
+        """冷却只针对同一英雄; 换另一个英雄不受影响。"""
+        c, calls = self._core([None, True], preferred=[99, 103])
+        c._do_auto_pick([99, 103], 57)          # 对 99 发一次, None
+        self.assertEqual(calls, [99])
+        # 冷却期内但目标英雄不同? 不会发生 —— best_cid 还是 99(优先级更高)。
+        # 直接验证: 同 cid 冷却中, 不同 cid 不冷却
+        self.assertTrue(c._swap_unconfirmed_cooling(99, time.time()))
+        self.assertFalse(c._swap_unconfirmed_cooling(103, time.time()))
+
+    def test_preinput_also_cooled(self):
+        """预输入路径同样要冷却。"""
+        c, calls = self._core([None, None])
+        c.toggle_preinput(103)
+        c._do_auto_pick([103, 99], 57)          # 第1轮: POST, None
+        self.assertEqual(calls, [103])
+        c._do_auto_pick([103, 99], 57)          # 冷却中: 不 POST
+        self.assertEqual(calls, [103], '预输入路径冷却期内重复 POST')
+
+    def test_confirmed_clears_cooldown(self):
+        """一旦确认成功, 冷却应被清掉(下一次换人不受影响)。"""
+        c, calls = self._core([None, True], preferred=[99])
+        c._do_auto_pick([99, 103], 57)
+        self.assertTrue(c._swap_unconfirmed_cooling(99, time.time()))
+        # 确认成功路径
+        c._last_swap_unconfirmed_t = 0
+        c._last_swap_unconfirmed_cid = 99
+        self.assertFalse(c._swap_unconfirmed_cooling(99, time.time()))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

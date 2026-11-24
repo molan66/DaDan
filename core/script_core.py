@@ -64,12 +64,41 @@ def _safe_int(v, default: int, lo: Optional[int] = None,
     return n
 
 
+def _safe_float(v, default, lo: float = 0.0, hi: float = 1.0):
+    """P3: 容错地把设置值转成 float 并夹到 [lo, hi]。
+
+    用户手改 settings.json 时, auto_pick_click_fracY / fracX / xlist 可能是
+    字符串 / None / NaN / 越界值 —— 直接参与 `fy * rect['h']` 这类乘除会抛
+    TypeError 或算出荒谬坐标, 被上层兜底吞掉后表现为"点卡永远不点"。失败回退
+    default, 成功则夹到 [lo, hi](default 传 None 表示"失败返回 None", 供列表过滤)。
+    """
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return default
+    if n != n:  # NaN
+        return default
+    if lo is not None and n < lo:
+        n = lo
+    if hi is not None and n > hi:
+        n = hi
+    return n
+
+
 class ScriptCore:
     def __init__(self, api, ws):
         self._api = api
         self._ws = ws
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # v5.0.0(#1 全停): 停止信号。原先只有布尔 _running, 长循环里 sleep 完一轮
+        # 才发现; 现在任何协作线程都能用 wait(短超时) 快速醒来退出。
+        self._stop_event = threading.Event()
+        # v5.0.0(#1 全停): 本核心派生的**非 daemon 守护**不适用 —— 所有工作线程
+        # 都登记在这里, stop() 时统一置位 + join, 确保退出时无后台残留。
+        # 注意: 主 _loop 线程单独存 _thread(需在 start() 里做 join 前置检查)。
+        self._workers: set = set()
+        self._workers_lock = threading.Lock()
 
         # 状态
         self._phase = 'None'
@@ -91,6 +120,11 @@ class ScriptCore:
             'auto_play_again': True,
             'auto_play_again_delay': 2,
             'auto_pick_champion': True,
+            # v4.9.13(用户要求): 小窗备选栏单击 = 预输入本局想玩的英雄(蓝光),
+            # 由 1s 轮询在下一拍自动换过去, 优先级高于偏好。
+            # 默认**开**: 这是用户点名要的用法; 关掉后单击退回 v4.9.12 的
+            # "立即换英雄"(见 ui/overlay_window._on_click 的分流)。
+            'auto_preinput_champion': True,
             'auto_select_champion': False,  # v41: 与 auto_pick_champion 对称, 进选人自动选英雄(默认关)
             'preferred_champions': [],
             # v31 点卡兜底: 海克斯(3270)"2-3 张卡"模式专用, REST 试错全空时
@@ -117,10 +151,19 @@ class ScriptCore:
         self._on_champion_data_ready: Optional[Callable] = None
         self._on_status_update: Optional[Callable] = None
         self._on_ready_check_state: Optional[Callable] = None
+        # v5.0.x(用户要求): 本机 ReadyCheck 响应回调 —— 面板需要知道"本机已接受/
+        # 已拒绝", 以便常驻显示并可反悔(拒绝已接受 / 接受已拒绝)。
+        self._on_ready_check_response: Optional[Callable] = None
         self._on_champ_select_info: Optional[Callable] = None  # 选人倒计时/状态回调
 
         # 冷却
         self._last_swap = 0
+        # v5.0.0(#2): 上一次 bench_swap 读回"未确认"的时刻与英雄。读回未确认时
+        # 请求**可能已生效**, 只是 LCU 慢同步读不到; 此前每 1s 轮询都重新 POST
+        # 同一个 swap(日志实测对同一英雄连打 8~10 次)。现在冷却期内不再重复提交,
+        # 让读回追上来; 冷却过后若读回仍不是目标才允许再发一次。
+        self._last_swap_unconfirmed_t = 0.0
+        self._last_swap_unconfirmed_cid = 0
         self._champ_dumped = False  # v27: 本局是否已 dump 一次选人 session 结构(诊断)
         # v28:自动选节流与诊断状态
         self._last_pick_t = 0.0        # 上次 pick 成功的时刻(3s 节流)
@@ -170,6 +213,21 @@ class ScriptCore:
         # 是两个独立 phase, 只靠 3s 节流会启动两次返回流程; 该标记保证一局只
         # 启动一次, 回到 Lobby 时重置(见 _apply_phase_side_effects)。
         self._return_pending = False
+        # v4.9.13:小窗「预输入选英雄」—— 用户在小窗备选栏点一个头像(蓝光),
+        # 脚本把它当作**优先级高于偏好**的换人目标。
+        #
+        # 为什么不做成"等倒计时结束再换": 用户 2026-11-22 的原话是「和偏好一个逻辑」,
+        # 而偏好换英雄本来就**不看倒计时** —— 它由 1s 轮询驱动(_do_auto_pick),
+        # 备选池里有就换。实测证据: ARAM 选人 session 的 timer.timeLeftInPhase
+        # 在 v4.9.7 日志里 12/12 次都是 None(`timer.phase=BAN_PICK timeLeft=None`),
+        # 任何"等到剩 N 秒"的实现在这台机器上都不会触发。
+        # 所以预输入复用同一条轮询链路, 只是判断排在偏好之前。
+        self._preinput_cid = 0        # 用户预输入的英雄 id, 0 = 未预输入
+        self._preinput_hit = False    # 本局是否已经切到过它(命中后不再被偏好换走)
+        # v4.9.14: 预输入标记的专用锁。toggle_preinput(主线程) 与 _do_preinput
+        # (poll/WS 后台线程) 都会读写这两个字段 —— 读-比较-写不是原子操作,
+        # GIL 不保护三步序列, 必须收口到同一把锁。
+        self._preinput_lock = threading.Lock()
 
     # ==================== 属性 ====================
     @property
@@ -183,6 +241,57 @@ class ScriptCore:
     @property
     def is_connected(self):
         return self._connected
+
+    @property
+    def preinput_champion(self):
+        """v4.9.13:当前预输入的英雄 id(0=未预输入)。小窗据此画蓝光。"""
+        with self._preinput_lock:
+            return self._preinput_cid
+
+    def _clear_preinput(self):
+        """v4.9.14:清空预输入标记(唯一清理收口)。开关关闭 / 阶段迁移 / 自愈都走这里。"""
+        with self._preinput_lock:
+            self._preinput_cid = 0
+            self._preinput_hit = False
+
+    def toggle_preinput(self, cid) -> int:
+        """v4.9.13:小窗单击备选英雄 → 切换预输入。返回**切换后**的预输入 id(0=已取消)。
+
+        这是**用户交互**对 `_preinput_cid` 的入口写入点; 阶段迁移(_apply_phase_side_effects)
+        与 _do_preinput 的"已不在池中/命中"分支也会写 —— 三者统一走 _preinput_lock 与
+        _clear_preinput, 避免无锁读-比较-写竞态。
+
+        语义(用户要求"单击选中、再次单击取消"):
+          · 点一个没标记的英雄 → 标记它
+          · 点当前已标记的那个 → 取消(0)
+          · 点另一个 → 直接改标记(不是取消)
+        开关 `auto_preinput_champion` 关闭时一律返回 0 且不记状态 ——
+        否则界面会画蓝光、脚本却不动作, 用户以为点了没用。
+        """
+        if not self._settings.get('auto_preinput_champion'):
+            self._clear_preinput()
+            return 0
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            with self._preinput_lock:
+                return self._preinput_cid
+        # v4.9.14: 0/负数不是合法英雄 id, 拒绝(否则会亮蓝光、下一轮被自愈清掉刷噪音)
+        if cid <= 0:
+            with self._preinput_lock:
+                return self._preinput_cid
+        with self._preinput_lock:
+            # 同一英雄再点一次 = 取消
+            self._preinput_cid = 0 if cid == self._preinput_cid else cid
+            # 换了目标就重置"已命中"保护, 否则新目标永远换不过去
+            self._preinput_hit = False
+            new_cid = self._preinput_cid
+        if new_cid:
+            name = self._champ_data.get(new_cid, str(new_cid))
+            print(f'[Core] 预输入英雄: {name}({new_cid}) —— 命中备选池即切换')
+        else:
+            print('[Core] 已取消预输入英雄')
+        return new_cid
 
     @property
     def summoner_name(self):
@@ -204,9 +313,20 @@ class ScriptCore:
     def set_on_champion_data_ready(self, cb): self._on_champion_data_ready = cb
     def set_on_status_update(self, cb): self._on_status_update = cb
     def set_on_ready_check_state(self, cb): self._on_ready_check_state = cb
+    def set_on_ready_check_response(self, cb): self._on_ready_check_response = cb
     def set_on_champ_select_info(self, cb): self._on_champ_select_info = cb
 
-    def update_settings(self, s): self._settings.update(s)
+    def update_settings(self, s):
+        # v4.9.14: 先判 None 再 update —— dict.update(None) 会抛 TypeError。
+        if s is not None:
+            self._settings.update(s)
+        # 关闭「预输入选英雄」开关时, 必须同步清掉当前标记。
+        # 否则蓝光一直挂到下一局阶段迁移才消失, 用户会以为"关了没用"。
+        # 权威源收口在 core: 后续 _on_bench 每轮把 preinput_champion 回推小窗,
+        # 这里清零后下一轮自然把 0 推过去。
+        if s is not None and s.get('auto_preinput_champion') is False:
+            self._clear_preinput()
+
     def get_settings(self): return self._settings.copy()
 
     # ==================== WS 事件注册 ====================
@@ -230,13 +350,13 @@ class ScriptCore:
         old = self._thread
         if old is not None and old.is_alive():
             print('[Core] 检测到上一轮线程仍在退出中, 等待其收工…')
-            old.join(timeout=3.0)
-            if old.is_alive():
+            if not self._ensure_stopped():
                 # 还没退出(多半卡在某个 REST 超时里) → 拒绝启动, 避免双线程并存
                 print('[Core] 上一轮线程仍未退出, 本次启动取消(请稍后重试)')
                 self._emit(self._on_status_update, '⚠️ 上一轮仍在退出，请稍后重试')
                 return
         self._running = True
+        self._stop_event.clear()
         self._has_accepted_this_check = False
         self._user_declined_this_session = False
         self._auto_queue_paused = False  # 手动点启动即解除拒绝暂停
@@ -245,8 +365,49 @@ class ScriptCore:
         self._emit(self._on_status_update, '脚本已启动')
 
     def stop(self):
+        """v5.0.0(#1 全停): 停止脚本并等所有协作线程退出。
+
+        原先只置 `_running = False` —— 正在跑的 _click_pick_card / 返回倒计时 /
+        点赞线程要等自己跑完才停(日志实锤: 用户点停止后点卡流程又锁了 3 张卡)。
+        现在:
+          1. 置位 _stop_event, 所有 `_stop_event.wait(短)` 的长循环立刻醒来;
+          2. 统一 join 已登记的工作线程(最长 STOP_JOIN_S, 超时不再等 —— 因为
+             这些线程都是 daemon, 主进程退出时会被带走, 不会永久卡死进程);
+          3. 最后置 _running=False。
+        stop() 仍**同步返回**(不无限阻塞调用它的 UI 线程): 最坏等 STOP_JOIN_S。
+        """
+        self._stop_event.set()
         self._running = False
+        # 让在途的倒计时线程立即醒来退出(_start_countdown 的 loop 每次 sleep 前检查)
+        with self._workers_lock:
+            workers = list(self._workers)
+        deadline = time.monotonic() + C.STOP_JOIN_S
+        for t in workers:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            if t is not threading.current_thread() and t.is_alive():
+                try:
+                    t.join(timeout=rem)
+                except Exception:
+                    pass
+        # 主 _loop 线程不在此 join(由 start() 的下一轮前置检查负责, 避免在 UI
+        # 线程里等 3 秒)。但若调用方显式要求彻底停, 可再调 join(见 _ensure_stopped)。
         self._emit(self._on_status_update, '脚本已停止')
+
+    def _ensure_stopped(self, timeout: float = 0.0):
+        """v5.0.0(#1): 等主 _loop 线程真正退出。timeout<=0 表示等到 STOP_JOIN_S。
+
+        供"启动前置检查"与"退出程序收尾"调用 —— 确保旧线程确实不再存在。
+        """
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            wait = C.STOP_JOIN_S if timeout <= 0 else min(timeout, C.STOP_JOIN_S)
+            try:
+                t.join(timeout=wait)
+            except Exception:
+                pass
+        return not (t is not None and t.is_alive())
 
     # ==================== 主循环 ====================
     def _loop(self):
@@ -257,13 +418,17 @@ class ScriptCore:
             try:
                 if not self._connected:
                     self._try_connect()
-                    time.sleep(C.RECONNECT_INTERVAL_S)  # v4.4.0(P2-12): 见 constants
+                    # v5.0.0(#1): 用 stop_event.wait 代替 sleep, 停止时立即醒来退出
+                    if self._stop_event.wait(C.RECONNECT_INTERVAL_S):
+                        break
                     continue
                 self._poll()
             except Exception as e:
                 print(f'[Core] 轮询异常，继续运行: {type(e).__name__}: {e}')
-                time.sleep(C.POLL_ERROR_SLEEP_S)
-            time.sleep(C.POLL_INTERVAL_S)
+                if self._stop_event.wait(C.POLL_ERROR_SLEEP_S):
+                    break
+            if self._stop_event.wait(C.POLL_INTERVAL_S):
+                break
         self._cleanup()
 
     def _init_session(self):
@@ -363,7 +528,7 @@ class ScriptCore:
         if changed:
             self._emit(self._on_phase_changed, p)
         # 强制对当前阶段执行一次动作(重置去重标记;不重复 emit)
-        self._last_handled_phase = None
+        self._reset_handled_phase()
         try:
             self._handle_phase()
         except Exception as e:
@@ -407,13 +572,44 @@ class ScriptCore:
         # 离开 ChampSelect 时重置单次接受标记
         if old == 'ChampSelect' and new != 'ChampSelect':
             self._has_accepted_this_check = False
+            # v4.9.13:预输入是**这一局**的选择, 每局清空(用户明确要求)。
+            # 跨局沿用很危险: 下一局的备选池里多半没有这个英雄, 会先亮蓝光再
+            # 被判"已不在备选池"清掉, 中间那句提示纯属噪音。
+            if self._preinput_cid or self._preinput_hit:
+                print('[Core] 离开选人阶段, 已清空预输入英雄')
+            self._clear_preinput()
         # 回到 Lobby/None = 新匹配会话，解除"主动拒绝"暂停
         if new in ('Lobby', 'None'):
             self._user_declined_this_session = False
             self._return_pending = False
+            # v4.9.12 修复(本次 B): 已经回到大厅, 说明"返回房间"这件事**已完成**,
+            # 在途的返回倒计时必须当场作废。
+            # 事故现场(dist/data/logs/app.log, 89 次进大厅里 30 次中招):
+            #   WaitingForStats 起「返回倒计时」→ 客户端自己先回了大厅(或用户点了返回)
+            #   → 大厅流程起「匹配倒计时」→ 旧返回倒计时到点, 又 playAgain 一次
+            #   → 阶段被打回 Lobby, 刚起的匹配白烧, 状态栏两个倒计时交错刷。
+            # 复位 _return_pending 只挡住"下一次进入结算再起流程", 挡不住**已经在跑的
+            # 那个倒计时线程**, 所以必须连它在途的计数一起作废。
+            self._bump_countdown('return')
+        else:
+            # v4.9.12 修复(本次 B 的另一半): 离开大厅(进匹配/确认/选人/对局)后,
+            # 「匹配倒计时」已无意义 —— 旧实现只靠 _do_queue 里的阶段判断兜住动作,
+            # 状态栏照样一路刷到 1(实测 25 行落在"确认对局"阶段), 既误导用户又干扰
+            # 排查。这里在阶段迁移点统一作废, 让倒计时线程自己停下。
+            self._bump_countdown('queue')
         # 进入 Matchmaking = 用户(手动)开始了匹配,解除自动匹配暂停
         if new == 'Matchmaking':
             self._auto_queue_paused = False
+
+    def _reset_handled_phase(self):
+        """把去重标记清空, 让 _handle_phase 下次强制执行。
+
+        P1: 与 _handle_phase 的 check-then-set 共用 _handle_lock —— 否则
+        poll/WS 线程在锁外写 _last_handled_phase 会与锁内的检查/置位并发,
+        检查刚通过就被清空, 导致同一 phase 重复进入。
+        """
+        with self._handle_lock:
+            self._last_handled_phase = None
 
     def _poll(self):
         try:
@@ -550,7 +746,9 @@ class ScriptCore:
             base = _safe_int(self._settings.get('auto_accept_delay', 1), 1, lo=0)
             # sona 模式：最大延迟保护（15秒上限）
             base = min(base, C.ACCEPT_DELAY_MAX_S)  # v4.4.0(P2-12): 上限见 constants
-            delay = self._random_delay(base)
+            # v4.10.x(P0 修复): 抖动会让 base=15 时最终值涨到 22s, 突破"15s 上限、
+            # 可能错过确认窗口"的保护。对最终 delay 二次夹取, 上限才是真上限。
+            delay = min(self._random_delay(base), C.ACCEPT_DELAY_MAX_S)
 
             def do_accept():
                 try:
@@ -559,6 +757,7 @@ class ScriptCore:
                         self._api.accept_match()
                         self._has_accepted_this_check = True
                         self._emit(self._on_status_update, '✅ 已接受对局!')
+                        self._emit(self._on_ready_check_response, 'Accepted')
                         print(f'[Core] 延迟{delay}秒后接受对局')
                     # 状态已离开 InProgress(如他人接受/超时),放弃本次
                 except Exception as e:
@@ -707,7 +906,11 @@ class ScriptCore:
             if self._settings.get('auto_select_champion'):
                 self._try_initial_pick(queue_id, allow_subset)
         else:
-            if self._settings.get('auto_pick_champion'):
+            # v4.9.13: 预输入是**用户的显式指令**, 级别高于"自动换英雄"这个自动
+            # 逻辑 —— 所以 auto_pick_champion 关着时预输入仍然生效。
+            # 只有 auto_preinput_champion(主界面那个开关)关掉才整条失效。
+            if self._settings.get('auto_pick_champion') or \
+                    self._settings.get('auto_preinput_champion'):
                 self._try_auto_pick(bench_ids, my_id)
 
     def _try_initial_pick(self, queue_id=None, allow_subset=False):
@@ -839,9 +1042,20 @@ class ScriptCore:
         except Exception:
             pass
 
-        fy = self._settings.get('auto_pick_click_fracY', 0.609)
-        fx_first = self._settings.get('auto_pick_click_fracX', 0.161)
-        xlist = self._settings.get('auto_pick_click_xlist') or [fx_first]
+        fy = _safe_float(self._settings.get('auto_pick_click_fracY', 0.609), 0.609)
+        fx_first = _safe_float(self._settings.get('auto_pick_click_fracX', 0.161), 0.161)
+        # P3: xlist 用户手改可能不是列表 / 元素是字符串或越界值 —— 逐项做数值
+        # 容错并过滤非法值, 全非法时回退到默认单点。不直接 int()/乘法, 否则
+        # TypeError 会被上层吞掉, 表现为"点卡功能开了但从不点击"。
+        raw_xlist = self._settings.get('auto_pick_click_xlist')
+        xlist = []
+        if isinstance(raw_xlist, (list, tuple)):
+            for v in raw_xlist:
+                v = _safe_float(v, None)
+                if v is not None:
+                    xlist.append(v)
+        if not xlist:
+            xlist = [fx_first]
         base_y = int(rect['top'] + fy * rect['h'])
         print(f'[点卡] 窗口 {rect["w"]}x{rect["h"]} @({rect["left"]},{rect["top"]}) '
               f'进程={rect["process"]} y比例={fy:.3f} '
@@ -917,11 +1131,18 @@ class ScriptCore:
         # 超过 deadline 即放弃本轮, 交给下个节流周期重试。
         _deadline = time.monotonic() + C.CLICK_PICK_DEADLINE_S
         for y_off in (0, 12):
+            # v5.0.0(#1): 停止时立即放弃本轮点卡(此前点停止后还会把整轮扫完并锁卡)
+            if self._stop_event.is_set():
+                print('[点卡] 脚本已停止, 放弃本轮点卡')
+                return None
             if time.monotonic() > _deadline:
                 print('[点卡] 达到本轮总时限, 放弃剩余候选(等下个节流周期)')
                 break
             y = base_y + y_off
             for xi in xlist:
+                if self._stop_event.is_set():
+                    print('[点卡] 脚本已停止, 放弃本轮点卡')
+                    return None
                 if time.monotonic() > _deadline:
                     print('[点卡] 达到本轮总时限, 放弃剩余候选(等下个节流周期)')
                     break
@@ -1068,9 +1289,17 @@ class ScriptCore:
         # 先抛 TypeError, 守卫形同虚设, 异常一路上抛被 _poll 吞成"选人轮询异常"。
         # 先把 None/空集合躲开, 再构造集合。
         if not bench_ids:
+            # v4.9.13: 池为空时**不许**清预输入 —— 备选池在下发/刷新中会短暂为空,
+            # 那时清掉标记, 用户刚点的那一下就白做了(实测日志里池子逐秒长出来)。
             return
         bench_set = set(bench_ids)
         now = time.time()
+
+        # v4.9.13:预输入优先 —— 命中就 return, 后面的偏好逻辑本轮不再执行。
+        # 走的是与偏好**同一条**轮询链路(_do_auto_pick 每秒被调一次), 所以不需要
+        # 任何倒计时字段; 用户看到的效果就是"池里出现我要的英雄 → 立刻换"。
+        if self._do_preinput(bench_set, current_id, bench_ids, now):
+            return
 
         # 备选池中优先级最高的偏好英雄（索引最小 = 优先级最高）
         best_cid = None
@@ -1108,12 +1337,19 @@ class ScriptCore:
             return
 
         # 3) 秒换到更高优先级偏好英雄（无冷却）
+        # v5.0.0(#2): 读回未确认后的冷却。同一英雄在冷却期内不重复 POST。
+        if self._swap_unconfirmed_cooling(best_cid, now):
+            return
         ok = self._api.bench_swap(best_cid)
         # v4.4.0(P1-3 配套): bench_swap 现为三态 —— True 成功 / False 明确被 API 拒绝 /
         # None 请求已发出但读回校验失败(未验证)。原先 None 也落进 else 分支打印
         # "API返回False", 属误报: 换英雄很可能已经生效, 只是没能读回确认。
         if ok is None:
             self._last_swap = now  # 未验证也节流, 避免 1s 轮询把同一请求打爆
+            # v5.0.0(#2): 记下未确认冷却, 消除重复 POST(旧版这里只写 _last_swap
+            # 但没有任何消费方读取, 于是每 1s 重发一次)
+            self._last_swap_unconfirmed_t = now
+            self._last_swap_unconfirmed_cid = best_cid
             print(f'[Core] 秒换结果未验证(请求已发出, REST 读回失败, 可能已生效): '
                   f'championId={best_cid}')
             return
@@ -1121,9 +1357,102 @@ class ScriptCore:
             print(f'[Core] 秒换失败(API返回False): championId={best_cid}')
             return
         self._last_swap = now
+        self._mark_swap_confirmed(best_cid)
         name = self._champ_data.get(best_cid, str(best_cid))
         print(f'[Core] 自动秒换 → {name}(#{best_rank+1})')
         self._emit(self._on_status_update, f'🔄 秒换 {name}')
+
+    def _swap_unconfirmed_cooling(self, cid, now):
+        """v5.0.0(#2): 同一英雄的 bench_swap 读回未确认后, 是否处于冷却期。
+
+        返回 True = 冷却中, 调用方应 return 不再 POST; False = 可以发。
+        只在**目标英雄没变**时冷却 —— 用户改换另一个英雄不在此限。
+        """
+        if (self._last_swap_unconfirmed_cid == cid
+                and now - self._last_swap_unconfirmed_t < C.SWAP_UNCONFIRMED_RETRY_S):
+            return True
+        return False
+
+    def _mark_swap_confirmed(self, cid):
+        """v5.0.0(#2): swap 已确认(True), 清掉该英雄的未确认冷却。"""
+        if self._last_swap_unconfirmed_cid == cid:
+            self._last_swap_unconfirmed_t = 0.0
+            self._last_swap_unconfirmed_cid = 0
+
+    def _do_preinput(self, bench_set, current_id, bench_ids, now):
+        """v4.9.13:处理「预输入选英雄」。返回 True = 本轮已由预输入接管(调用方应 return)。
+
+        用户要的语义(2026-11-22):
+            「备选栏里我先点一个想要的, 蓝光; 脚本帮我换过去, 优先级比偏好高;
+              单击选中、再单击取消。」
+
+        与偏好的关系: **同一套机制**, 只是判断排在偏好之前。所以它同样由 1s 轮询
+        驱动、同样"池里有就换", 不依赖任何倒计时字段(ARAM 下该字段恒为 None)。
+
+        四条分支, 缺一条都会出事:
+          ① 没有预输入 / 开关关着 → 返回 False, 交回偏好逻辑(绝不能拦着偏好)
+          ② 当前已是它 → 记命中、返回 True(本局不再被偏好换走)
+          ③ 它不在非空的池里 → 清标记 + 提示(否则会永远等一个不会来的英雄)
+          ④ 它在池里且当前不是它 → bench_swap, 成功则清标记并记命中
+        """
+        with self._preinput_lock:
+            cid = self._preinput_cid
+        if not cid or not self._settings.get('auto_preinput_champion'):
+            return False
+
+        # ② 已经是它了: 记下"本局命中过", 后面的偏好逻辑不许再动它。
+        # ⚠️ 这里**故意不清** _preinput_cid —— 清了的话下一轮 cid=0 → 本方法返回
+        # False → 偏好逻辑接管 → 立刻把刚换好的英雄又换走(用户白点)。
+        # 标记留着还有第二个好处: 小窗蓝光就停在"你指定的那个英雄"上, 是准确的反馈。
+        if current_id == cid:
+            with self._preinput_lock:
+                first_hit = not self._preinput_hit
+                self._preinput_hit = True
+            if first_hit:
+                name = self._champ_data.get(cid, str(cid))
+                print(f'[Core] 预输入已生效: {name}({cid}), 本局不再被偏好换走')
+                self._emit(self._on_status_update, f'✅ 已切到预输入 {name}')
+            return True
+
+        # ③ 池子非空却没有它 —— 用户标记的英雄已经不可选(被队友换走/池刷新)。
+        # 注意本方法的调用前提就是 bench_set 非空(空的已在 _do_auto_pick 提前返回)。
+        if cid not in bench_set:
+            name = self._champ_data.get(cid, str(cid))
+            self._clear_preinput()
+            print(f'[Core] 预输入英雄 {name}({cid}) 已不在备选池, 已取消预输入')
+            self._emit(self._on_status_update, f'⚠️ {name} 已不在备选池，已取消预输入')
+            return False   # 交回偏好逻辑, 别把这一轮也吞掉
+
+        # ④ 在池里、当前不是它 → 换。
+        # 复用 _do_auto_pick 调用方已持有的 _swap_lock(见 _try_auto_pick),
+        # 这里不再抢锁, 避免自锁。
+        # v5.0.0(#2): 读回未确认后的冷却, 同一英雄冷却期内不重复 POST。
+        if self._swap_unconfirmed_cooling(cid, now):
+            return True
+        ok = self._api.bench_swap(cid)
+        name = self._champ_data.get(cid, str(cid))
+        if ok is None:
+            # 与偏好秒换同口径: 请求已发出、读回未验证 —— 不谎报成功, 但也不清标记,
+            # 下一轮再读回确认(若真已生效, ②分支会接住它)。
+            self._last_swap = now
+            # v5.0.0(#2): 记下冷却, 消除重复 POST(旧版每 1s 重发一次, 日志实测连打 8 次)
+            self._last_swap_unconfirmed_t = now
+            self._last_swap_unconfirmed_cid = cid
+            print(f'[Core] 预输入切换结果未验证(请求已发出, REST 读回失败, 可能已生效): '
+                  f'championId={cid}')
+            return True
+        if not ok:
+            # POST 明确失败: 保留标记, 下一轮重试(不打扰用户, 只在日志留痕)。
+            print(f'[Core] 预输入切换失败(API返回False), 下轮重试: championId={cid}')
+            return True
+        self._last_swap = now
+        self._mark_swap_confirmed(cid)
+        with self._preinput_lock:
+            self._preinput_hit = True
+        # 同样故意不清 _preinput_cid: 下一轮由分支②接住(读回确认 + 挡住偏好)。
+        print(f'[Core] 预输入切换 → {name}({cid}) 成功, 本局不再被偏好换走')
+        self._emit(self._on_status_update, f'✅ 已切到预输入 {name}')
+        return True
 
     # ==================== 对局结束自动返回（sona 模式） ====================
     def _handle_end_of_game(self):
@@ -1151,10 +1480,34 @@ class ScriptCore:
         else:
             # v41: delay=0 也走后台线程, 避免 _do_play_again 的 15s 重试循环
             # 阻塞 poll 轮询线程(原 delay=0 直接在 poll 线程跑)
-            threading.Thread(target=self._do_play_again, daemon=True).start()
+            self._spawn_worker(self._do_play_again, name='core-play-again')
+
+    # v4.9.12: 「自动返回」真正执行的入口, 允许在此停留的阶段集合。
+    # 只有仍停在结算链上才该 playAgain —— 已经回到大厅/已在匹配中说明这件事
+    # 已经发生(或客户端自己回了), 再调就是把流程倒带。
+    # 注意不含 'Lobby': 大厅由 _handle_lobby 的「匹配倒计时」接管, 见本次修复 C。
+    _PLAY_AGAIN_ALLOWED_PHASES = ('EndOfGame', 'WaitingForStats', 'PreEndOfGame')
 
     def _do_play_again(self):
-        """playAgain + retry matchmaking（仅房主可操作）"""
+        """playAgain（仅结算阶段; 之后的重排交给大厅流程）"""
+        # v5.0.0(#1): 停止后不再发起返回房间动作
+        if self._stop_event.is_set():
+            self._return_pending = False
+            return
+        # v4.9.12 修复(本次 A): 阶段守卫。
+        # 事故现场(dist/data/logs/app.log, 89 次进大厅里 30 次中招):
+        #   「返回倒计时」启动后阶段已回 Lobby(客户端自己返回/用户点了返回),
+        #   倒计时到点照样执行 playAgain → 刚进入的大厅被重新 playAgain,
+        #   紧接着 _handle_lobby 起的匹配倒计时还在跑, 两条流程互相打断。
+        # 位置很关键: 必须在 play_again() **之前**判, 事后再判已经晚了。
+        phase = self._phase
+        if phase not in self._PLAY_AGAIN_ALLOWED_PHASES:
+            # 复位 pending, 让下一次真正进入结算阶段时还能重新起流程。
+            # 若不复位, 这次被守卫挡掉的流程会让本局后续「自动返回」永久失效
+            # (与 v4.3.11 的 playAgain 失败分支同一个道理)。
+            self._return_pending = False
+            print(f'[Core] 跳过返回房间(阶段已变为 {phase}, 返回流程已完成)')
+            return
         try:
             # playAgain 所有成员都可以调用
             self._api.play_again()
@@ -1167,28 +1520,14 @@ class ScriptCore:
             self._return_pending = False
             return
 
-        if not self._settings.get('auto_queue'):
-            return
-
-        # v4.4.0(P2-12): 15(重试上限)/1(重试间隔)集中到 core/constants.py
-        for i in range(1, C.PLAY_AGAIN_RETRY_MAX + 1):
-            time.sleep(C.PLAY_AGAIN_RETRY_INTERVAL_S)
-            if not self._running:
-                return
-            try:
-                self._api.start_matchmaking()
-                # v4.4.0(P2-7): 返回房间后的重排也是"我们发起的", 同样登记
-                self._queue_started_by_us = True
-                print(f'[Core] 匹配启动（第{i}次）')
-                return
-            except Exception as e:
-                err = str(e)
-                if 'INVALID_PERMISSIONS' in err:
-                    print('[Core] 非房主，等待房主匹配')
-                    self._emit(self._on_status_update, '⏳ 等待房主匹配...')
-                    return
-                if i >= C.PLAY_AGAIN_RETRY_MAX:
-                    print('[Core] 匹配启动失败')
+        # v4.9.12 修复(本次 C): **不再**在这里重试 start_matchmaking。
+        # 原先这里循环 15 次 × 1s 抢开队列, 而回到大厅后 _handle_lobby 又会按
+        # 「匹配倒计时(auto_queue_delay)」再开一次 —— 两条通道同时开队列, 日志里
+        # 表现为 `[Core] 匹配启动（第1次）` 与 `[Core] 开始匹配` 并存(实测 3 次紧邻),
+        # 且夹着 54 次 `非房主，等待房主匹配` 的噪音, 用户设的匹配延迟也被绕过。
+        # 现在收口到**单一写入点**: 重排只由 _handle_lobby → _do_queue 发起,
+        # 队列归属登记(_queue_started_by_us)也在那里完成。
+        # 如果之后确实回不到大厅, playAgain 失败/阶段不动会有日志, 不比静默重试更差。
 
     # ==================== 自动点赞（sona 模式） ====================
     def _try_start_honor(self):
@@ -1220,10 +1559,9 @@ class ScriptCore:
         # 永不释放 —— 锁由 _honor_worker 结束时释放, 若线程根本没起来锁会泄漏,
         # 后续所有自动点赞全被阻塞。这里 start 异常时立即归还锁。
         try:
-            threading.Thread(target=self._honor_worker,
-                             kwargs={'ballot': ballot, 'allies': allies,
-                                     'opponents': opponents},
-                             daemon=True).start()
+            self._spawn_worker(self._honor_worker, name='core-honor',
+                               kwargs={'ballot': ballot, 'allies': allies,
+                                       'opponents': opponents})
         except Exception as e:
             self._honor_lock.release()
             print(f'[Core] 点赞线程启动失败: {type(e).__name__}: {e}')
@@ -1239,6 +1577,9 @@ class ScriptCore:
 
     def _do_auto_honor(self, ballot, allies, opponents):
         """对局结束后自动点赞队友（sona auto-honor 模式）"""
+        # v5.0.0(#1): 停止后不再补票
+        if self._stop_event.is_set():
+            return
         HONOR_CATEGORIES = ['HEART', 'COOL', 'SHOTCALLER']
         try:
             # v4.4.0 修复(P1-9): 原先 `(ballot.get('votePool') or {}).get('votes', 1)`。
@@ -1325,6 +1666,10 @@ class ScriptCore:
         response = data.get('playerResponse', '')
         if self._on_ready_check_state:
             self._on_ready_check_state(state == 'InProgress')
+        # v5.0.x(用户要求): 玩家在客户端里手动点的响应也同步到面板。
+        # playerResponse 只会是本机玩家自己的响应(队友响应在 players 数组里)。
+        if response in ('Accepted', 'Declined'):
+            self._emit(self._on_ready_check_response, response)
         # 本机玩家已拒绝（任何途径）：撤销延迟接受 + 暂停自动接受与自动匹配，
         # 直到手动点"启动"或手动在客户端开始匹配(→ _set_phase Matchmaking)才恢复
         if response == 'Declined' and not self._user_declined_this_session:
@@ -1376,12 +1721,17 @@ class ScriptCore:
             # 小窗 —— 所以这里返回 False(不谎报成功), 但用状态栏讲清"未验证",
             # 免得用户以为完全没生效而反复点。
             if ok is None:
+                # v5.0.0 审计修复(P3): 与自动路径同口径记冷却 —— 否则快速连点
+                # 同一英雄会重复 POST 未确认的 swap。
+                self._last_swap_unconfirmed_t = now
+                self._last_swap_unconfirmed_cid = cid
                 print(f'[Core] 手动换英雄结果未验证(请求已发出, REST 读回失败, 可能已生效): '
                       f'championId={cid}')
                 self._emit(self._on_status_update, '⚠️ 换英雄结果未确认，请查看客户端')
                 return False
             if ok:
                 print(f'[Core] 手动换英雄: {cid}')
+                self._mark_swap_confirmed(cid)
             return ok
         except Exception as e:
             print(f'[Core] 换英雄失败: {type(e).__name__}: {e}')
@@ -1402,6 +1752,7 @@ class ScriptCore:
             self._accept_pending = False  # 手动接受:取消在途的自动接受倒计时
             self._auto_queue_paused = False  # 手动接受 = 恢复整条自动化链
             self._emit(self._on_status_update, '✅ 已接受对局!')
+            self._emit(self._on_ready_check_response, 'Accepted')
             return True
         except Exception as e:
             print(f'[Core] 接受失败: {type(e).__name__}: {e}')
@@ -1423,6 +1774,7 @@ class ScriptCore:
             self._auto_queue_paused = True  # G6
             print('[Core] 已拒绝对局，暂停自动匹配（手动恢复）')
             self._emit(self._on_status_update, '❌ 已拒绝，暂停自动匹配')
+            self._emit(self._on_ready_check_response, 'Declined')
             return True
         except Exception as e:
             print(f'[Core] 拒绝失败: {type(e).__name__}: {e}')
@@ -1549,14 +1901,16 @@ class ScriptCore:
                     _cancel()
                     return
                 self._emit(self._on_status_update, f'{prefix} {r}...')
-                time.sleep(C.COUNTDOWN_TICK_S)
+                # v5.0.0(#1): stop 时立即醒来退出, 不再傻等整秒
+                if self._stop_event.wait(C.COUNTDOWN_TICK_S):
+                    _cancel()
+                    return
             if _still_mine() and self._running:
                 on_done()
             else:
                 _cancel()
 
-        t = threading.Thread(target=loop, daemon=True)
-        t.start()
+        t = self._spawn_worker(loop, name=f'countdown-{kind}')
 
     def _emit(self, cb, *args):
         if cb:
@@ -1568,6 +1922,34 @@ class ScriptCore:
                 # 至少打出异常类型与消息(走 print 会被 LogCapture 落盘, 便于事后排查)。
                 print(f'[Core] 回调异常(cb={getattr(cb, "__name__", cb)}): '
                       f'{type(e).__name__}: {e}')
+
+    def _spawn_worker(self, target, name='core-worker', kwargs=None):
+        """v5.0.0(#1): 派生并登记一个工作线程, stop() 会统一 join 它。
+
+        原先各处直接 `threading.Thread(...).start()`, stop() 无从追踪, 点停止后
+        这些线程还在跑(点卡连锁 3 张卡的日志实锤)。现在统一经此派生:
+          - daemon=True(进程退出不受阻)
+          - 登记到 _workers, stop() 时 join
+          - 线程结束时自动从 _workers 摘除(防止集合无限增长)
+        """
+        def _run():
+            try:
+                target(**(kwargs or {}))
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
+
+        t = threading.Thread(target=_run, daemon=True, name=name)
+        with self._workers_lock:
+            self._workers.add(t)
+        try:
+            t.start()
+        except Exception:
+            # 起线程失败: 把登记撤销, 别留一个永远不结束的条目
+            with self._workers_lock:
+                self._workers.discard(t)
+            raise
+        return t
 
     def _cleanup(self):
         """停止脚本/退出程序时的收尾（_loop 退出后执行一次）。

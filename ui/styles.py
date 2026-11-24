@@ -44,18 +44,32 @@ class Glass:
     PRIMARY_GLOW = 'rgba(99, 102, 241, 0.15)'
     PRIMARY_SUBTLE = 'rgba(99, 102, 241, 0.10)'
 
+    # v4.4.0 修复(P2): 品牌色透明度令牌 —— 原 champion_picker 里 rgba(99,102,241,x)
+    # 散落各 QSS 内联, 与 PRIMARY 语义同源却各有各的透明度写法。集中到这里:
+    # 名字 = PRIMARY_透明度百分比。改动品牌色时只需改 PRIMARY 一处。
+    PRIMARY_06 = 'rgba(99, 102, 241, 0.06)'
+    PRIMARY_10 = 'rgba(99, 102, 241, 0.10)'
+    PRIMARY_12 = 'rgba(99, 102, 241, 0.12)'
+    PRIMARY_18 = 'rgba(99, 102, 241, 0.18)'
+    PRIMARY_20 = 'rgba(99, 102, 241, 0.20)'
+    PRIMARY_30 = 'rgba(99, 102, 241, 0.30)'
+    PRIMARY_40 = 'rgba(99, 102, 241, 0.40)'
+
     # ===== 语义色 =====
     ACCENT = '#34d399'
     DANGER = '#f87171'
     DANGER_SUBTLE = 'rgba(248, 113, 113, 0.10)'
+    # v4.4.0 修复(P2): DANGER 透明度令牌, 供 champion_picker 清空按钮 hover 描边使用
+    DANGER_30 = 'rgba(248, 113, 113, 0.30)'
     WARNING = '#fbbf24'
-    SUCCESS = '#34d399'
+    # v4.4.0 修复(P3): SUCCESS 与 ACCENT 同值, 收口为别名避免两处漂移
+    SUCCESS = ACCENT
 
     # v4.4.1(UI-B5): 连接"中间态"专用色(与 WARNING 同值, 但语义独立)。
     # 原来连接指示只有红/绿两态, 于是"应用刚启动、正在扫客户端"和"客户端真的
     # 没开"显示得一模一样(都是红色未连接), 用户会以为软件坏了。中间态用琥珀,
     # 与"断开"的红色"危险语义"区分开。
-    CONNECTING = '#fbbf24'
+    CONNECTING = WARNING
 
     # v4.4.1(UI-A2): 按钮三档色。原来 ACCENT/DANGER 的 hover/pressed/渐变末端
     # 散落在 overlay_window 里硬写成 #6ee7b7/#059669/#047857/#fca5a5/#dc2626/#b91c1c,
@@ -80,6 +94,17 @@ class Glass:
     ACCENT_SOFT = 'rgba(52, 211, 153, 0.18)'
     ACCENT_BORDER = 'rgba(52, 211, 153, 0.85)'
     ACCENT_BORDER_HOVER = 'rgba(52, 211, 153, 1.0)'
+
+    # v4.9.13(用户要求): 小窗「预输入选英雄」态 = 蓝光。
+    # 与"偏好绿 / 当前选中靛"同屏并存, 所以三个颜色必须一眼可分。
+    # 取偏青的 sky-400(#38bdf8) 而不是再深一档的蓝: 靛(#6366f1)本身就在蓝区,
+    # 两枚 52px 头像挨在一起时, 同色相不同明度**肉眼分不出来**(已在本机小窗
+    # 实测过 #6366f1 vs #3b82f6 的对比度不足)。sky-400 明度高、偏青, 与靛拉开。
+    PREINPUT = '#38bdf8'
+    PREINPUT_SUBTLE = 'rgba(56, 189, 248, 0.12)'
+    PREINPUT_SOFT = 'rgba(56, 189, 248, 0.20)'
+    PREINPUT_BORDER = 'rgba(56, 189, 248, 0.90)'
+    PREINPUT_BORDER_HOVER = 'rgba(56, 189, 248, 1.0)'
 
     # ===== 海克斯强化稀有度色（v4.4.20）=====
     # 起因: 用户反馈"海克斯好多没有颜色"。实测 LCU 的 augmentSmallIconPath

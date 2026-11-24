@@ -67,6 +67,39 @@ CONN_STATE_TEXTS = {
 }
 
 
+def _run_btn_qss(bg, fg, border, hover_bg, hover_fg, hover_border):
+    """启动/停止按钮 QSS 模板(单色底)。"""
+    return f"""
+        QPushButton {{
+            background: {bg}; color: {fg};
+            border: 1px solid {border}; border-radius: {Glass.RADIUS_SM};
+            font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
+        }}
+        QPushButton:hover {{ background: {hover_bg}; color: {hover_fg}; border-color: {hover_border}; }}
+        QPushButton:pressed {{ padding-top: 1px; }}
+    """
+
+
+def _pill_btn_qss(bg, bg2, hover_bg, hover_bg2, pressed):
+    """渐变 pill 按钮(接受/拒绝)QSS 模板。
+
+    v4.4.1(UI-A2): 原为 `stop:0 {hover_bg}, stop:0 {bg}` —— 两个 stop 都是 0,
+    第二个覆盖第一个, 渐变退化成纯色且 hover 几乎无变化。现为正常的
+    stop:0/stop:1 两档。
+    """
+    return f"""
+        QPushButton {{
+            background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {bg}, stop:1 {bg2});
+            color: white; border: none; border-radius: {Glass.RADIUS_SM};
+            font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
+        }}
+        QPushButton:hover {{
+            background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {hover_bg}, stop:1 {hover_bg2});
+        }}
+        QPushButton:pressed {{ background: {pressed}; padding-top: 1px; }}
+    """
+
+
 class _OverlayGlassContainer(QWidget):
     """小窗容器 - 玻璃背景(半透明着色, 底层由系统Acrylic模糊)"""
     def __init__(self, parent=None):
@@ -81,7 +114,15 @@ class _OverlayGlassContainer(QWidget):
 
 
 class ReadyCheckPanel(QWidget):
-    """ReadyCheck 控制面板（霓虹脉冲）"""
+    """ReadyCheck 控制面板（确认卡，可反悔）
+
+    v5.0.x 重构(用户要求): 原"15 秒倒计时卡"是假倒计时 —— 本地 QTimer 从硬编码
+    15 倒数, 与 core 真实接受延迟(auto_accept_delay)脱钩, 于是出现"已接受对局! 却
+    还显示 12 秒后自动接受"。现改为纯确认卡:
+      · 不自己倒数(真实倒计时由顶栏"⏳ 接受倒计时 N..."显示);
+      · 接受/拒绝按钮在 ReadyCheck 期间常驻, 随时可反悔;
+      · 响应状态由 core 经 sig_ready_response 回推, 不再本地 1.5s 后自动收起。
+    """
     accept_clicked = pyqtSignal()
     decline_clicked = pyqtSignal()
 
@@ -90,19 +131,12 @@ class ReadyCheckPanel(QWidget):
         self._visible = False
         self._response = 'None'
         self._completed = False
-        self._countdown = 15
-        # v4.4.1(UI-B6): 进度条需要总时长做分母; 临期(stage warning)状态
-        self._countdown_total = 15
-        self._warning = False
-        self._pulse_value = 0.0
-        self._pulse_dir = 1
-        self._pulse_active = False
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._pulse_timer = QTimer(self)
-        self._pulse_timer.timeout.connect(self._pulse_tick)
-        self._pulse_timer.setInterval(30)
         self._init_ui()
+
+    @property
+    def is_completed(self) -> bool:
+        """本机已给出响应(接受/拒绝)。_do_ready 用它在轮询重推时阻止重弹。"""
+        return self._completed
 
     def _init_ui(self):
         self.setVisible(False)
@@ -118,7 +152,7 @@ class ReadyCheckPanel(QWidget):
         self._state_label.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.TEXT_PRIMARY};background:transparent;")
         left.addWidget(self._state_label)
-        self._countdown_label = QLabel('15 秒后自动接受')
+        self._countdown_label = QLabel('点击接受/拒绝，可随时反悔')
         self._countdown_label.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         left.addWidget(self._countdown_label)
@@ -127,188 +161,104 @@ class ReadyCheckPanel(QWidget):
         self._accept_btn = QPushButton('接受')
         self._accept_btn.setFixedSize(56, 26)
         self._accept_btn.setCursor(Qt.PointingHandCursor)
-        self._accept_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {Glass.ACCENT}, stop:1 {Glass.ACCENT_DARK});
-                color: white; border: none; border-radius: {Glass.RADIUS_SM};
-                font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
-            }}
-            /* v4.4.1(UI-A2): 原为 `stop:0 {Glass.ACCENT_HOVER}, stop:0 {Glass.ACCENT}`
-               —— 两个 stop 都是 0, 第二个覆盖第一个, 渐变退化成纯色且 hover 几乎无变化。
-               改成正常的 stop:0/stop:1 两档。 */
-            QPushButton:hover {{
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {Glass.ACCENT_HOVER}, stop:1 {Glass.ACCENT});
-            }}
-            QPushButton:pressed {{ background: {Glass.ACCENT_PRESSED}; padding-top: 1px; }}
-        """)
+        self._accept_btn.setStyleSheet(_pill_btn_qss(
+            Glass.ACCENT, Glass.ACCENT_DARK,
+            Glass.ACCENT_HOVER, Glass.ACCENT, Glass.ACCENT_PRESSED))
         self._accept_btn.clicked.connect(self._on_accept)
         lay.addWidget(self._accept_btn)
 
         self._decline_btn = QPushButton('拒绝')
         self._decline_btn.setFixedSize(56, 26)
         self._decline_btn.setCursor(Qt.PointingHandCursor)
-        self._decline_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {Glass.DANGER}, stop:1 {Glass.DANGER_DARK});
-                color: white; border: none; border-radius: {Glass.RADIUS_SM};
-                font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
-            }}
-            /* v4.4.1(UI-A2): 同上, 双 stop:0 已修正为 stop:0/stop:1。 */
-            QPushButton:hover {{
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {Glass.DANGER_HOVER}, stop:1 {Glass.DANGER});
-            }}
-            QPushButton:pressed {{ background: {Glass.DANGER_PRESSED}; padding-top: 1px; }}
-        """)
+        self._decline_btn.setStyleSheet(_pill_btn_qss(
+            Glass.DANGER, Glass.DANGER_DARK,
+            Glass.DANGER_HOVER, Glass.DANGER, Glass.DANGER_PRESSED))
         self._decline_btn.clicked.connect(self._on_decline)
         lay.addWidget(self._decline_btn)
 
     @ui_slot
     def _on_accept(self):
-        self._timer.stop()
         self._response = 'Accepted'
         self._completed = True
         self._update_ui()
         self.accept_clicked.emit()
-        QTimer.singleShot(1500, self.hide_check)
 
     @ui_slot
     def _on_decline(self):
-        self._timer.stop()
         self._response = 'Declined'
         self._completed = True
         self._update_ui()
         self.decline_clicked.emit()
-        QTimer.singleShot(1500, self.hide_check)
 
-    def _set_countdown_text(self, text, warn=False):
-        """倒计时文案 + 临期变红(v4.4.1 / UI-B6)。
-
-        只在 warn 状态**翻转**时写样式表 —— _tick 每秒一次, 若每次都
-        setStyleSheet 等于每秒触发一遍 QSS 解析与控件重排。
-        """
+    def _set_hint_text(self, text, tone='muted'):
+        """提示行文案; 仅在色调变化时重写样式表(与旧 _set_countdown_text 同纪律)。"""
         self._countdown_label.setText(text)
-        if warn != self._warning:
-            self._warning = warn
-            color = Glass.DANGER if warn else Glass.TEXT_MUTED
+        color = {'muted': Glass.TEXT_MUTED,
+                 'accent': Glass.ACCENT,
+                 'danger': Glass.DANGER}.get(tone, Glass.TEXT_MUTED)
+        if color != getattr(self, '_hint_color', None):
+            self._hint_color = color
             self._countdown_label.setStyleSheet(
                 f"font-size:{Glass.FONT_SIZE_XS};color:{color};background:transparent;")
 
     def _update_ui(self):
+        # v5.0.x: 面板在确认窗口内常驻, 可反悔 —— 已接受仍可点拒绝、已拒绝仍可点接受。
+        # 已选择的动作按钮禁用, 另一个保持可点。
         if self._response == 'Accepted':
             self._state_label.setText('已接受')
             self._state_label.setStyleSheet(
                 f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.ACCENT};background:transparent;")
-            self._accept_btn.setVisible(False)
-            self._decline_btn.setVisible(False)
-            self._countdown_label.setVisible(False)
-            self._timer.stop()
+            self._accept_btn.setEnabled(False)
+            self._decline_btn.setEnabled(True)
+            self._countdown_label.setVisible(True)
+            self._set_hint_text('已接受，仍可点「拒绝」反悔', tone='accent')
         elif self._response == 'Declined':
             self._state_label.setText('已拒绝')
             self._state_label.setStyleSheet(
                 f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.DANGER};background:transparent;")
-            self._accept_btn.setVisible(False)
-            self._decline_btn.setVisible(False)
-            self._countdown_label.setVisible(False)
-            self._timer.stop()
+            self._decline_btn.setEnabled(False)
+            self._accept_btn.setEnabled(True)
+            self._countdown_label.setVisible(True)
+            self._set_hint_text('已拒绝，仍可点「接受」反悔', tone='danger')
         else:
             self._state_label.setText('已找到对局')
             self._state_label.setStyleSheet(
                 f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.TEXT_PRIMARY};background:transparent;")
-            self._accept_btn.setVisible(True)
-            self._decline_btn.setVisible(True)
+            self._accept_btn.setEnabled(True)
+            self._decline_btn.setEnabled(True)
             self._countdown_label.setVisible(True)
-            self._set_countdown_text(f'{self._countdown} 秒后自动接受',
-                                     warn=self._is_warning())
+            self._set_hint_text('点击接受/拒绝，可随时反悔', tone='muted')
 
-    def _is_warning(self) -> bool:
-        """临期判定(最后 5 秒)。分母用本次 show 的总时长, 不写死 15。"""
-        return 0 < self._countdown <= min(5, self._countdown_total)
-
-    def show_check(self, countdown=15):
+    def show_check(self, countdown=None):
+        # v5.0.x: countdown 参数保留仅为兼容旧调用(_do_ready 传 15), 不再使用 ——
+        # 面板不做本地假倒计时, 真实倒计时由顶栏"⏳ 接受倒计时 N..."显示。
         if self._completed:
             return
         self._visible = True
         self._response = 'None'
-        self._countdown = countdown
-        self._countdown_total = max(1, int(countdown))
-        self._warning = False
-        self._countdown_label.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         self._update_ui()
-        self._accept_btn.setVisible(True)
-        self._decline_btn.setVisible(True)
+        self._accept_btn.setEnabled(True)
+        self._decline_btn.setEnabled(True)
         self._countdown_label.setVisible(True)
         self.setVisible(True)
-        self._timer.start(1000)
-        self._pulse_active = True
-        self._pulse_value = 0.0
-        self._pulse_dir = 1
-        self._pulse_timer.start()
 
     def hide_check(self):
         self._visible = False
-        self._timer.stop()
-        self._pulse_active = False
-        self._pulse_timer.stop()
         self.setVisible(False)
 
     def reset_check(self):
         self._completed = False
         self._response = 'None'
         self._visible = False
-        self._timer.stop()
-        self._pulse_active = False
-        self._pulse_timer.stop()
         self.setVisible(False)
 
-    @ui_slot
-    def _tick(self):
-        if self._response in ('Accepted', 'Declined'):
-            self._timer.stop()
-            self._pulse_active = False
-            self._pulse_timer.stop()
-            return
-        self._countdown -= 1
-        if self._countdown <= 0:
-            self._timer.stop()
-            self._pulse_active = False
-            self._pulse_timer.stop()
-            self._set_countdown_text('自动接受中...', warn=True)
-            self.update()          # 进度条清零
-            QTimer.singleShot(500, self.hide_check)
-            return
-        self._set_countdown_text(f'{self._countdown} 秒后自动接受',
-                                 warn=self._is_warning())
-        self.update()              # v4.4.1(UI-B6): 进度条按剩余比例重绘
-
-    @ui_slot
-    def _pulse_tick(self):
-        if not self._pulse_active:
-            return
-        self._pulse_value += 0.05 * self._pulse_dir
-        if self._pulse_value >= 1.0:
-            self._pulse_value = 1.0
-            self._pulse_dir = -1
-        elif self._pulse_value <= 0.0:
-            self._pulse_value = 0.0
-            self._pulse_dir = 1
-        self.update()
-
-    # v4.4.0 修复(P1-14): 小窗隐藏/关闭时, 这个 30ms 的脉冲定时器本来
-    # 会继续空转(面板自身只是 setVisible(False), 定时器不受影响)。
     def pause_timers(self):
-        """停掉面板的定时器, 记住"原本是否在跑"以便恢复。"""
-        self._resume_countdown = self._timer.isActive()
-        self._resume_pulse = self._pulse_active
-        self._timer.stop()
-        self._pulse_timer.stop()
+        """v5.0.x: 面板不再持有任何定时器, 保留空实现供 _pause_timers 调用。"""
+        pass
 
     def resume_timers(self):
-        """按暂停前的状态恢复(没在跑就不重启, 不制造空转)。"""
-        if getattr(self, '_resume_countdown', False) and self._visible:
-            self._timer.start(1000)
-        if getattr(self, '_resume_pulse', False) and self._pulse_active:
-            self._pulse_timer.start()
+        """v5.0.x: 同上, 空实现。"""
+        pass
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -324,27 +274,6 @@ class ReadyCheckPanel(QWidget):
         # 顶部折射高光
         _draw_top_highlight(p, w, h, r, intensity=3)
 
-        # 脉冲柔光描边
-        if self._pulse_active and self._pulse_value > 0:
-            alpha = int(15 + 35 * self._pulse_value)
-            _draw_glow_border(p, w, h, r, base_alpha=alpha, glow_expand=4)
-
-        # v4.4.1(UI-B6): 倒计时进度条 —— 贴底 2px, 剩余时间按比例收缩。
-        # 走 paintEvent 而非 QProgressBar/setStyleSheet: 每秒重绘一条 2px 线
-        # 远比每秒重建一次样式缓存便宜(与 P1-14/P1-18 同一条纪律)。
-        if (self._visible and self._response == 'None'
-                and not self._completed and self._countdown_total > 0
-                and self._countdown > 0):
-            frac = max(0.0, min(1.0, self._countdown / float(self._countdown_total)))
-            bar_w = max(0.0, (w - 2) * frac)
-            if bar_w > 0:
-                bar = QColor(Glass.DANGER if self._is_warning() else Glass.PRIMARY)
-                bar.setAlpha(210)
-                p.setPen(Qt.NoPen)
-                p.setBrush(bar)
-                # 底边内侧: 左右各留 1px, 高 2px, 圆角随面板
-                p.drawRoundedRect(QRectF(1, h - 3, bar_w, 2), 1, 1)
-
         p.end()
 
     @ui_slot
@@ -352,20 +281,19 @@ class ReadyCheckPanel(QWidget):
         self._response = response
         if response in ('Accepted', 'Declined'):
             self._completed = True
-            self._timer.stop()
         self._update_ui()
-        if response in ('Accepted', 'Declined'):
-            QTimer.singleShot(1500, self.hide_check)
+        # v5.0.x: 不再 1.5s 后自动收起 —— 面板保持到 ReadyCheck 结束, 方便反悔。
 
 
 class ChampionIcon(QPushButton):
     """小窗英雄头像按钮"""
     clicked_id = pyqtSignal(int)
 
-    def __init__(self, cid, name='', parent=None):
+    def __init__(self, cid, parent=None):
         super().__init__(parent)
         self.cid = cid
         self._is_selected = False
+        self._is_preinput = False
         self.setFixedSize(52, 52)
         self.setCursor(Qt.PointingHandCursor)
         # v17:不设 tooltip —— PyQt5 默认悬停 tooltip 是系统黑框,观感突兀
@@ -378,6 +306,11 @@ class ChampionIcon(QPushButton):
         (_refresh_preferred_highlight 里 icon._is_selected), 跨文件读私有属性
         破坏封装且 grep 困难。"""
         return self._is_selected
+
+    @property
+    def is_preinput(self) -> bool:
+        """v4.9.13:是否处于预输入(蓝光)态。"""
+        return self._is_preinput
 
     def _apply_normal(self):
         self.setStyleSheet(f"""
@@ -393,10 +326,29 @@ class ChampionIcon(QPushButton):
             QPushButton:pressed {{ padding-top: 1px; }}
         """)
 
-    def set_selected(self, sel, is_preferred: bool = False):
-        """v13:同时管选中态与偏好态(selected 优先级 > preferred)"""
+    def set_selected(self, sel, is_preferred: bool = False, is_preinput: bool = False):
+        """v13:同时管选中态与偏好态; v4.9.13:再加预输入态。
+
+        视觉优先级: 预输入(蓝) > 当前选中(靛) > 偏好(绿) > 普通。
+        为什么预输入排最前: 它是用户**手动点出来**的本局目标, 而"选中"只是
+        客户端当前恰好锁着谁 —— 排后面的话, 用户刚点亮蓝光的那个头像会被
+        "当前英雄"的靛框盖住, 看起来像没点上。
+        """
         self._is_selected = sel
-        if sel:
+        self._is_preinput = is_preinput
+        if is_preinput:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: {Glass.PREINPUT_SUBTLE};
+                    border: 2px solid {Glass.PREINPUT_BORDER};
+                    border-radius: {Glass.RADIUS_BTN};
+                }}
+                QPushButton:hover {{
+                    background: {Glass.PREINPUT_SOFT};
+                    border-color: {Glass.PREINPUT_BORDER_HOVER};
+                }}
+            """)
+        elif sel:
             self.setStyleSheet(f"""
                 QPushButton {{
                     background: rgba(99, 102, 241, 0.12);
@@ -468,15 +420,31 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
     sig_hide = pyqtSignal()
     sig_live_status = pyqtSignal(str, str)
     sig_mini_log = pyqtSignal(str)
+    # v4.9.13: 用户单击备选英雄 → 请求切换预输入。携带 cid(int)。
+    # 小窗**不自己记账**, 只 emit + 等 main 回推 set_preinput();
+    # 否则"界面已变蓝、脚本没收到"这种漂移会很难查。
+    sig_preinput = pyqtSignal(int)
+    # v4.9.14: core 回推"当前预输入英雄"状态 → 主线程更新蓝光。
+    # 为什么必须是信号: _on_bench 在 core 的 poll/WS **后台线程**里跑, 若像
+    # 上一版那样直调 set_preinput(), 会从非 GUI 线程遍历 _icons 并 setStyleSheet
+    # (违反 Qt 线程模型, 且与主线程 _do_bench 的 icons.pop 并发会抛
+    # "dictionary changed size during iteration")。走 pyqtSignal, Qt 会按接收者
+    # (主线程)亲和自动选 QueuedConnection, 与 update_bench_champions 同构。
+    sig_preinput_state = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
         self._icons: Dict[int, ChampionIcon] = {}
-        self._champ_data: Dict[int, str] = {}
+        # v4.x(P3): _champ_data 死数据流已删 —— ChampionIcon 的 name 参数从不
+        # 被使用(只存 cid), set_champion_data 保留为兼容空操作(见下方注释)。
         self._settings = {}
         # v13 优化项 1:偏好英雄集合(用于头像描边高亮)
         self._preferred: set = set()
-        # S3:顶部 _live_dot 只表达"连接态",脚本运行态体现在 _live_text。
+        # v4.9.13: 预输入英雄 id(0=无)。由 main 从 core 回推, 小窗只读。
+        self._preinput_cid = 0
+        # S3:顶部 _live_dot 只表达"连接态"; _live_text 由连接态**权威写入**
+        # (三态文案), 脚本运行态只在连接态之外的间隙显示 —— 见 _do_conn_state,
+        # 该行为有回归测试钉死, 勿拆走。
         # v4.4.1(UI-B5): 由 bool 改为三态字符串('connected'/'connecting'/'disconnected')
         # —— "应用刚起来正在扫客户端"和"客户端根本没开"原来渲染得一模一样。
         # v4.4.0 修复(P2 拖拽/P1-21 玻璃): _drag_pos 必须显式 None
@@ -551,8 +519,20 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
             GWL_EXSTYLE = -20
             WS_EX_TOOLWINDOW = 0x00000080
             user32 = ctypes.windll.user32
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW)
+            # v4.x(P3): 64 位下 Get/SetWindowLongW 是 32 位截断版本, 按指针位宽
+            # 选择 Ptr 版本, 避免高 32 位被丢弃。
+            if ctypes.sizeof(ctypes.c_void_p) == 8:
+                get_style = user32.GetWindowLongPtrW
+                set_style = user32.SetWindowLongPtrW
+            else:
+                get_style = user32.GetWindowLongW
+                set_style = user32.SetWindowLongW
+            set_style.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong)
+            set_style.restype = ctypes.c_longlong
+            get_style.argtypes = (ctypes.c_void_p, ctypes.c_int)
+            get_style.restype = ctypes.c_longlong
+            style = get_style(hwnd, GWL_EXSTYLE)
+            set_style(hwnd, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW)
         except Exception as e:
             # v4.4.2(P2-20): 原 `except Exception: pass` 静默吞 —— 失败时任务栏
             # 会多出一个图标(用户可见)却无任何日志。补打印, 便于定位。
@@ -642,6 +622,7 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         self.sig_champ_name.connect(lambda n: self._champ_label.setText(n if n else ''))
         self.sig_bench.connect(self._do_bench)
         self.sig_icon.connect(self._do_icon)
+        self.sig_preinput_state.connect(self._do_preinput_state)
         self.sig_clear.connect(self._do_clear)
         self.sig_ready.connect(self._do_ready)
         self.sig_ready_response.connect(lambda r: self._ready_panel.set_response(r))
@@ -866,15 +847,9 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         self._run_btn = QPushButton('启动')
         self._run_btn.setFixedSize(52, 24)
         self._run_btn.setCursor(Qt.PointingHandCursor)
-        self._run_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {Glass.PRIMARY_SUBTLE}; color: {Glass.PRIMARY};
-                border: 1px solid rgba(99,102,241,0.15); border-radius: {Glass.RADIUS_SM};
-                font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
-            }}
-            QPushButton:hover {{ background: {Glass.PRIMARY}; color: white; border-color: {Glass.PRIMARY}; }}
-            QPushButton:pressed {{ padding-top: 1px; }}
-        """)
+        self._run_btn.setStyleSheet(_run_btn_qss(
+            Glass.PRIMARY_SUBTLE, Glass.PRIMARY, 'rgba(99,102,241,0.15)',
+            Glass.PRIMARY, 'white', Glass.PRIMARY))
         self._run_btn.clicked.connect(self.toggle_script_signal)
         lay.addWidget(self._run_btn)
 
@@ -900,7 +875,7 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         self.sig_conn_state.emit(state, text or '')
 
     def update_status(self, text):
-        """脚本运行态文本,驱动顶栏右侧 _champ_label(简短,8 字截断)"""
+        """脚本运行态文本,驱动顶栏 _live_text(连接态三态文案会覆盖它, 属有意设计)。"""
         self.sig_status.emit(text)
 
     def update_current_champion(self, name):
@@ -908,6 +883,36 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
 
     def update_bench_champions(self, ids, current_id=None):
         self.sig_bench.emit(ids, current_id)
+
+    def set_preinput(self, cid):
+        """v4.9.14:由 main 回推"当前预输入的英雄"(0=无)。
+
+        本方法**必须从任意线程都可安全调用** —— _on_bench 在 core 的 poll/WS 后台
+        线程里跑。因此这里只做信号发射, 真正的控件操作由主线程槽 _do_preinput_state
+        执行。这样界面上亮蓝光的那个英雄, 一定就是 core 正在盯的那个。
+        """
+        try:
+            cid = int(cid or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        self.sig_preinput_state.emit(cid)
+
+    @ui_slot
+    def _do_preinput_state(self, cid):
+        """v4.9.14:主线程执行预输入蓝光更新(信号槽)。幂等: 值没变不重绘。
+
+        这是 `_preinput_cid` 的**唯一视觉写入点**。core 是权威源, 本槽只照画。
+        """
+        try:
+            cid = int(cid or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid == self._preinput_cid:
+            return
+        self._preinput_cid = cid
+        for c, icon in self._icons.items():
+            # icon.is_selected 已是"当前英雄"态, 这里原样传回(不重算)
+            icon.set_selected(icon.is_selected, c in self._preferred, c == cid)
 
     def set_champion_icon(self, cid, data):
         if data:
@@ -1003,30 +1008,30 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         self._script_running = running
         if running:
             self._run_btn.setText('停止')
-            self._run_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {Glass.DANGER_SUBTLE}; color: {Glass.DANGER};
-                    border: 1px solid rgba(248,113,113,0.15); border-radius: {Glass.RADIUS_SM};
-                    font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
-                }}
-                QPushButton:hover {{ background: {Glass.DANGER}; color: white; border-color: {Glass.DANGER}; }}
-                QPushButton:pressed {{ padding-top: 1px; }}
-            """)
+            self._run_btn.setStyleSheet(_run_btn_qss(
+                Glass.DANGER_SUBTLE, Glass.DANGER, 'rgba(248,113,113,0.15)',
+                Glass.DANGER, 'white', Glass.DANGER))
         else:
             self._run_btn.setText('启动')
-            self._run_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {Glass.PRIMARY_SUBTLE}; color: {Glass.PRIMARY};
-                    border: 1px solid rgba(99,102,241,0.15); border-radius: {Glass.RADIUS_SM};
-                    font-size: {Glass.FONT_SIZE_SM}; font-weight: 600;
-                }}
-                QPushButton:hover {{ background: {Glass.PRIMARY}; color: white; border-color: {Glass.PRIMARY}; }}
-                QPushButton:pressed {{ padding-top: 1px; }}
-            """)
+            self._run_btn.setStyleSheet(_run_btn_qss(
+                Glass.PRIMARY_SUBTLE, Glass.PRIMARY, 'rgba(99,102,241,0.15)',
+                Glass.PRIMARY, 'white', Glass.PRIMARY))
 
     @ui_slot
     def update_settings(self, settings):
-        self._settings = settings.copy()
+        # v5.0.0(#3 P3): 判空必须排在 .copy() 之前 —— 上一版声称修了 None,
+        # 实际只修了 core 侧; 这里 None.copy() 会抛 AttributeError。
+        if settings is not None:
+            self._settings = settings.copy()
+        else:
+            settings = {}
+        # v4.9.14: 关掉「预输入选英雄」开关时, 本地蓝光同帧收起。
+        # core 的 update_settings 也会清权威标记并随 _on_bench 回推, 这里是
+        # UI 侧的即时兜底 —— 用户关开关的瞬间不等下一轮轮询就看到蓝光消失。
+        if settings is not None and settings.get('auto_preinput_champion') is False \
+                and self._preinput_cid:
+            self._preinput_cid = 0
+            self._refresh_preferred_highlight()
         for key, btn in self._toggle_btns.items():
             if key in self._settings:
                 v = self._settings[key]
@@ -1058,13 +1063,20 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
             self._refresh_preferred_highlight()
 
     def _refresh_preferred_highlight(self):
-        """v13 优化项 1:遍历 _icons 重设每个头像的偏好描边状态(选中态优先级 > 偏好态)"""
+        """v13 优化项 1:遍历 _icons 重设每个头像的偏好描边状态(选中态优先级 > 偏好态)
+        v4.9.13:预输入态一起重描(优先级最高)。"""
         for cid, icon in self._icons.items():
             # v4.4.2(P2-7): 走只读 property, 不再直读私有 _is_selected。
-            icon.set_selected(icon.is_selected, cid in self._preferred)
+            icon.set_selected(icon.is_selected, cid in self._preferred,
+                              cid == self._preinput_cid)
 
     def set_champion_data(self, data):
-        self._champ_data = data
+        """v4.x(P3): 保留的兼容空操作。
+
+        main.py 的 _on_champ_data 仍会调用本方法传入英雄名映射, 但小窗内
+        ChampionIcon 从不使用 name(死数据流已删除), 故此处不再存储。
+        删除本方法需要同步改 main.py, 不在本次改动范围内。
+        """
 
     # ==================== 实际更新 ====================
     @ui_slot
@@ -1107,8 +1119,9 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         用户会以为软件坏了。现在 'connecting' 走琥珀 + 半透明琥珀 ring, 与
         'disconnected' 的红色危险语义区分开。
 
-        `_live_text` 优先用调用方给的文案, 没给就按状态取默认(三个公开入口都
-        允许省略文案)。
+        连接态是顶栏 _live_text 的权威写入方(会覆盖脚本运行态文案) —— 这是有意
+        设计且有回归测试钉死(TestOverlayConnState 断言 _live_text 显示"已连接/
+        连接中/未连接")。脚本运行态只在连接态之外的间隙显示, 请勿拆走。
         """
         if state not in CONN_STATE_COLORS:
             state = 'disconnected'
@@ -1133,7 +1146,7 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
 
     @ui_slot
     def _do_conn_top(self, connected: bool, text: str):
-        """v8 显式驱动:顶部 _live_dot + 顶部 _live_text + 底部 _conn_dot + 底部 _conn_lbl
+        """v8 显式驱动:顶部 _live_dot + 底部 _conn_dot + 底部 _conn_lbl
         同步翻转,圆点颜色只表达连接态。
 
         v4.4.1(UI-B5): 本体已挪到 `_do_conn_state`(三态)。这里保留 bool 入口并
@@ -1192,7 +1205,7 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         v12 恢复 v10 行为 — S3 圆点颜色归 _do_conn_top 唯一维护,_do_live_status
         不再写 _live_dot 颜色/启动 _pulse_timer(脉冲已废弃,只有三点动画)。
         """
-        clean = text
+        clean = text or ''
         for emoji in STATUS_EMOJI_STRIP:
             clean = clean.replace(emoji, '')
         clean = clean.strip()
@@ -1222,9 +1235,14 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         old = set(self._icons.keys())
         # v13 优化项 1:把偏好状态一起传给 set_selected(selected, preferred),
         # 选中态优先级 > 偏好态,选中时不被偏好绿框覆盖。
+        # v4.9.13:再加第三态 preinput(优先级最高, 见 set_selected)。
+        # v4.9.14:预输入"已不在池中"的蓝光收起**不在这里做** —— core 的
+        # _do_preinput 分支③是权威源, 会通过 _on_bench → set_preinput → 信号
+        # 推 0 过来, 本槽只负责照画, 避免与权威源形成双写入点。
         if cur_set == old:
             for cid, icon in self._icons.items():
-                icon.set_selected(cid == current_id, cid in self._preferred)
+                icon.set_selected(cid == current_id, cid in self._preferred,
+                                  cid == self._preinput_cid)
             return
         for cid in list(self._icons.keys()):
             if cid not in cur_set:
@@ -1234,11 +1252,11 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         r, c = 0, 0
         for cid in ids:
             if cid not in self._icons:
-                name = self._champ_data.get(cid, f'ID:{cid}')
-                icon = ChampionIcon(cid, name)
+                icon = ChampionIcon(cid)
                 icon.clicked_id.connect(self._on_click)
                 self._icons[cid] = icon
-            self._icons[cid].set_selected(cid == current_id, cid in self._preferred)
+            self._icons[cid].set_selected(cid == current_id, cid in self._preferred,
+                                          cid == self._preinput_cid)
             self._grid.addWidget(self._icons[cid], r, c)
             c += 1
             if c >= 4:
@@ -1247,6 +1265,17 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
 
     @ui_slot
     def _on_click(self, cid):
+        """v4.9.13: 单击备选英雄 —— 开关开=标记预输入(蓝光), 开关关=旧的立即换。
+
+        为什么不做成"两个都用, 加右键": 右键换英雄是隐藏操作, 用户记不住;
+        而开关关闭时退回旧行为, 需要立即换的人关掉开关即可, 语义干净。
+        """
+        if self._settings.get('auto_preinput_champion', True):
+            # 只发请求, 不在这里改视觉 —— 由 main 回调 set_preinput() 统一重描,
+            # 保证"看到的"与"core 记的"永远是同一个值。
+            self.sig_preinput.emit(cid)
+            return
+        # 开关关闭: 完全保持 v4.9.12 及以前的行为(单击立即换)
         for c, icon in self._icons.items():
             icon.set_selected(c == cid, c == cid and c in self._preferred)
         self.swap_signal.emit(cid)
@@ -1273,16 +1302,12 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
     @ui_slot
     def _do_ready(self, visible):
         if visible:
-            # v4.4.2(P1-17): 原用 _ready_visible 标志当"面板是否在显示"的代理,
-            # 但面板有两条自动消失路径都不回写它 —— _on_accept/_on_decline 排
-            # singleShot(1500, hide_check) 与 _tick 倒计时归零排 singleShot(500,
-            # hide_check)。而 main.py 在同一局内只推 True(phase 不变), 重推的 True
-            # 被旧标志吃掉 → 面板第一次自动消失后, 同一局再也不出现。
-            # 改判面板真实可见性 isVisible(): 已显示(含响应后等待隐藏的过渡态)
-            # 时不重置倒计时(保留 G1 语义); 已隐藏则重置并重新弹出。
-            if not self._ready_panel.isVisible():
+            # v5.0.x: 面板在确认窗口内常驻可反悔; 已给出响应(is_completed)后,
+            # 即使轮询每秒重推 True 也不重弹/重置, 直到离开 ReadyCheck 由 core
+            # 推 False → hide + reset, 下一局再重弹。
+            if not self._ready_panel.isVisible() and not self._ready_panel.is_completed:
                 self._ready_panel.reset_check()
-                self._ready_panel.show_check(countdown=15)
+                self._ready_panel.show_check()
         else:
             self._ready_panel.hide_check()
             self._ready_panel.reset_check()

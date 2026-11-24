@@ -49,7 +49,10 @@ class WebSocketListener:
         self._last_err_t = {}
         self._err_window_s = 60.0
         self._q_dropped = 0
-        self._q_drop_reported = False
+        # v4.4.x(P3): _q_dropped 只加不读, 换成"上次丢弃报告时刻" —— 每 60s
+        # 打印一次累计丢弃数并清零, 让满队列这一故障信号定期可见, 而不是
+        # 进程生命周期里只报第一次。
+        self._q_drop_last_report = 0.0
 
     @property
     def is_connected(self) -> bool:
@@ -81,6 +84,11 @@ class WebSocketListener:
         # getattr 兜底，否则会抛 AttributeError 而不是返回 'no-client'。
         if self._c is None or not getattr(self._c, 'is_connected', False):
             return 'no-client'
+        # v4.4.x(P3): 上面的 is_connected 检查与下方 _connect_locked 读 port 之间
+        # 存在竞态 —— 另一个线程可能在检查通过后 reset() 连接器, 使 port 变 None
+        # 拼出 wss://127.0.0.1:None/。临界区里再读一次并断言, 失配即返回 no-client。
+        if not self._c.is_connected:
+            return 'no-client'
         # v4.4.2(P1-19): 持锁进入临界区 —— 把"单飞检查 + 赋值 self._thread + start"
         # 收成原子操作。两个调用方(main.py:1594 / main.py:2000)各自受不同标志
         # 保护、互不检查, 只有锁能挡住它们并发起出两条 run_forever。
@@ -107,8 +115,13 @@ class WebSocketListener:
         self._ensure_consumer()
 
         # v4.4.2(P2-9): 走 connector 的公开 port property, 不再直读私有 _port。
-        ws_url = f'wss://127.0.0.1:{self._c.port}/'
-        token = self._c.auth[1]
+        port = getattr(self._c, 'port', None)
+        token = getattr(self._c, 'auth', ('riot', ''))[1]
+        # v4.4.x(P3): 临界区内再校验一次 —— connect() 的无锁检查与这里之间仍可能
+        # 被 reset(), 必须保证 port 非空, 否则拼出坏 URL 且异常信息难以定位。
+        if not port:
+            return 'no-client'
+        ws_url = f'wss://127.0.0.1:{port}/'
 
         # v4.4.0 修复：用「每代连接独立的标记」替代全局 _manual_close 判定。
         # 旧实现里 connect() 会把 _manual_close 复位为 False，若上一代读线程
@@ -167,8 +180,11 @@ class WebSocketListener:
                                  'data': data[3]}
                     if event:
                         self._enqueue(event)
-                elif isinstance(data, dict):
-                    self._enqueue(data)
+                    # v4.4.x(P3): 删除 `elif isinstance(data, dict): self._enqueue(data)`
+                    # 分支 —— LCU 的 WS 帧恒为 [8, "OnJsonApiEvent", {...}] 列表形状,
+                    # 顶层裸 dict 不是任何已观测到的合法来源; 且这类 dict 往往不含
+                    # 'uri' 字段, 入队后在 _dispatch 里查不到任何 handler, 只会白占
+                    # 队列。与"非 OnJsonApiEvent 操作码直接忽略"的处理对齐。
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -285,10 +301,15 @@ class WebSocketListener:
             self._q.put_nowait(event)
         except queue.Full:
             self._q_dropped += 1
-            if not self._q_drop_reported:
-                self._q_drop_reported = True
-                self._report_error(f'[WS] 事件队列已满({self._Q_MAXSIZE}), 开始丢弃'
-                                   f'积压事件(消费线程被慢处理器卡住)', kind='qfull')
+            now = time.monotonic()
+            if self._q_drop_last_report == 0.0 or \
+                    now - self._q_drop_last_report >= self._err_window_s:
+                dropped = self._q_dropped
+                self._q_dropped = 0
+                self._q_drop_last_report = now
+                self._report_error(
+                    f'[WS] 事件队列已满({self._Q_MAXSIZE}), 60s 内丢弃 {dropped} 条'
+                    f'积压事件(消费线程被慢处理器卡住)', kind='qfull')
         except Exception as e:
             self._report_error(f'[WS] 事件入队失败: {type(e).__name__}: {e}',
                                kind='enqueue')
@@ -417,7 +438,13 @@ class WebSocketListener:
                 t.join(timeout=2.0)   # v4.4.0 修复：等读线程收尾，消除重连竞态
             except Exception:
                 pass
-        self._thread = None           # v4.4.0 修复：置空，否则单飞守卫会永久短路
+        # v5.0.0(#3 P1): 只有线程**确实退出**才置 None —— 与 _stop_consumer(:362)
+        # 同口径。原先无条件置 None: join 超时(读线程卡在慢 handler 里)后
+        # _thread=None, 下一次 _connect_locked 的单飞检查(:104)看到 None 就直接
+        # 起第二条 run_forever, 两条 WS 连接并存 → 同一事件双份分发 → 重复
+        # accept / 重复 bench_swap。
+        if t is None or not t.is_alive():
+            self._thread = None
         self._connected = False
         self._manual_close = False
         self._stop_consumer()

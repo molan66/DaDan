@@ -24,12 +24,18 @@ from .styles import Glass
 
 from .window_base import ui_slot
 
+# 模块级近黑背景色令牌: 窗口底色 / 标题栏底色 / 卡片底色三处原本各自硬编码,
+# 统一到这里方便整体调暗度(与 Glass 色板保持同一档深色玻璃观感)。
+_BG_WINDOW = (8, 10, 18, 155)      # 主窗/小窗顶层半透明底色
+_BG_TITLEBAR = (14, 16, 24, 160)   # 标题栏半透明底色
+_BG_CARD = (12, 14, 24, 180)       # 玻璃卡片底色
+
 
 def paint_window_backdrop(p, w, h):
     """主窗/小窗统一的顶层玻璃背景: 深色半透明底色 + 顶部柔光
     （底层由 DWM 系统 Acrylic 模糊提供, 此处只画半透明着色层）"""
     p.setPen(Qt.NoPen)
-    p.setBrush(QColor(8, 10, 18, 155))
+    p.setBrush(QColor(*_BG_WINDOW))
     p.drawRect(0, 0, w, h)
     # 顶部柔光线
     cr, cg, cb = Glass.NEON_QCOLOR
@@ -141,7 +147,12 @@ class SpringStackedWidget(QStackedWidget):
 
 
 class HoverRow(QWidget):
-    """容器行 - 透明无 hover 绘制（白色 hover 背景已按用户要求移除）"""
+    """容器行 - 透明无 hover 绘制（白色 hover 背景已按用户要求移除）。
+
+    纯容器语义: 不覆写 paintEvent、不画任何东西, 只承载布局。
+    调用方(main_window.py / overlay_window.py)在它上面 setLayout, 靠它把
+    若干子控件聚成一行。**不要删除本类**: 它是两处调用点的公共容器类型。
+    """
 
 
 def _draw_glow_border(p, w, h, r, base_alpha=28, glow_expand=4, color=None):
@@ -230,7 +241,7 @@ class GlassTitleBar(QWidget):
 
         # 半透明背景
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(14, 16, 24, 160))
+        p.setBrush(QColor(*_BG_TITLEBAR))
         p.drawRect(0, 0, w, h)
 
         # 顶部折射高光
@@ -296,7 +307,7 @@ class GlassCard(QWidget):
 
         # 卡片背景
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(12, 14, 24, 180))
+        p.setBrush(QColor(*_BG_CARD))
         p.drawRoundedRect(0, 0, w, h, r, r)
 
         # 顶部折射高光
@@ -578,7 +589,12 @@ def make_empty_state(icon_char, title, hint='', min_height=120,
 
     animated=True 时下方挂三点呼吸指示器(仅"加载中"这类进行态需要),
     开始呼吸必须显式调 `.start()` —— 工厂不自动启动, 让调用方决定生命周期。
-    返回的 `QWidget` 上挂了 `dots` 属性(未启用时为 None)。
+
+    ⚠️ 返回值的动态属性是**固定契约**, 调用方(main_window.py:1921-1928)依赖它们:
+        - `.dots`        : LoadingDots 或 None(animated=False 时)
+        - `.title_label` : 标题 QLabel, 恒非 None
+        - `.hint_label`  : 副提示 QLabel 或 None(hint='' 时)
+    改名/移除必须同步 grep 全部调用点。
     """
     w = QWidget()
     w.setStyleSheet('background:transparent;')

@@ -10,12 +10,13 @@
 
 import json
 import os
+import threading
 import time as _time
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit,
     QApplication, QScrollArea, QProgressBar,
-    QGraphicsOpacityEffect, QCheckBox
+    QGraphicsOpacityEffect, QCheckBox, QMessageBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation
 # v4.4.0 修复(P1-22): QFont 原来在 SidebarButton.paintEvent 内部 import
@@ -28,7 +29,10 @@ from .styles import Glass
 # 这里用原名别名导入, 模块内既有调用点无需改动。
 from .match_fmt import (LANE_CN as _LANE_CN, phase_text as _phase_text,
                         game_mode_text as _game_mode_text,
-                        dur_text as _dur_text, time_text as _time_text)
+                        dur_text as _dur_text, time_text as _time_text,
+                        lane_text as _lane_text, kda_text as _kda_text,
+                        kda_ratio as _kda_ratio,
+                        wan_compact as _wan_compact, num_text as _num_text)
 from .icons import (icon_home, icon_settings, icon_hero, icon_chart, icon_log,
                      AnimatedToggle, make_title_buttons, rounded_pixmap,
                      icon_to_pixmap)
@@ -150,6 +154,18 @@ def _group_code(code: str, size: int = 5) -> str:
     """
     s = (code or '').replace('-', '')
     return '-'.join(s[i:i + size] for i in range(0, len(s), size))
+
+
+def _as_int(v, default=0) -> int:
+    """容错 int 转换：None/空串/非数字一律回落 default。
+
+    update_account_info 原形是 `int(info.get(k) or 0)` —— `or 0` 已并入本助手
+    (空值走 except 分支返回 default)，行为一致且不再到处裸 int()。
+    """
+    try:
+        return int(v or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _fmt_size(n) -> str:
@@ -489,9 +505,11 @@ def _make_toggle_row(label, toggle_key, settings, toggles_dict, on_toggle_fn):
 
 
 class _MatchRow(QWidget):
-    """战绩页单场行: [英雄头像] 英雄名/模式·时长·位置·时间 | KDA | 胜/负徽章
+    """战绩页单场行: [胜负竖条+头像] 英雄名/模式·时长·位置·时间 | KDA | 经济/补刀/输出 | 胜/负徽章
 
     v4.3.0: 整行可点击 → 查看本局详情(clicked 信号由战绩页转发给主窗)。
+    v4.10.x: 左侧加 3px 胜负竖条(胜红/负绿), 行内加经济/补刀/输出三列 ——
+    字段由 main._parse_recent/_parse_eog_stats 直接带出, 无额外请求。
 
     注意: **这里不设 setToolTip** —— 用户明确不要"点击查看本局详情"的悬浮小提示。
     可点击性靠 PointingHandCursor + 悬停高亮表达就够了。
@@ -502,12 +520,29 @@ class _MatchRow(QWidget):
     # 图标轮询的时间窗: 窗口内持续重试(覆盖慢速下载), 超窗即放弃 ——
     # 防某个英雄图标永久不存在时每 900ms 空打网络(LCU + CDN 双请求)
     ICON_RETRY_WINDOW_S = 15.0
+    # 胜负竖条宽(画在行最左)
+    WIN_BAR_W = 3
+    # 指标列宽(经济/补刀/输出, 数值右对齐; 与 KDA 列同源风格)。
+    # v4.10.x: 52 → 64 —— "99.9万" 实测 72px(离屏字体), 52 放不下会裁切;
+    # 配合 wan 紧凑格式(≥100万 取整)最宽 "99.9万" 必须留足。
+    METRIC_W = 64
+    # 可压缩文本列的最小宽度: 布局空间不足时允许压到这个宽度(子标题/名字
+    # 都有省略号逻辑, 压缩不会丢字, 只是提前截断)。不设的话 QLabel 的
+    # minimumSizeHint = 整段文本宽, 滚动区比它窄时整行右侧溢出被裁。
+    TEXT_MIN_W = 48
 
     def __init__(self, game, parent=None):
         super().__init__(parent)
         self._game = game or {}
+        # v4.10.x(P0): EOG 即时战绩插入的行打标记。update_recent 全量重建时,
+        # 该局若 match-history 尚未入库(1~3 分钟延迟)会被当成"消失"删掉;
+        # 标记让重建逻辑把它保留, 等正式数据带回同 game_id 再覆盖。
+        self._from_eog = False
         self.icon_loaded = False
         self.icon_deadline = _time.monotonic() + self.ICON_RETRY_WINDOW_S
+        # v4.4.x(P2): 只对未请求过的 cid 调一次下载回调, 避免每 900ms 重复触发;
+        # set_icon 成功或超窗后复位(想重试时允许再次请求)。
+        self._dl_requested = False
         self._hovered = False
         cid = self._game.get('champion_id')
         try:
@@ -517,13 +552,17 @@ class _MatchRow(QWidget):
 
         self.setFixedHeight(52)
         self.setCursor(Qt.PointingHandCursor)
+        # v4.4.x(P3): 键盘可达性 —— 行可聚焦, Enter/Space 触发与鼠标点击相同的
+        # clicked 信号(见 keyPressEvent)。
+        self.setFocusPolicy(Qt.StrongFocus)
         # QWidget 子类默认不绘制样式表里的 background, 必须开 WA_StyledBackground
         # (v4.4.0: 行底色改 paintEvent 自绘后该属性不再必需, 保留无副作用 ——
         #  避免动到其它继承的样式表语义)
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 6, 10, 6)
+        # 左边距多留 WIN_BAR_W, 给竖条腾位置
+        lay.setContentsMargins(10 + self.WIN_BAR_W, 6, 10, 6)
         lay.setSpacing(10)
 
         # 英雄头像(占位=英雄名首字, 下载完成后 set_icon 覆盖)
@@ -546,6 +585,10 @@ class _MatchRow(QWidget):
         self._sub_lbl.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};"
             f"color:{Glass.TEXT_MUTED};background:transparent;")
+        # v4.10.x: 允许压缩 —— 两个 label 的最小宽度收到 TEXT_MIN_W,
+        # 空间不足时省略号截断(截断逻辑 _apply_sub_elide 已有), 行不溢出。
+        self._name_lbl.setMinimumWidth(self.TEXT_MIN_W)
+        self._sub_lbl.setMinimumWidth(self.TEXT_MIN_W)
         mid.addWidget(self._name_lbl)
         mid.addWidget(self._sub_lbl)
 
@@ -554,6 +597,45 @@ class _MatchRow(QWidget):
         self._kda_lbl.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_MD};font-weight:600;"
             f"color:{Glass.TEXT_SECONDARY};background:transparent;")
+        # v4.10.x: KDA 下方叠加 KDA 比小字(国服玩家扫一眼更关心比值)
+        self._kda_ratio_lbl = QLabel()
+        self._kda_ratio_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._kda_ratio_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};"
+            f"color:{Glass.TEXT_MUTED};background:transparent;")
+        # v4.10.x: KDA 列同样允许压缩("12 / 10 / 13" 实测 156px 是
+        # minimumSizeHint, 滚动区窄时把行撑溢出; 压到 74 也够读)。
+        self._kda_lbl.setMinimumWidth(74)
+        self._kda_ratio_lbl.setMinimumWidth(40)
+        kda_col = QVBoxLayout()
+        kda_col.setContentsMargins(0, 0, 0, 0)
+        kda_col.setSpacing(0)
+        kda_col.addWidget(self._kda_lbl)
+        kda_col.addWidget(self._kda_ratio_lbl)
+
+        # v4.10.x: 经济/补刀/输出三列 —— 与 KDA 列同一套"上数值下标签"样式
+        self._metric_cols = []
+        self._metric_layouts = []
+        for label in ('经济', '补刀', '输出'):
+            val = QLabel()
+            val.setFixedWidth(self.METRIC_W)
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            val.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
+                f"color:{Glass.TEXT_SECONDARY};background:transparent;")
+            lab = QLabel(label)
+            lab.setFixedWidth(self.METRIC_W)
+            lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lab.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};"
+                f"color:{Glass.TEXT_MUTED};background:transparent;")
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(0)
+            col.addWidget(val)
+            col.addWidget(lab)
+            self._metric_cols.append((val, lab))
+            self._metric_layouts.append(col)
 
         self._badge = QLabel()
         self._badge.setFixedSize(24, 24)
@@ -561,7 +643,9 @@ class _MatchRow(QWidget):
 
         lay.addWidget(self._icon_lbl)
         lay.addLayout(mid, 1)
-        lay.addWidget(self._kda_lbl)
+        lay.addLayout(kda_col)
+        for col in self._metric_layouts:
+            lay.addLayout(col)
         lay.addWidget(self._badge)
 
         self._fill()
@@ -578,19 +662,33 @@ class _MatchRow(QWidget):
         d = _dur_text(g.get('duration_s'))
         if d:
             parts.append(d)
-        lane = _LANE_CN.get(str(g.get('lane') or '').upper())
+        lane = _lane_text(g.get('lane'))
         if lane:
             parts.append(lane)
         t = _time_text(g.get('created_ms'))
         if t:
             parts.append(t)
-        self._sub_lbl.setText(' · '.join([p for p in parts if p]))
+        # v4.10.x: 子标题省略号截断, 过长文本不再被 Qt 硬裁成半截字
+        sub = ' · '.join([p for p in parts if p])
+        self._sub_full = sub
+        self._apply_sub_elide()
 
         k, dd, a = g.get('kills'), g.get('deaths'), g.get('assists')
+        self._kda_lbl.setText(_kda_text(k, dd, a))
+        # KDA 比: (击杀+助攻)/max(1,死亡); 任一缺字段显示占位
         if k is None or dd is None or a is None:
-            self._kda_lbl.setText('— / — / —')
+            self._kda_ratio_lbl.setText('')
         else:
-            self._kda_lbl.setText(f'{k} / {dd} / {a}')
+            self._kda_ratio_lbl.setText(f'KDA {_kda_ratio(k, dd, a)}')
+
+        # v4.10.x: 经济/补刀/输出 —— 缺字段显示 '—', 不瞎猜 0。
+        # 输出用 wan_compact(≥100万取整), 保证最宽值也放得进 64px 定宽列。
+        gold = g.get('gold')
+        cs = g.get('cs')
+        dmg = g.get('dmg')
+        self._metric_cols[0][0].setText(_wan_compact(gold))
+        self._metric_cols[1][0].setText(_num_text(cs))
+        self._metric_cols[2][0].setText(_wan_compact(dmg))
 
         # 胜=红 / 负=绿(国服习惯: 红为正向)
         if g.get('win') is True:
@@ -605,14 +703,34 @@ class _MatchRow(QWidget):
                 'background: rgba(52,211,153,0.16); color: #34d399;'
                 f'border-radius: {Glass.RADIUS_SM}px;'
                 f'font-size: {Glass.FONT_SIZE_XS}; font-weight: 700;')
+        # 胜负色变了, 竖条也要跟着重画
+        self.update()
+
+    def _apply_sub_elide(self):
+        """按当前 label 宽度做单行省略; 完整文本在 _sub_full, tooltip 可见。"""
+        try:
+            sub = getattr(self, '_sub_full', '') or ''
+            fm = self._sub_lbl.fontMetrics()
+            w = max(20, self._sub_lbl.width())
+            self._sub_lbl.setText(fm.elidedText(sub, Qt.ElideRight, w))
+            self._sub_lbl.setToolTip(sub)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        """宽度变化时重算子标题省略号 —— 构造期布局未激活, width 可能不准。"""
+        super().resizeEvent(event)
+        self._apply_sub_elide()
 
     def paintEvent(self, event):
-        """行底色(悬停/常态)在 paintEvent 里画。
+        """行底色(悬停/常态) + 左侧胜负竖条, 全在 paintEvent 里画。
 
         v4.4.0 修复(P1-18): 原来 enterEvent/leaveEvent 各自 `setStyleSheet`
         重写整行 `background/border-radius` —— 每次鼠标划过一行都触发一次
         QSS 解析 + 该行及其子控件重新 polish, 滚动列表里鼠标扫过几十行时
         是可见的抖动源。底色本就只是一个圆角矩形, 直接画即可。
+
+        v4.10.x: 胜红/负绿竖条画在最左, 与底色圆角同框, 不重写 QSS。
         """
         super().paintEvent(event)
         p = QPainter(self)
@@ -622,6 +740,13 @@ class _MatchRow(QWidget):
         p.setBrush(QColor(255, 255, 255, 23 if self._hovered else 9))
         r = Glass.RADIUS_BTN
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), r, r)
+        # 胜负竖条: 红=胜 / 绿=负(与徽章同色系), 未定(脏数据)不画
+        win = self._game.get('win')
+        if isinstance(win, bool):
+            bar = QColor('#f87171') if win else QColor('#34d399')
+            p.setBrush(bar)
+            p.drawRoundedRect(
+                0, 8, self.WIN_BAR_W, self.height() - 16, 2, 2)
         p.end()
 
     def _apply_bg(self):
@@ -647,6 +772,17 @@ class _MatchRow(QWidget):
                 print(f'[战绩] 行点击处理失败: {type(e).__name__}: {e}')
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event):
+        """v4.4.x(P3): 键盘可达性 —— Enter/Space 等价于鼠标点击本行。"""
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            try:
+                self.clicked.emit(dict(self._game))
+            except Exception as e:
+                print(f'[战绩] 行键盘触发失败: {type(e).__name__}: {e}')
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def set_icon(self, data) -> bool:
         """用图标字节填充头像(圆角裁剪)。失败返回 False 让上层继续轮询。"""
         try:
@@ -656,6 +792,7 @@ class _MatchRow(QWidget):
             self._icon_lbl.setText('')
             self._icon_lbl.setPixmap(rounded)
             self.icon_loaded = True
+            self._dl_requested = False
             return True
         except Exception:
             return False
@@ -690,6 +827,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     sig_update_phase = pyqtSignal(str)
     sig_set_script_running = pyqtSignal(bool)
     sig_append_log = pyqtSignal(str)
+    # v4.9.3(P1): 复制机器码后台采集完成 → 主线程写剪贴板/恢复按钮
+    sig_machine_id_ready = pyqtSignal(str)
+    sig_machine_id_failed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -703,7 +843,11 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._recent_sig = None         # 对局签名(gameId 元组), 变化才重建
         self._recent_icon_cb = None     # main 注入: cid -> bytes|None(仅内存缓存)
         self._recent_dl_cb = None       # main 注入: cid -> 触发后台下载
+        self._recent_refresh_cb = None  # main 注入: 手动刷新(置 _force_profile)
+        self._refresh_pending = False   # v4.10.x: 手动刷新进行中标记(按钮禁用态)
         self._recent_icon_timer = None
+        self._acct_id_state = None      # v4.4.x(P3): 账号 ID 标签脏值比较缓存
+        self._lic_copying = False       # v4.9.3(P1): 机器码后台采集进行中标记
         # v4.3.0: 对局详情弹窗(main 注入的装备图标回调 + 数据回调 + 当前弹窗引用)
         self._item_icon_cb = None
         self._item_dl_cb = None
@@ -819,6 +963,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self.sig_update_phase.connect(self._do_phase)
         self.sig_set_script_running.connect(self._do_run)
         self.sig_append_log.connect(self._do_log)
+        self.sig_machine_id_ready.connect(self._on_machine_id_ready)
+        self.sig_machine_id_failed.connect(self._on_machine_id_failed)
 
     # ==================== 标题栏 ====================
     def _make_title_bar(self):
@@ -880,9 +1026,15 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._pages.setCurrentIndex(idx)
         for i, btn in enumerate(self._nav_buttons):
             btn.set_active(i == idx)
-        # 切到战绩页时补一轮图标并重开时间窗(下载是后台异步的, 离开页面后轮询会停)
+        # 切到战绩页时补一轮图标并重开时间窗; 离开战绩页则停掉轮询(下载是后台
+        # 异步的, 页面不可见时不该每 900ms 空转), 切回时 _tick_recent_icons(rearm=True)
+        # 会按需重新 start。
         if idx == 3:
             self._tick_recent_icons(rearm=True)
+        else:
+            t = getattr(self, '_recent_icon_timer', None)
+            if t is not None and t.isActive():
+                t.stop()
         # v4.6.3: 切到设置页时清点一次缓存占用 —— 否则用户看到的是上次的旧数字
         if idx == 1:
             self.refresh_clean_sizes()
@@ -1233,7 +1385,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
-        row, btn = _make_toggle_row('自动选英雄', 'auto_select_champion', self._settings, self._toggles, self._toggle)
+        row, _ = _make_toggle_row('自动选英雄', 'auto_select_champion', self._settings, self._toggles, self._toggle)
         cl.addWidget(row)
         desc = QLabel('进选人界面按偏好点击卡片；无偏好时随机点一张兜底（需要管理员权限以绕开 UIPI）')
         desc.setWordWrap(True)
@@ -1247,13 +1399,32 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
-        row, btn = _make_toggle_row('自动换英雄', 'auto_pick_champion', self._settings, self._toggles, self._toggle)
+        row, _ = _make_toggle_row('自动换英雄', 'auto_pick_champion', self._settings, self._toggles, self._toggle)
         cl.addWidget(row)
         desc = QLabel('按偏好英雄优先级自动切换，无偏好时不换')
         desc.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;padding-left:52px;")
         cl.addWidget(desc)
         lay.addWidget(card)
+
+        # v4.9.13(用户要求): 小窗备选栏单击 = 预输入本局想玩的英雄(蓝光)。
+        # 优先级高于偏好; 单击选中、再单击取消; 脚本在备选池里一出现就换过去。
+        card_pi = GlassCard()
+        cpi = QVBoxLayout(card_pi)
+        cpi.setContentsMargins(14, 12, 14, 12)
+        cpi.setSpacing(8)
+        row_pi, _ = _make_toggle_row('预输入选英雄', 'auto_preinput_champion',
+                                     self._settings, self._toggles, self._toggle)
+        cpi.addWidget(row_pi)
+        desc_pi = QLabel(
+            '在小窗备选栏单击头像即可预先指定本局想玩的英雄（蓝光标记，再单击取消）；'
+            '脚本会优先切到它，优先级高于偏好英雄。关闭后单击头像恢复为“立即换英雄”')
+        desc_pi.setWordWrap(True)
+        desc_pi.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
+            f"background:transparent;padding-left:52px;padding-right:8px;")
+        cpi.addWidget(desc_pi)
+        lay.addWidget(card_pi)
 
         # 自动点赞
         card_h = GlassCard()
@@ -1443,30 +1614,84 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     def _on_copy_machine_id(self):
         """复制机器码。没有就现场采集一次。
 
-        ⚠️ v4.9.3: 注释原写"约 190ms，点击时略等可接受" —— **实测冷启动 1.509 s**，
-        差了 8 倍。这个量级已经不能叫"略等"：点下去界面会卡 1.5 秒（最坏 30 s，
-        即 subprocess 超时上限）。真要改好应该像激活窗那样走后台线程；
-        这里暂未改（本方法只在设置页授权卡点「复制」时触发，不在自动流程上），
-        但**注释必须写成真实量级** —— 否则下一个人还会拿 190ms 当依据做判断，
-        而 P1-E「激活窗白屏」就是这么被忽略掉的。
+        v4.9.3(P1): 采集放到后台线程(L.machine_id() 实测冷启动 1.5s、最坏 30s),
+        完成后经信号回主线程写剪贴板。期间按钮禁用 + 文案「读取中…」, 避免
+        点下去界面卡死。
         """
-        mid = self._lic_machine_id
-        if not mid:
-            try:
-                from core import licensing as L
-                mid = L.machine_id()
-                self._lic_machine_id = mid
-                self._lic_mid_lbl.setText(f'机器码  {_group_code(mid)}')
-            except Exception as e:
-                self._lic_hint2_lbl.setText(f'读取机器码失败：{type(e).__name__}: {e}')
-                return
-        cb = QApplication.clipboard()
-        if cb is None:
-            self._lic_hint2_lbl.setText('无法访问剪贴板，请手动选中机器码后按 Ctrl+C。')
+        if getattr(self, '_lic_copying', False):
             return
-        # 复制**纯码**（无连字符）：微信里更不容易被自动换行截断
-        cb.setText(mid)
-        self._lic_hint2_lbl.setText('机器码已复制 ✓ 发给卖家，他会回你一串授权码。')
+        mid = self._lic_machine_id
+        if mid:
+            self._write_clipboard(mid)
+            return
+        self._lic_copying = True
+        try:
+            self._lic_copy_btn.setEnabled(False)
+            self._lic_copy_btn.setText('读取中…')
+        except Exception:
+            pass
+        try:
+            threading.Thread(target=self._collect_machine_id_bg,
+                             daemon=True).start()
+        except Exception as e:
+            # 线程都起不来(极端环境)就原地兜底, 不卡死按钮
+            self._lic_copying = False
+            try:
+                self._lic_copy_btn.setEnabled(True)
+                self._lic_copy_btn.setText('复制机器码')
+            except Exception:
+                pass
+            self._lic_hint2_lbl.setText(f'读取机器码失败：{type(e).__name__}: {e}')
+
+    def _collect_machine_id_bg(self):
+        """后台线程: 采集机器码, 结果经信号送回主线程(不在此碰任何 UI)。"""
+        try:
+            from core import licensing as L
+            mid = L.machine_id()
+            if not mid:
+                raise ValueError('machine_id 返回空')
+            self.sig_machine_id_ready.emit(mid)
+        except Exception as e:
+            self.sig_machine_id_failed.emit(f'{type(e).__name__}: {e}')
+
+    @ui_slot
+    def _on_machine_id_ready(self, mid):
+        """后台采集成功 → 主线程缓存 + 写剪贴板 + 恢复按钮。"""
+        self._lic_machine_id = mid
+        try:
+            self._lic_mid_lbl.setText(f'机器码  {_group_code(mid)}')
+        except Exception:
+            pass
+        self._write_clipboard(mid)
+
+    @ui_slot
+    def _on_machine_id_failed(self, err):
+        """后台采集失败 → 主线程提示 + 恢复按钮。"""
+        try:
+            self._lic_hint2_lbl.setText(f'读取机器码失败：{err}')
+        except Exception:
+            pass
+        self._restore_copy_btn()
+
+    def _write_clipboard(self, mid):
+        """主线程写剪贴板(纯码, 无连字符), 并恢复按钮状态。"""
+        try:
+            cb = QApplication.clipboard()
+            if cb is None:
+                self._lic_hint2_lbl.setText('无法访问剪贴板，请手动选中机器码后按 Ctrl+C。')
+                return
+            cb.setText(mid)
+            self._lic_hint2_lbl.setText('机器码已复制 ✓ 发给卖家，他会回你一串授权码。')
+        finally:
+            self._restore_copy_btn()
+
+    def _restore_copy_btn(self):
+        self._lic_copying = False
+        try:
+            self._lic_copy_btn.setEnabled(True)
+            self._lic_copy_btn.setText('复制机器码')
+        except Exception:
+            pass
 
 
     # ==================== v4.6.3: 清理缓存 ====================
@@ -1647,6 +1872,13 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.WARNING};"
                 f"background:transparent;")
             return
+        # v4.4.x(P3): 日志是排查问题的唯一依据, 破坏性操作前弹一次确认
+        if 'logs' in picked:
+            ret = QMessageBox.question(
+                self, '确认清理', '清理将删除所有日志（含历史日志与崩溃记录），且不可恢复。\n确定继续吗？',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
         self._clean_state.setText('正在清理…')
         self._clean_state.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
@@ -1677,27 +1909,11 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
-        row = HoverRow()
-        row.setStyleSheet('background:transparent;')
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(10)
-
-        btn = AnimatedToggle()
-        checked = self._settings.get(toggle_key, True)
-        btn.setChecked(checked)
-        btn.toggled.connect(lambda c, k=toggle_key: self._on_setting(k, c))
-        self._toggles[toggle_key] = btn
-        rl.addWidget(btn)
-
-        lbl = QLabel(label)
-        lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_MD};color:{Glass.TEXT_PRIMARY};background:transparent;")
-        lbl.setCursor(Qt.PointingHandCursor)
-        lbl.mousePressEvent = lambda e, b=btn: b.toggle()
-        rl.addWidget(lbl)
-        rl.addStretch()
-
+        # v4.4.x(P2): 开关行与 _make_toggle_row 完全同构(仅回调不同), 复用避免双份拷贝。
+        # _toggle(key, checked, btn) 内部就是 _on_setting(key, checked), 签名正好匹配。
+        row, _ = _make_toggle_row(label, toggle_key, self._settings,
+                                  self._toggles, self._toggle)
+        rl = row.layout()
         self._make_delay_ctrl(rl, delay_key, delay_def, dmin, dmax)
         rl.addSpacing(4)
         cl.addWidget(row)
@@ -1806,9 +2022,34 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._recent_sum_lbl.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_SM};color:{Glass.TEXT_MUTED};"
             f"background:transparent;")
+        # v4.10.x: 胜率 pill —— 与刷新按钮同排, 数据由 _set_recent_sum 统一写
+        self._recent_rate_lbl = QLabel('')
+        self._recent_rate_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};font-weight:700;"
+            f"color:{Glass.PRIMARY};background:{Glass.PRIMARY_SUBTLE};"
+            f"border-radius:6px;padding:3px 8px;")
+        self._recent_rate_lbl.setAlignment(Qt.AlignCenter)
+        self._recent_rate_lbl.setVisible(False)
+        # v4.9.x: 手动刷新按钮 —— 复用 main 的 _force_profile_refresh 通道,
+        # 置位后下一轮探活(≤3s)立即重拉战绩, 不等 30s 周期。
+        self._recent_refresh_btn = QPushButton('🔄 刷新')
+        self._recent_refresh_btn.setFixedHeight(26)
+        self._recent_refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._recent_refresh_btn.setStyleSheet(f"""
+            QPushButton {{ background: rgba(99,102,241,0.08); color: {Glass.TEXT_SECONDARY};
+                border: none; border-radius: 6px; font-size: {Glass.FONT_SIZE_XS};
+                padding: 0 10px; }}
+            QPushButton:hover {{ background: rgba(99,102,241,0.18); color: {Glass.TEXT_PRIMARY}; }}
+            QPushButton:pressed {{ background: rgba(99,102,241,0.26); }}
+            QPushButton:disabled {{ background: rgba(255,255,255,0.04); color: {Glass.TEXT_MUTED}; }}
+        """)
+        self._recent_refresh_btn.clicked.connect(self._on_recent_refresh)
         head.addWidget(title)
         head.addStretch()
         head.addWidget(self._recent_sum_lbl)
+        head.addWidget(self._recent_rate_lbl)
+        head.addSpacing(8)
+        head.addWidget(self._recent_refresh_btn)
         lay.addLayout(head)
 
         scroll = QScrollArea()
@@ -1823,9 +2064,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._recent_lay.setSpacing(6)
 
         # v4.4.1(UI-B2): 统一空态工厂(原来把副提示用 \n 塞进同一个标签)
+        # v4.10.x: 改为 animated=True —— 空态要表达三态(未连接/拉取中/无数据),
+        # 拉取中时启动呼吸点, 消除"刚连上正在拉, 却显示暂无记录"的误报。
         self._recent_empty = make_empty_state(
             '🗂', '暂无对局记录', '连接客户端后自动加载最近 10 场',
-            min_height=140)
+            min_height=140, animated=True)
+        self._recent_empty._state = 'empty'
         self._recent_lay.addWidget(self._recent_empty)
         self._recent_lay.addStretch()
         scroll.setWidget(holder)
@@ -1836,6 +2080,39 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._recent_icon_timer.setInterval(900)
         self._recent_icon_timer.timeout.connect(self._tick_recent_icons)
         return page
+
+    def _set_recent_empty(self, state, title=None, hint=None):
+        """战绩页空态三态切换(v4.10.x)。
+
+        state: 'loading' 正在拉取(呼吸点) / 'empty' 真无数据 / 'offline' 未连接。
+        未连接态不复用"正在加载"的呼吸点, 避免"客户端没开"看起来像"软件在忙"。
+        """
+        try:
+            w = self._recent_empty
+            if w is None:
+                return
+            prev = getattr(w, '_state', None)
+            if prev == state and title is None and hint is None:
+                return
+            w._state = state
+            if title is None:
+                title = {'loading': '正在读取对局记录…',
+                         'offline': '未连接到客户端',
+                         'empty': '暂无对局记录'}.get(state, '暂无对局记录')
+            if hint is None:
+                hint = {'loading': '连接后自动加载最近 10 场，请稍候',
+                        'offline': '请先打开英雄联盟客户端并登录',
+                        'empty': '连接客户端后自动加载最近 10 场'}.get(state, '')
+            if w.title_label is not None:
+                w.title_label.setText(title)
+            if w.hint_label is not None:
+                w.hint_label.setText(hint)
+            if state == 'loading' and w.dots is not None:
+                w.dots.start()
+            elif w.dots is not None:
+                w.dots.stop()
+        except Exception as e:
+            print(f'[战绩] 空态切换失败: {type(e).__name__}: {e}')
 
     def set_recent_icon_cb(self, icon_cb, download_cb=None,
                            item_icon_cb=None, item_dl_cb=None,
@@ -1859,6 +2136,51 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     def set_recent_detail_cb(self, fetch_cb):
         """main 注入"拉单局详情"回调: fetch_cb(game_id, callback(detail, err))。"""
         self._recent_detail_cb = fetch_cb
+
+    def set_recent_refresh_cb(self, refresh_cb):
+        """main 注入"手动刷新战绩"回调: refresh_cb() → 置 _force_profile。"""
+        self._recent_refresh_cb = refresh_cb
+
+    @ui_slot
+    def _on_recent_refresh(self):
+        """点击「刷新」→ 调 main 的强制刷新通道, 下一轮探活立即重拉战绩。
+
+        v4.10.x: 增加进行中反馈 —— 点击后按钮短暂禁用并显示"刷新中", 下一轮
+        探活结果到达(update_recent 或 update_account_info)时恢复。用户之前看到
+        的只有一句 toast, 无法确认刷新真的在执行。
+        """
+        cb = self._recent_refresh_cb
+        if cb is None:
+            self._show_toast('刷新功能未就绪', kind='error')
+            return
+        try:
+            cb()
+            self._refresh_pending = True
+            self._apply_refresh_state()
+            self._show_toast('已触发刷新，即将更新')
+            # 兜底: 若回调通道失效(探活停摆), 3.5s 后恢复按钮, 避免永久"刷新中"
+            QTimer.singleShot(3500, self._clear_refresh_pending)
+        except Exception as e:
+            print(f'[战绩] 手动刷新失败: {type(e).__name__}: {e}')
+            self._show_toast('刷新失败', kind='error')
+
+    def _apply_refresh_state(self):
+        """按 _refresh_pending 渲染刷新按钮的禁用态(有 pending 时禁用)。"""
+        btn = self._recent_refresh_btn
+        if btn is None:
+            return
+        pending = bool(getattr(self, '_refresh_pending', False))
+        btn.setEnabled(not pending)
+        btn.setText('🔄 刷新中…' if pending else '🔄 刷新')
+
+    def _clear_refresh_pending(self):
+        """刷新兜底复位: 探活结果正常到达时也会调, 幂等。"""
+        try:
+            if getattr(self, '_refresh_pending', False):
+                self._refresh_pending = False
+                self._apply_refresh_state()
+        except Exception as e:
+            print(f'[战绩] 刷新状态复位失败: {type(e).__name__}: {e}')
 
     @ui_slot
     def _open_recent_detail(self, game):
@@ -1894,6 +2216,20 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 except Exception as e:
                     print(f'[战绩] 旧详情窗释放失败: {type(e).__name__}: {e}')
             self._detail_dlg = None
+            # v4.10.x: 把当前列表快照与下标传给详情窗, 支持 ◀/▶ 上下局导航。
+            # 弹窗切局时经 on_nav 回调调本方法(传同一列表的相邻项)。
+            nav_games = [dict(r._game) for r in self._recent_rows]
+            nav_index = 0
+            gid = game.get('game_id')
+            for i, g in enumerate(nav_games):
+                if g.get('game_id') == gid:
+                    nav_index = i
+                    break
+
+            def _nav_to(idx):
+                if 0 <= idx < len(nav_games):
+                    self._open_recent_detail(nav_games[idx])
+
             dlg = RecentDetailDialog(
                 game,
                 champ_icon_cb=self._recent_icon_cb,
@@ -1905,7 +2241,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 aug_icon_cb=self._aug_icon_cb,
                 aug_dl_cb=self._aug_dl_cb,
                 fetch_cb=self._recent_detail_cb,
-                parent=self)
+                parent=self,
+                games=nav_games, index=nav_index, on_nav=_nav_to)
             self._detail_dlg = dlg
             # 先 show 再发起请求: 回调可能比首帧还快, 先显示才不会丢回填
             dlg.show()
@@ -1935,8 +2272,10 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         以 gameId 元组做签名: 内容没变直接返回, 避免每 3s 重建 10 行控件导致闪烁。
         """
         try:
+            _games_none = games is None
             games = list(games or [])
         except Exception:
+            _games_none = True
             games = []
         # v4.3.10: 签名 = (game_id, 英雄名)。原来只比 game_id, 但英雄名是 main 侧
         # 探活时从 _champ_data 补上去的 —— 若第一轮探活在英雄数据就绪前完成, 名字
@@ -1946,7 +2285,35 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                     for g in games)
         if sig == self._recent_sig:
             return
+        # v4.10.x(P0): EOG 即时战绩的行保留合并。match-history 服务端入库有
+        # 1~3 分钟延迟 —— 刚打完的局由 EOG 秒出并 prepend 到列表顶部, 但随后
+        # 每 3s 一轮的探活带回来的 games 里还没有它, 全量重建会把它删掉,
+        # 表现成"秒出 → 3 秒后消失 → 1~3 分钟后才回来"。这里把"本地有 EOG 行、
+        # 新数据没有、且未被换号/手动刷新清场"的局合并进新数据顶部, 保留到正式
+        # 数据带回同 game_id 为止(届时以 match-history 的正式数据为准覆盖)。
+        _new_ids = {g.get('game_id') for g in games}
+        _eog_keep = [r._game for r in self._recent_rows
+                     if r._from_eog and r._game.get('game_id') not in _new_ids]
+        # 合并后统一截到 10 场: EOG 局是最新一局, 优先保留; 挤掉的应是最老的
+        # match-history 行, 而不是刚打完的 EOG 局(满 10 场时尤其如此)。
+        merged = (_eog_keep + games)[:10]
+
         self._recent_sig = sig
+        _render = merged
+
+        # v4.10.x: 空态三态 —— games 为 None(尚未拉到)显示"拉取中", 空列表显示"暂无",
+        # 未连接由 _do_conn 置 offline; 有数据/合并后非空则收起空态。
+        if _render:
+            if self._recent_empty is not None:
+                self._recent_empty.setVisible(False)
+        else:
+            if self._recent_empty is not None:
+                self._recent_empty.setVisible(True)
+                if _games_none:
+                    self._set_recent_empty('loading')
+                else:
+                    self._set_recent_empty('empty')
+            self._set_recent_sum(0, 0, 0)
 
         for w in self._recent_rows:
             try:
@@ -1956,22 +2323,17 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 pass
         self._recent_rows = []
 
-        if not games:
-            if self._recent_empty is not None:
-                self._recent_empty.setVisible(True)
-            try:
-                self._recent_sum_lbl.setText('')
-            except Exception:
-                pass
+        if not _render:
             return
 
         if self._recent_empty is not None:
             self._recent_empty.setVisible(False)
 
         wins = losses = 0
-        for g in games:
+        for g in _render:
             try:
                 row = _MatchRow(g)
+                row._from_eog = bool(g.get('_from_eog'))
             except Exception as e:
                 print(f'[战绩] 行构建失败: {type(e).__name__}: {e}')
                 continue
@@ -1984,10 +2346,75 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 wins += 1
             elif g.get('win') is False:
                 losses += 1
-        self._recent_sum_lbl.setText(
-            f'近 {len(self._recent_rows)} 场 · {wins}胜{losses}负')
+        self._set_recent_sum(len(self._recent_rows), wins, losses)
 
         self._tick_recent_icons()
+
+    def _set_recent_sum(self, total, wins, losses):
+        """统一写战绩页标题统计(近 N 场 · X胜Y负 + 胜率 pill)。
+
+        v4.10.x: 原先 update_recent / prepend_recent_game 各写一遍文案, 且没
+        胜率。收口到单一方法, 无数据时清空, 有数据时胜率 = wins/total。
+        """
+        try:
+            if self._recent_sum_lbl is None:
+                return
+            if total <= 0:
+                self._recent_sum_lbl.setText('')
+                if self._recent_rate_lbl is not None:
+                    self._recent_rate_lbl.setVisible(False)
+                    self._recent_rate_lbl.setText('')
+                return
+            self._recent_sum_lbl.setText(f'近 {total} 场 · {wins}胜{losses}负')
+            if self._recent_rate_lbl is not None:
+                rate = round(wins * 100 / max(1, total))
+                self._recent_rate_lbl.setText(f'胜率 {rate}%')
+                self._recent_rate_lbl.setVisible(True)
+        except Exception as e:
+            print(f'[战绩] 标题统计写入失败: {type(e).__name__}: {e}')
+
+    def prepend_recent_game(self, game):
+        """v4.9.x: EOG 即时战绩回填 —— 把刚结束的一局插到列表最前。
+
+        与 update_recent(全量重建)不同: 这里只插一行, 不重建整页, 避免闪烁;
+        随后 3s 一轮的探活会把 match-history 的正式数据带过来并全量刷新,
+        二者签名去重, 不会重复。game 结构与 _MatchRow 消费的 dict 一致。
+        """
+        try:
+            if not isinstance(game, dict) or not game.get('game_id'):
+                return
+            gid = game.get('game_id')
+            # 已有同局(探活已带来)就不重复插
+            if any(r._game.get('game_id') == gid for r in self._recent_rows):
+                return
+            if self._recent_empty is not None:
+                self._recent_empty.setVisible(False)
+            try:
+                row = _MatchRow(game)
+            except Exception as e:
+                print(f'[战绩] EOG 行构建失败: {type(e).__name__}: {e}')
+                return
+            # v4.10.x(P0): 标记 EOG 来源, 供 update_recent 全量重建时保留合并
+            game['_from_eog'] = True
+            row._from_eog = True
+            row.clicked.connect(self._open_recent_detail)
+            # 插到最前(布局 index 0), 使"最新一局"置顶
+            self._recent_lay.insertWidget(0, row)
+            self._recent_rows.insert(0, row)
+            # 更新签名: 与 update_recent 同一签名规则, 防后续全量刷新误判。
+            # v4.10.x(P0): 原代码这里 `for g in self._recent_rows` 而 _recent_rows
+            # 存的是 _MatchRow 对象(不是 dict), g.get() 必抛 AttributeError 被外层
+            # 吞掉 → 签名停留旧值, EOG 插入后签名从未反映真实列表。改为 r._game。
+            self._recent_sig = tuple(
+                (r._game.get('game_id'),
+                 (r._game.get('champion_name') or '').strip())
+                for r in self._recent_rows)
+            wins = sum(1 for r in self._recent_rows if r._game.get('win') is True)
+            losses = sum(1 for r in self._recent_rows if r._game.get('win') is False)
+            self._set_recent_sum(len(self._recent_rows), wins, losses)
+            self._tick_recent_icons()
+        except Exception as e:
+            print(f'[战绩] EOG 回填异常: {type(e).__name__}: {e}')
 
     def _tick_recent_icons(self, rearm=False):
         """补图标: 有缓存直接贴, 没有则请求下载并保持轮询直到全部就位或超出时间窗。
@@ -2005,6 +2432,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             if rearm and row.icon_deadline < now:
                 row.icon_deadline = now + row.ICON_RETRY_WINDOW_S
             if now > row.icon_deadline:
+                # 超窗放弃, 复位下载标记 —— 下次 rearm(切回战绩页)允许再请求一次
+                row._dl_requested = False
                 continue
             cid = row.champion_id
             if cid <= 0:
@@ -2018,11 +2447,13 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             if data and row.set_icon(data):
                 continue
             pending += 1
-            if self._recent_dl_cb is not None:
+            # v4.4.x(P2): 每个 cid 只触发一次下载, 避免每 900ms 重复打网络
+            if self._recent_dl_cb is not None and not row._dl_requested:
+                row._dl_requested = True
                 try:
                     self._recent_dl_cb(cid)
                 except Exception:
-                    pass
+                    row._dl_requested = False
         timer = self._recent_icon_timer
         if timer is None:
             return
@@ -2049,7 +2480,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._log_text.setStyleSheet(Glass.LOG_STYLE)
         lay.addWidget(self._log_text, 1)
 
-        clear_btn = QPushButton('清空日志')
+        # v4.4.x(P3): 该按钮只清空 QTextEdit 的界面显示, 不删磁盘日志文件, 文案如实说明
+        clear_btn = QPushButton('清空界面显示')
         clear_btn.setFixedHeight(32)
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.setStyleSheet(f"""
@@ -2140,9 +2572,17 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         None != 任何 tuple, 因此下一次 update_recent() 必然重绘 —— 换号/换区后
         英雄名与 gameId 一起变, 但旧签名可能恰好相同(见 update_recent 注释),
         这个显式入口比让外部直接改私有属性安全。
+
+        v4.10.x(P0): 同时清掉所有 EOG 来源标记 —— 换号/手动清空战绩后, 旧账号
+        的 EOG 行绝不能并入新账号列表(update_recent 的合并逻辑依赖 _from_eog)。
         """
         try:
             self._recent_sig = None
+            for r in self._recent_rows:
+                try:
+                    r._from_eog = False
+                except Exception:
+                    pass
         except Exception as e:
             print(f'[ui_slot] MainWindow.mark_recent_dirty 异常已被拦下: '
                   f'{type(e).__name__}: {e}')
@@ -2154,11 +2594,16 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         紧跟 `_main._save_settings()`, 两次伸进私有成员。这里合并成一个公开方法:
         先写 self._settings[key], 再复用 _save_settings()(已改原子写),
         并同步 sync_setting 的界面状态(toggle 按钮)。
+
+        v5.0.0(#3 P3): 补发 settings_changed_signal —— 与 _on_setting 同口径。
+        否则调用方(如 main._revert_auto_select_champion 的 UAC 取消回退)只改了
+        UI/磁盘, core 侧 _settings 仍是旧值, 脚本运行中会出现 UI 与行为不一致。
         """
         try:
             self._settings[key] = value
             self._save_settings()
             self.sync_setting(key, value)
+            self.settings_changed_signal.emit(self._settings)
         except Exception as e:
             print(f'[ui_slot] MainWindow.persist_setting 异常已被拦下: '
                   f'{type(e).__name__}: {e}')
@@ -2215,6 +2660,13 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             )
             self._champion_picker.champions_selected.connect(self._on_picker_saved)
             if self._picker_placeholder:
+                # v4.4.x(P3): 占位三点动画在 hide 前显式停掉, 避免残留定时器空转
+                dots = getattr(self._picker_placeholder, 'dots', None)
+                if dots is not None:
+                    try:
+                        dots.stop()
+                    except Exception:
+                        pass
                 self._picker_lay.removeWidget(self._picker_placeholder)
                 self._picker_placeholder.hide()
                 self._picker_placeholder = None
@@ -2234,13 +2686,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._toast.show_toast(f'已保存 {len(ids)} 个偏好英雄', kind='success')
 
     # ==================== v37 账号卡更新 ====================
-    def _mk_rank_chip(self, color, bg, label, default_value,
-                       size_policy_expanding=False):
+    def _mk_rank_chip(self, color, bg, label, default_value):
         """段位/荣誉标签-值双段胶囊(带前缀 label,如「单双 白银 I·60胜点」)。
 
         v4.1.46 改: 数据态 vs 等待态分两种 style, **chip 默认 visible 不隐藏**。
-        v4.1.48 增: size_policy_expanding=True 让 chip 在 QHBoxLayout 中按 stretch
-        自动均分可用宽度(用于熟练度三 chip 等一行放不下的场景)。
+        v4.1.54 起 size_policy_expanding 已无任何调用点(熟练度行改回左对齐),
+        该参数与不可达分支删除。
         原 set_default 用 setVisible(False) 会让整行塌陷, 未连接时账号卡
         比连接时矮 24px, 顶部连接/未连接状态卡 + fab 高度都不变, 看起来
         不协调。现在让两种状态行高一致, 仅 chip 背景透明度区分:
@@ -2252,7 +2703,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         h = QHBoxLayout(wrap)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
-        # v4.1.48: expanding 模式下让 chip 拉伸填满, 文本居中
         # v4.1.50: prefix 文字跟随 chip 主色(蓝 chip 的「蓝精粹」也染蓝、橙 chip 的
         # 「橙精粹」也染橙), 与 value 视觉统一; 等待态弱化为 TEXT_MUTED。
         prefix = QLabel(label)
@@ -2267,10 +2717,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             f"font-size:{CHIP_FONT_PX}px;font-weight:600;")
         h.addWidget(prefix)
         h.addWidget(val)
-        # v4.1.48: expanding 模式下设 sizePolicy 让 chip 按 stretch 自动填宽
-        if size_policy_expanding:
-            from PyQt5.QtWidgets import QSizePolicy
-            wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         # v4.1.46: chip 默认 visible, 行高稳定
         wrap.setVisible(True)
         wrap._prefix = prefix
@@ -2314,6 +2760,19 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         wrap.set_default = lambda: _apply_value(default_value, False)
         return wrap
 
+    def _set_acct_id(self, text, connected):
+        """v4.4.x(P3): 账号 ID 标签脏值比较 —— 探活每 3s 刷新一次, (text, connected)
+        没变就跳过 setStyleSheet, 避免反复 QSS 解析 + polish。"""
+        key = (text, bool(connected))
+        if key == getattr(self, '_acct_id_state', None):
+            return
+        self._acct_id_state = key
+        color = Glass.TEXT_PRIMARY if connected else Glass.TEXT_MUTED
+        self._acct_id_lbl.setText(text)
+        self._acct_id_lbl.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_LG};font-weight:600;"
+            f"color:{color};background:transparent;")
+
     def update_account_info(self, info):
         """主线程调用(连接探活数据/断线重置)。info=None → 等待态。
 
@@ -2321,10 +2780,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         v37 用 _label/_value 双控件:label 显示列名(单双/灵活),value 显示段位。
         """
         if not info:
-            self._acct_id_lbl.setText('--')
-            self._acct_id_lbl.setStyleSheet(
-                f"font-size:{Glass.FONT_SIZE_LG};font-weight:600;"
-                f"color:{Glass.TEXT_MUTED};background:transparent;")
+            self._set_acct_id('--', False)
             self._acct_lv_lbl.setText('--')
             self._acct_xp.setValue(0)
             self._acct_xp_txt.setText('升级 --%')
@@ -2342,12 +2798,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         # 行1:游戏ID
         name = (info.get('name') or '').strip()
         if name:
-            self._acct_id_lbl.setText(name)
-            self._acct_id_lbl.setStyleSheet(
-                f"font-size:{Glass.FONT_SIZE_LG};font-weight:600;"
-                f"color:{Glass.TEXT_PRIMARY};background:transparent;")
+            self._set_acct_id(name, True)
         # 行2:等级 + 经验
-        level = int(info.get('level') or 0)
+        level = _as_int(info.get('level'))
         self._acct_lv_lbl.setText(str(level) if level else '--')
         try:
             pct = float(info.get('xp_pct') or 0)
@@ -2362,10 +2815,10 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         # v4.1.62: 后缀拼接"X胜Y负"(本季总场), 玩家直观看本季战绩。
         solo_txt = _rank_text(info.get('solo'))
         flex_txt = _rank_text(info.get('flex'))
-        solo_w = int(info.get('solo_wins') or 0)
-        solo_l = int(info.get('solo_losses') or 0)
-        flex_w = int(info.get('flex_wins') or 0)
-        flex_l = int(info.get('flex_losses') or 0)
+        solo_w = _as_int(info.get('solo_wins'))
+        solo_l = _as_int(info.get('solo_losses'))
+        flex_w = _as_int(info.get('flex_wins'))
+        flex_l = _as_int(info.get('flex_losses'))
         if solo_txt and (solo_w or solo_l):
             solo_txt = f'{solo_txt} {solo_w}胜{solo_l}负'
         if flex_txt and (flex_w or flex_l):
@@ -2373,8 +2826,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._chip_solo.set_value(solo_txt or '未定级')
         self._chip_flex.set_value(flex_txt or '未定级')
         # 行4:资产 = 蓝精粹 / 橙精粹
-        wallet_ip = int(info.get('wallet_ip') or 0)
-        wallet_cos = int(info.get('wallet_cosmetic') or 0)
+        wallet_ip = _as_int(info.get('wallet_ip'))
+        wallet_cos = _as_int(info.get('wallet_cosmetic'))
         if wallet_ip > 0:
             self._chip_wallet_ip.set_value(f'{wallet_ip:,}')
         else:
@@ -2384,8 +2837,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         else:
             self._chip_wallet_cosmetic.set_default()
         # 行5:资产(续) 神话精粹 / 荣誉
-        wallet_my = int(info.get('wallet_mythic') or 0)
-        honor = int(info.get('honor') or 0)
+        wallet_my = _as_int(info.get('wallet_mythic'))
+        honor = _as_int(info.get('honor'))
         if wallet_my > 0:
             self._chip_wallet_mythic.set_value(f'{wallet_my:,}')
         else:
@@ -2401,7 +2854,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             if i < len(mt):
                 m = mt[i]
                 nm = m.get('name') or f"#{m.get('champion_id')}"
-                lv = int(m.get('level') or 0)
+                lv = _as_int(m.get('level'))
                 # v4.1.49: 去掉 grade, 紧凑单段 = "英雄名 等级级", 与游戏"英雄成就"页一致
                 if lv > 0:
                     text = f'{nm} {lv}级'
@@ -2426,9 +2879,11 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             self.update_recent((recent or {}).get('games'))
         except Exception as e:
             print(f'[战绩] 页面刷新失败: {type(e).__name__}: {e}')
+        # v4.10.x: 手动刷新按钮的"刷新中"复位 —— 探活结果已带回, 说明刷新完成
+        self._clear_refresh_pending()
         # 头像:真头像已上屏(icon 匹配)时探活刷新不覆盖;未就绪/换头像才显示
         # v4.1.39 生成式占位等下载完成替换 —— 修复"真头像渲染后 3s 被占位盖掉"
-        cur_icon = int(info.get('icon_id') or 0)
+        cur_icon = _as_int(info.get('icon_id'))
         if name and not (cur_icon and cur_icon == self._avatar_real_id):
             self._avatar_real_id = 0
             self._set_generated_avatar(name, cur_icon)
@@ -2534,8 +2989,18 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         # qFatal(abort), 一个脏数据就能杀进程。这里只打印并继续。
         try:
             self._update_dot(connected)
-            self._conn_label.setText(CONN_TEXT_ONLINE if connected
-                                     else CONN_TEXT_OFFLINE)
+            if connected:
+                # v4.4.x(P2): name 参数此前被静默丢弃, 现在拼接显示(如"客户端已连接 · 召唤师名")
+                self._conn_label.setText(
+                    CONN_TEXT_ONLINE + (f' · {name}' if name else ''))
+            else:
+                self._conn_label.setText(CONN_TEXT_OFFLINE)
+            # v4.10.x: 战绩页空态三态 —— 断线且当前没有渲染任何行时, 空态显示
+            # "未连接到客户端"; 有历史行则保留不动(旧数据仍可浏览, 不强行清空)。
+            if not connected and not self._recent_rows:
+                self._set_recent_empty('offline')
+            elif connected and getattr(self._recent_empty, '_state', '') == 'offline':
+                self._set_recent_empty('loading')
         except Exception as e:
             print(f'[ui_slot] MainWindow._do_conn 异常已被拦下: '
                   f'{type(e).__name__}: {e}')
@@ -2639,6 +3104,10 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             'auto_start_on_connect': False, 'auto_start_on_connect_delay': 5,
             'auto_select_champion': False,   # v34: 进选人自动选英雄(默认关)
             'auto_pick_champion': True,      # 锁后自动换 bench(默认开, 保留旧行为)
+            # v4.9.13(用户要求): 小窗备选栏单击 = 预输入本局想玩的英雄(蓝光),
+            # 由 core 的 1s 轮询在备选池里一出现就换过去, 优先级高于偏好。
+            # 默认开 —— 这是用户点名要的用法; 关掉后单击退回"立即换英雄"。
+            'auto_preinput_champion': True,
             'preferred_champions': [],       # v41: 移除死配置 'queue_id', 队列从 session 取
             'agreement_accepted': False,     # v4.1.55: 首次启动强制阅读须知(30s)后置 True
             # v4.8.1(用户要求): 点「启动 LOL」成功后自动"隐藏主界面 + 打开小窗"。
@@ -2658,6 +3127,21 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
                     defaults.update(loaded)
+                    # v5.0.0 审计修复(P2): 按 defaults 的类型对 bool/int 键做规约。
+                    # 手改 settings.json 写成 "auto_queue": "false"(字符串 truthy)
+                    # 会让 PyQt 的 setChecked 把开关显示成"开", 与用户意图相反。
+                    # preferred_champions 的脏值已有 overlay 侧防护, 这里只规约
+                    # 标量开关/延迟项。
+                    for k, dflt in defaults.items():
+                        if isinstance(dflt, bool) and not isinstance(defaults[k], bool):
+                            # 非 bool(字符串/数字)一律回退默认值 —— 无法可靠推断
+                            # 用户意图, 与其赌 truthiness 不如用默认, 用户下次自己开。
+                            defaults[k] = dflt
+                        elif isinstance(dflt, int) and not isinstance(defaults[k], int):
+                            try:
+                                defaults[k] = int(defaults[k])
+                            except (TypeError, ValueError):
+                                defaults[k] = dflt
                 else:
                     # v4.4.0 修复(P1-24): 顶层不是对象(手改坏/被别的工具写坏)
                     # 也按损坏处理, 否则 defaults.update(list) 会抛。
@@ -2707,7 +3191,10 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         2. json.dump 抛异常(如 _settings 里混进不可序列化对象)时文件已被前面
            的 write 截断, 同样是半个 JSON。
         os.replace 在同一卷上是原子的: 要么是完整旧档, 要么是完整新档。
+        v4.4.x(P3): os.makedirs 移进本方法 —— v34 迁移路径直接调本方法写盘,
+        此前它不建目录, 首启时 %APPDATA%\\LOLScript 可能还不存在导致迁移静默失败。
         """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2721,7 +3208,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     def _save_settings(self):
         try:
             path = self._settings_path()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
             self._write_settings_file(path, self._settings)
         except Exception as e:
             print(f'[Settings] 保存失败: {e}')

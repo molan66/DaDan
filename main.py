@@ -7,7 +7,9 @@ import os
 # LCU 通信目标恒为 127.0.0.1 本机,绝不应走代理。用户机器若装有本地代理工具
 # (抓包/加速器, 会设置 HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:xxxx),requests 与
 # websocket-client 都会读它 → REST 卡在代理隧道数秒(启动 6s 黑洞根因) + WS 反复
-# CONNECT 502。本程序无外网需求,直接清空并声明 NO_PROXY。
+# CONNECT 502。LCU 通信目标恒为 127.0.0.1, 绝不该走系统代理, 故直接清空并声明
+# NO_PROXY; 少数第三方 CDN(英雄/装备图标)走的是 requests trust_env=False 通道,
+# 同样不读代理 —— 清空环境变量不会影响这些外网请求。
 for _k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
            'all_proxy', 'ALL_PROXY'):
     os.environ.pop(_k, None)
@@ -19,6 +21,7 @@ import threading
 import time as _time
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Optional
 
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox, QWidget
 from PyQt5.QtCore import Qt, QTimer, QObject, QPropertyAnimation, QThread, pyqtSignal
@@ -83,6 +86,19 @@ def _duration_s(v) -> int:
     if dur > _DURATION_MS_THRESHOLD:
         dur = dur // 1000
     return dur if dur > 0 else 0
+
+
+def _win_flag(v) -> bool:
+    """把 LCU 的胜负字段归一化成 bool(与 _parse_eog_stats 的判据一致)。
+
+    布尔保留; 字符串按 'win'/'true'/'1'(忽略大小写/首尾空白)判真;
+    其余形态(如字符串 'Fail'、数字 0、None)一律 False。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ('win', 'true', '1')
+    return False
 
 
 # v4.4.16: 「全部停止」= 关掉 LOL → 等 STOP_ALL_DELAY_S 秒 → 停脚本。
@@ -232,6 +248,8 @@ class _ConnProbeWorker(QObject):
                         dur = _gi(stats.get('timePlayed')) // 1000
                     # KDA: 缺字段存 None, 由 UI 显示 '—'
                     lane = str((part.get('timeline') or {}).get('lane') or '')
+                    # v4.10.x: 战绩列表补经济/补刀/输出三列 —— 都在列表端点的
+                    # stats 里, 无需额外请求。补刀=小兵+野怪, 与详情弹窗口径一致。
                     games_out.append({
                         'game_id': _gi(g.get('gameId')),
                         'champion_id': _gi(part.get('championId')),
@@ -245,6 +263,10 @@ class _ConnProbeWorker(QObject):
                         'duration_s': dur,
                         'created_ms': _gi(g.get('gameCreation')),
                         'lane': lane if lane and lane != 'NONE' else '',
+                        'gold': _gi(stats.get('goldEarned')),
+                        'cs': (_gi(stats.get('totalMinionsKilled'))
+                               + _gi(stats.get('neutralMinionsKilled'))),
+                        'dmg': _gi(stats.get('totalDamageDealtToChampions')),
                     })
                     break
             except Exception as e:
@@ -378,8 +400,8 @@ class _ConnProbeWorker(QObject):
                 self._last_solo_losses = 0
                 self._last_flex_wins = 0
                 self._last_flex_losses = 0
-                for qkey, cache_self in (('RANKED_SOLO_5x5', '_last_solo'),
-                                         ('RANKED_FLEX_SR', '_last_flex')):
+                for qkey, _attr in (('RANKED_SOLO_5x5', '_last_solo'),
+                                     ('RANKED_FLEX_SR', '_last_flex')):
                     try:
                         q = qm.get(qkey) or {}
                         w = int(q.get('wins') or 0)
@@ -457,6 +479,113 @@ class _ConnProbeWorker(QObject):
         self.probe_done.emit(True, info, '')
 
 
+def _parse_eog_stats(eog, my_puuid: str) -> Optional[Dict]:
+    """把 /lol-end-of-game/v1/eog-stats-block 的原始返回压成战绩页单局结构。
+
+    v4.9.x: EOG 块在结算页本地生成, 比 match-history 服务端入库快得多,
+    用于对局结束后"秒查最新一局"。返回结构与 _parse_recent 的 games[] 单条
+    **完全一致**, UI 层零改动即可渲染:
+        {'game_id','champion_id','win','kills','deaths','assists','level',
+         'mode','queue_id','duration_s','created_ms','lane','champion_name'}
+
+    EOG 结构(实测 2026-11-13): {gameId, queueType(字符串, 无 queueId),
+                     gameMode, gameLength(秒), endOfGameTimestamp(ms),
+                     teams:[{teamId, isWinningTeam(bool), isPlayerTeam,
+                     players:[{puuid, championId, championName, level(召唤师级),
+                     detectedTeamPosition, selectedPosition, isLocalPlayer,
+                     stats:{kills/deaths/assists/champLevel/WIN(0|1)...}}]}]}
+
+    无 gameId / 找不到本人 / 无对局 → 返回 None, 调用方静默降级。
+    """
+    if not isinstance(eog, dict):
+        return None
+    gid = _gi(eog.get('gameId'))
+    if gid <= 0:
+        return None
+
+    teams = eog.get('teams') or []
+    if not isinstance(teams, list):
+        return None
+
+    # 先全队收集"我"的候选: puuid 精确匹配优先; 只有调用方没给 puuid 时,
+    # 才退回 isLocalPlayer 兜底。两者都缺 → 无法定位本人。
+    def _iter_players():
+        for team in teams:
+            if not isinstance(team, dict):
+                continue
+            players = team.get('players') or []
+            if isinstance(players, list):
+                for p in players:
+                    if isinstance(p, dict):
+                        yield team, p
+
+    me_team = None
+    me = None
+    if my_puuid:
+        for team, p in _iter_players():
+            if p.get('puuid') == my_puuid:
+                me_team, me = team, p
+                break
+    else:
+        for team, p in _iter_players():
+            if p.get('isLocalPlayer'):
+                me_team, me = team, p
+                break
+    if me is None:
+        return None
+
+    team_win = me_team.get('isWinningTeam')
+    if team_win is None:
+        team_win = me_team.get('win')
+    # win 可能是布尔、'Win'/'Fail'/'WIN' 字符串(与 _parse_game_detail 共用判据)
+    win_b = _win_flag(team_win)
+    stats = me.get('stats') or {}
+    if not isinstance(stats, dict):
+        stats = {}
+    # 时长: EOG 的 gameLength 恒为秒(实测), 兜底 stats.timePlayed(毫秒)
+    dur = _gi(eog.get('gameLength'))
+    if dur <= 0:
+        dur = _duration_s(eog.get('gameDuration'))
+    if dur <= 0:
+        dur = _gi(stats.get('timePlayed')) // 1000
+    lane = str(me.get('detectedTeamPosition') or me.get('selectedPosition')
+               or me.get('teamPosition') or '')
+    if lane and lane.upper() in ('NONE', 'INVALID', ''):
+        lane = ''
+    # EOG 无 gameCreation(实测顶层是 endOfGameTimestamp, ms),
+    # 用 endOfGameTimestamp 折算开局时间(开局 ≈ 结束 - 时长)
+    if eog.get('gameCreation') or eog.get('gameCreationDate'):
+        created_ms = _gi(eog.get('gameCreation') or eog.get('gameCreationDate'))
+    elif eog.get('endOfGameTimestamp'):
+        created_ms = _gi(eog.get('endOfGameTimestamp')) - dur * 1000
+    else:
+        created_ms = 0
+    return {
+        'game_id': gid,
+        'champion_id': _gi(me.get('championId')),
+        'win': win_b,
+        'kills': _opt(stats.get('kills')),
+        'deaths': _opt(stats.get('deaths')),
+        'assists': _opt(stats.get('assists')),
+        'level': _gi(stats.get('champLevel') or stats.get('championLevel')),
+        'mode': str(eog.get('gameMode') or ''),
+        # EOG 无 queueId(实测顶层只有 queueType 字符串), queue_id 保持 0,
+        # 由 match_fmt 的 gameMode 回退中文映射补足队列显示
+        'queue_id': _gi(eog.get('queueId')),
+        'duration_s': dur,
+        'created_ms': created_ms,
+        'lane': lane,
+        # EOG 自带的 championName(英文), 主控后续会用 _champ_data 覆盖为中文
+        'champion_name': str(me.get('championName') or ''),
+        # v4.10.x: 与 _parse_recent 补齐同款指标列(经济/补刀/输出)。
+        # 结算页 stats 里都有; 补刀=小兵+野怪, 与详情弹窗口径一致。
+        'gold': _gi(stats.get('goldEarned')),
+        'cs': (_gi(stats.get('totalMinionsKilled'))
+               + _gi(stats.get('neutralMinionsKilled'))),
+        'dmg': _gi(stats.get('totalDamageDealtToChampions')),
+    }
+
+
 def _parse_game_detail(raw, my_puuid: str):
     """把 /lol-match-history/v1/games/{gameId} 的原始返回压成详情弹窗要用的结构。
 
@@ -490,6 +619,8 @@ def _parse_game_detail(raw, my_puuid: str):
 
     players = []
     for part in participants:
+        if not isinstance(part, dict):
+            continue
         st = part.get('stats') or {}
         pid = _gi(part.get('participantId'), -1)
         items = [_gi(st.get(f'item{i}')) for i in range(7)]
@@ -511,7 +642,7 @@ def _parse_game_detail(raw, my_puuid: str):
             'kills': _opt(st.get('kills')),
             'deaths': _opt(st.get('deaths')),
             'assists': _opt(st.get('assists')),
-            'win': bool(st.get('win')),
+            'win': _win_flag(st.get('win')),
             'gold': _gi(st.get('goldEarned')),
             'cs': (_gi(st.get('totalMinionsKilled'))
                    + _gi(st.get('neutralMinionsKilled'))),
@@ -519,6 +650,7 @@ def _parse_game_detail(raw, my_puuid: str):
             'taken': _gi(st.get('totalDamageTaken')),
             'vision': _gi(st.get('visionScore')),
             'wards': _gi(st.get('wardsPlaced')),
+            'wards_killed': _gi(st.get('wardsKilled')),
             'multi': multi,
             'lane': str((part.get('timeline') or {}).get('lane') or ''),
             # v4.3.2: 召唤师技能在 participant **顶层**(不在 stats 里!)。
@@ -532,6 +664,8 @@ def _parse_game_detail(raw, my_puuid: str):
 
     teams = []
     for tm in raw.get('teams') or []:
+        if not isinstance(tm, dict):
+            continue
         teams.append({
             'team_id': _gi(tm.get('teamId')),
             'win': tm.get('win'),
@@ -581,6 +715,11 @@ class AppController(QObject):
     # poll/WS 后台线程调用,若直接在那里 new QTimer(),timer 绑定到无 Qt
     # 事件循环的后台线程,timeout 永不触发 → 游戏开始后小窗不隐藏。
     _schedule_hide_sig = pyqtSignal()
+    # v5.0.0 审计修复: 对局结束后 [15s,45s,90s] 补拉战绩的调度必须排回主线程。
+    # 原 _schedule_recent_refresh 在 _on_phase(poll/WS 后台线程)里直接
+    # QTimer.singleShot —— 定时器绑定到无事件循环的后台线程, 永不触发(本项目
+    # 已在 _schedule_hide_sig/_ui_cmd 三处踩过同一坑), 补拉战绩是死代码。
+    _schedule_recent_refresh_sig = pyqtSignal()
     # v20:后台线程拉取英雄数据完成后,若选择器尚未初始化,排回主线程补建
     _champ_remote_ready = pyqtSignal()
     # v36:召唤师头像下载完成(icon_id, bytes)。_icon_pool 线程池下载线程 emit
@@ -588,15 +727,19 @@ class AppController(QObject):
     # 主线程渲染。v4.1.39:带 icon_id,渲染成功后主窗据此避免被探活轮询覆盖。
     _avatar_done = pyqtSignal(int, bytes)
 
-    # v4.3.0:单局详情拉取完成(独立线程池 → 主线程)。gameId, detail(dict|None), err(str)
+    # v4.3.0:单局详情拉取完成(独立线程池 → 主线程)。gameId, generation, detail(dict|None), err(str)
     # ⚠️ gameId 必须走 object, **不能用 int**: PyQt 的 `int` 映射到 C++ 32 位 int,
     # 而 LOL 的 gameId 是 64 位大数(如 401111677051)。用 int 会在跨线程投递时被
     # 截断成另一个数(999999999999 → -727379969), 槽函数拿截断后的 key 去
     # _detail_waiters 里 pop 必然找不到 → 回调永不触发 → 弹窗一直读到 40s 硬超时。
     # 这正是"点开详情一直转圈"的真正根因, 别再改回 int / 'qint64' 之外的窄类型。
-    _detail_ready = pyqtSignal(object, object, str)
+    # v4.4.x(P1): 附带 generation(请求代数) —— 重复点开同一 gameId 时, 旧请求的
+    # 软/硬超时与结果回投只认自己的代数, 不会误杀/误填新请求。
+    _detail_ready = pyqtSignal(object, int, object, str)
     # v4.7.0: 授权检查结果从后台线程送回主线程（None = 检查未产出结果）
     _lic_result_sig = pyqtSignal(object)
+    # v4.9.x: EOG 即时战绩拉取完成(独立线程池 → 主线程)。game(dict|None), err(str)
+    _eog_ready = pyqtSignal(object, str)
 
     # v4.3.10:WS 的 on_open / on_close 回调发生在 **websocket-client 的后台线程**,
     # 那里没有 Qt 事件循环。原实现用 `QTimer.singleShot(0, _do)` 想排回主线程,
@@ -637,16 +780,23 @@ class AppController(QObject):
     # 参数: kind('accept'|'decline'|'swap'), ok(bool), cid(int, 仅 swap 用)
     _action_done_sig = pyqtSignal(str, bool, int)
 
+    # v4.4.x(P1): 「清理缓存」后台完成 → 主线程回填结果。
+    # payload: {'cleaned': bool, 'removed': int, 'freed': int, 'notes': list, 'items': dict}
+    _clean_done_sig = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self._schedule_hide_sig.connect(self._schedule_hide_impl)
+        self._schedule_recent_refresh_sig.connect(self._schedule_recent_refresh_impl)
         self._ui_cmd.connect(self._apply_ui_connected)
         self._conn_state_sig.connect(self._apply_conn_state)  # v4.4.1(UI-B5)
         self._champ_remote_ready.connect(self._on_champ_remote_ready)
         self._avatar_done.connect(self._apply_avatar)
         self._detail_ready.connect(self._on_detail_ready)
+        self._eog_ready.connect(self._on_eog_ready)
         self._start_done_sig.connect(self._on_start_done)
         self._action_done_sig.connect(self._on_action_done)  # v4.4.2(P1-4)
+        self._clean_done_sig.connect(self._on_clean_cache_done)  # v4.4.x(P1)
         # v4.4.5: 启动 LOL 完成 → 主线程收尾(提示/回填日志)
         self._lol_launch_done_sig.connect(self._on_lol_launch_done)
         # v4.8.0: 录制前准备登录器的信号连接已删除(录制回放功能整体移除)。
@@ -669,6 +819,11 @@ class AppController(QObject):
         # _on_auto_select_champion_request, 若时机重合(用户很快就点了启动)会
         # 重复弹提示框 + 重复触发 runas。成功触发一次后置位, 其余入口直接跳过。
         self._elevate_requested = False
+        # v4.10.x(P1 修复"提权弹窗弹两次"): _elevate_requested 只在 UAC 通过后
+        # 才置位, 而提示框 exec_() 是模态循环 —— 模态期间另一入口(启动脚本补查/
+        # 协议确认回调)进入时判据还是 False, 就会弹第二个框。此标志在**弹框前**
+        # 置位、exec_ 返回后复位, 保证同一时刻最多只有一个提示框在屏上。
+        self._elevate_prompting = False
 
         self._conn = LCUConnector()
         self._api = LCUAPI(self._conn)
@@ -688,13 +843,20 @@ class AppController(QObject):
         # /英雄图标互相堵
         self._item_pool = ThreadPoolExecutor(max_workers=4,
                                              thread_name_prefix='item')
-        self._detail_waiters: dict = {}   # gameId -> callback(detail, err)
+        self._detail_waiters: dict = {}   # gameId -> (callback, generation)
+        # v4.4.x(P1): 详情请求代数。同一 gameId 重复点开时 gen 自增, 旧请求的
+        # 软/硬超时与结果回投只认自己的 gen, 避免"旧超时定时器误杀新请求"。
+        self._detail_gen = 0
         # v4.3.1: 本人 puuid 缓存(探活 worker 每轮回传, 见 _on_probe_done)。
         # 空串 = 还没探活过, 此时点详情会给"尚未获取账号信息"而不是崩。
         # v4.4.0(P1-25): 与 _ConnProbeWorker._probe_puuid 区分命名 —— 这一份是
         # **主控侧副本**(消费方), worker 那份是源(生产方); 原来两边都叫 _puuid,
         # 分属两个线程各写, 排查时无法一眼看出谁写谁读。
         self._summoner_puuid = ''
+        # v4.9.x: EOG 即时战绩状态。_eog_fetched_gid 防同一局重复拉;
+        # EOG 只在结算页存在, 离开结算页(或客户端关掉)后该端点即 404。
+        self._eog_inflight = False
+        self._eog_fetched_gid = 0
         # 两级兜底, 别让 UI 干等、也别把慢的当成死的:
         #   软超时 → 只告诉弹窗"读得慢, 仍在等", waiter 保留, 结果回来照样回填;
         #   硬超时 → 才摘掉 waiter 并报错。
@@ -787,6 +949,9 @@ class AppController(QObject):
         self._auto_start_timer.setSingleShot(True)
         self._auto_start_timer.timeout.connect(self._do_auto_start_on_connect)
         self._last_icon_id = 0
+        # v4.4.x(P1): 手动接受/拒绝/换英雄的在途标志。后台 REST 未返回前连点
+        # 直接忽略(此前每次点击都新建一个无单飞的 daemon 线程)。
+        self._action_inflight = {'accept': False, 'decline': False, 'swap': False}
 
         # v4.7.0: 授权状态。**懒检查** —— 后台预热一次, 结果缓存到 _lic_status，
         # 避免每次点"启动"都重跑指纹采集/验签（合计 300ms+，会卡住 GUI）。
@@ -838,7 +1003,12 @@ class AppController(QObject):
 
 
     def _make_icon(self) -> QIcon:
-        """生成应用图标 - 从文件加载"""
+        """生成应用图标 - 从文件加载。
+
+        v4.4.x(P1) 注: 这里**故意不**统一走 _data_base()/app_data_dir —— 图标在
+        打包后可能位于 _MEIPASS(包内 data/)或 exe 同级 data/, 需要多路径回退;
+        app_data_dir 只指向包外那一处, 语义不同(见 _data_base 的注释)。
+        """
         if getattr(sys, 'frozen', False):
             base = sys._MEIPASS
             base2 = os.path.dirname(sys.executable)
@@ -874,27 +1044,35 @@ class AppController(QObject):
         return QIcon(pm)
 
     def initialize(self):
-        icon = self._make_icon()
-        self._app.setWindowIcon(icon)
+        # v4.4.x: 图标只生成一次并缓存, _setup_tray 直接复用 —— 避免每次启动
+        # 都跑两遍磁盘探测 + 兜底绘制(_make_icon 含文件 IO 与 QPainter 绘制)。
+        self._app_icon = self._make_icon()
+        self._app.setWindowIcon(self._app_icon)
 
         # ===== 小窗日志过滤策略（v11 增强）=====
         # 主窗日志面板是开发者/诊断向的，仍接受所有内容；
         # 小窗 mini_log 只展示面向用户的友好状态。
-        _HIDE_PATTERNS = ['hwnd', 'shadow=', 'port=', 'token=', 'Acrylic', 'Glass',
-                          'Exception', 'Traceback', 'Error', 'Timeout', 'ConnectionError',
-                          'ImportError', 'ModuleNotFoundError', 'FileNotFoundError',
-                          # v11：明确拦截监控类日志(原来靠"无中文"过滤),
-                          # 但 [WS] 关闭: code=None msg=None manual=False 里有"关闭"二字会漏进来,
-                          # 这里直接拦截主入口与典型监控字串:
-                          '] 关闭:', '] 已连接:', '] 连接中', '] on_open',
-                          'code=None', 'msg=None', 'manual=',
-                          '[探活]', '[监控]']
-        # v11：监控类日志关键字大集合 —— 任一命中即不进 mini_log
-        # 即便有中文字符(像 "[WS] 关闭: code=None msg=None manual=False" 含"关闭")
-        _MONITOR_PATTERNS = _HIDE_PATTERNS + ['[WS]', '[Core]', '[App]', '[选人]',
-                                              'GET ', 'POST ', 'PUT ', 'DELETE ',
-                                              'wss://', 'ws://', 'https://', 'http://',
-                                              'Connection:', 'User-Agent']
+        # v4.4.x: _HIDE_PATTERNS 曾是独立命名的"死命名层" —— 它只被下面
+        # _MONITOR_PATTERNS 拼接一次, 别无引用。现把两部分直接合并成一份列表,
+        # 注释说明各自拦截的类别, 过滤逻辑(any(p in text))保持不变。
+        _MONITOR_PATTERNS = [
+            # 技术细节与敏感字段
+            'hwnd', 'shadow=', 'port=', 'token=', 'Acrylic', 'Glass',
+            'Exception', 'Traceback', 'Error', 'Timeout', 'ConnectionError',
+            'ImportError', 'ModuleNotFoundError', 'FileNotFoundError',
+            # v11：明确拦截监控类日志(原来靠"无中文"过滤),
+            # 但 [WS] 关闭: code=None msg=None manual=False 里有"关闭"二字会漏进来,
+            # 这里直接拦截主入口与典型监控字串:
+            '] 关闭:', '] 已连接:', '] 连接中', '] on_open',
+            'code=None', 'msg=None', 'manual=',
+            '[探活]', '[监控]',
+            # v11：监控类日志关键字大集合 —— 任一命中即不进 mini_log
+            # 即便有中文字符(像 "[WS] 关闭: code=None msg=None manual=False" 含"关闭")
+            '[WS]', '[Core]', '[App]', '[选人]',
+            'GET ', 'POST ', 'PUT ', 'DELETE ',
+            'wss://', 'ws://', 'https://', 'http://',
+            'Connection:', 'User-Agent',
+        ]
 
         def _on_log(text):
             try:
@@ -952,7 +1130,7 @@ class AppController(QObject):
             return
         self._tray = QSystemTrayIcon(self._main)
         self._tray.setToolTip('大蛋小助手')
-        self._tray.setIcon(self._make_icon())
+        self._tray.setIcon(getattr(self, '_app_icon', None) or self._make_icon())
 
         menu = QMenu()
         # v4.4.1(UI-B7): 深色菜单 QSS + 菜单项图标。
@@ -974,6 +1152,7 @@ class AppController(QObject):
         quit_a.triggered.connect(self._quit)
 
         self._tray.setContextMenu(menu)
+        self._tray_menu = menu   # 保持 QMenu 成员引用, 防止被 GC 回收(见审计 P1)
         self._tray.activated.connect(self._on_tray)
         self._tray.show()
 
@@ -988,6 +1167,7 @@ class AppController(QObject):
         # 该回调触发的是"英雄数据就绪"(供界面刷新), 与图标下载(main._dl_icon 线程池)是两条链路。
         self._core.set_on_status_update(self._on_status)
         self._core.set_on_ready_check_state(self._on_ready)
+        self._core.set_on_ready_check_response(self._on_ready_response)
         self._core.set_on_champ_select_info(self._on_champ_select_info)
 
     def _flush_mini_log(self):
@@ -1083,14 +1263,11 @@ class AppController(QObject):
         """保存英雄数据缓存（压缩格式，减小文件大小）
         v16:frozen 时写到 exe 同级 data/（_MEIPASS 临时目录只读,退出即消失,
         写那里下次启动读不到）。与 _get_icon_cache_dir 的落盘策略保持一致。
+        v4.4.x(P1): 基准目录统一走 _data_base()(= core.icon_cache.app_data_dir('')),
+        消除"frozen/源码分支各写一份"的漂移点。
         """
         try:
-            if getattr(sys, 'frozen', False):
-                base = os.path.dirname(sys.executable)
-            else:
-                base = os.path.dirname(os.path.abspath(__file__))
-            d = os.path.join(base, 'data')
-            os.makedirs(d, exist_ok=True)
+            d = self._data_base()
             # 使用紧凑格式，不缩进
             with open(os.path.join(d, 'champion_cache.json'), 'w', encoding='utf-8') as f:
                 json.dump({
@@ -1193,9 +1370,12 @@ class AppController(QObject):
         # v4.3.5: 对局结束时立刻 + 分阶段补拉战绩 —— 解决"刚打完战绩里不显示"。
         # ⚠️ 刻意放在 `if self._overlay:` **外面**: 万一小窗构造失败,
         # 战绩刷新不该跟着一起不工作(两者本无依赖)。
-        if phase == 'EndOfGame':
-            self._force_profile_refresh('对局结束')
-            self._schedule_recent_refresh()
+        if phase in ('PreEndOfGame', 'EndOfGame'):
+            # v4.9.x: 先试 EOG 本地即时块(结算页秒出), 再走 match-history 补拉兜底
+            self._try_fetch_eog()
+            if phase == 'EndOfGame':
+                self._force_profile_refresh('对局结束')
+                self._schedule_recent_refresh()
 
     def _on_conn(self, connected, name=''):
         """ScriptCore 连接事件回调（来自 _init_session / _poll 失败 / refresh_connection）
@@ -1300,6 +1480,9 @@ class AppController(QObject):
             if not self._overlay:
                 return
             self._overlay.update_bench_champions(ids, cur_id)
+            # v4.9.13: core 可能自己清掉预输入(英雄已不在池里/换了新目标/离开选人),
+            # 每轮对齐一次。set_preinput 内部幂等, 值没变不重绘, 所以这里可以放心刷。
+            self._overlay.set_preinput(self._core.preinput_champion)
             for cid in ids:
                 data = self._cache_champ.hit(cid)
                 if data:
@@ -1482,32 +1665,63 @@ class AppController(QObject):
 
         为什么清点与清理共用一个信号: 两者都是"读同一份清点", 分开会多一个信号
         和一个槽, 而语义上本就是同一个入口的两种模式。
+
+        v4.4.x(P1): 清点/清理都涉及磁盘目录扫描(clean_caches 里还有 close/reopen
+        日志句柄、清空图标缓存等 IO), 原实现同步跑在主线程, 数据量大时卡 UI。
+        现在全部挪进后台线程, 结果经 _clean_done_sig 排回主线程回填。
         """
+        # v4.4.x(P1): 简单防抖 —— 上一次后台清理还没结束时, 忽略新的触发,
+        # 避免多次点击堆积后台任务(清理本身幂等, 最坏只是少刷新一次占用)。
+        if getattr(self, '_clean_inflight', False):
+            print('[清理] 上一次清理尚未完成, 忽略本次请求')
+            return
+        self._clean_inflight = True
+        threading.Thread(
+            target=self._clean_cache_worker, args=(list(targets or []),),
+            daemon=True, name='clean-cache').start()
+
+    def _clean_cache_worker(self, targets):
+        """后台线程: 执行清理/清点, 结果经信号排回主线程。"""
         try:
-            targets = list(targets or [])
-            if targets:
+            cleaned = bool(targets)
+            removed = freed = 0
+            notes = []
+            if cleaned:
                 removed, freed, notes = self.clean_caches(targets)
                 print(f'[清理] 已清理 {removed} 个文件, 释放 {freed} 字节'
                       + (f', 异常: {notes}' if notes else ''))
-                try:
-                    self._main.on_clean_done(removed, freed, notes)
-                except Exception:
-                    pass
-            # 回填最新占用。
-            # v4.6.8: 区分两种模式 —— 清理后要**保留**上面刚写的"已清理 N 个"
-            # 结果(keep_state=True); 纯清点才用占用数字覆盖状态行。原先两处都不传,
-            # 导致清理结果在同一帧被顶掉, 用户看不到任何反馈(实测复现)。
+            # 回填最新占用。清理后要**保留**上面刚写的"已清理 N 个"结果
+            # (keep_state=True); 纯清点才用占用数字覆盖状态行。
             items = self.scan_cleanable()
-            try:
-                self._main.update_clean_sizes(items, keep_state=bool(targets))
-            except Exception:
-                pass
+            self._clean_done_sig.emit({
+                'cleaned': cleaned, 'removed': removed, 'freed': freed,
+                'notes': notes, 'items': items})
         except Exception as e:
             print(f'[清理] 执行失败: {type(e).__name__}: {e}')
-            try:
-                self._main.on_clean_done(0, 0, [f'{type(e).__name__}: {e}'])
-            except Exception:
-                pass
+            self._clean_done_sig.emit({
+                'cleaned': bool(targets), 'removed': 0, 'freed': 0,
+                'notes': [f'{type(e).__name__}: {e}'], 'items': None})
+
+    @ui_slot
+    def _on_clean_cache_done(self, payload):
+        """主线程槽: 回填后台清理/清点结果。"""
+        self._clean_inflight = False
+        try:
+            if payload.get('cleaned'):
+                try:
+                    self._main.on_clean_done(payload.get('removed', 0),
+                                             payload.get('freed', 0),
+                                             payload.get('notes') or [])
+                except Exception:
+                    pass
+            if payload.get('items') is not None:
+                try:
+                    self._main.update_clean_sizes(
+                        payload.get('items'), keep_state=bool(payload.get('cleaned')))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f'[清理] 结果回填失败: {type(e).__name__}: {e}')
 
     def _sync_assets_version(self):
         """v4.6.3: 把游戏版本对齐到图标缓存, 版本一变就清掉旧图。
@@ -1540,6 +1754,22 @@ class AppController(QObject):
         except Exception as e:
             # 版本对齐失败绝不能让启动挂掉 —— 图标旧一点远比程序起不来轻
             print(f'[App] 图标版本对齐失败: {type(e).__name__}: {e}')
+
+    def _sync_assets_version_async(self):
+        """把版本对齐丢进后台线程池执行(WS 连接成功时调用)。
+
+        v4.4.x(P1): 原先 _on_ws_connected(主线程)同步调 _sync_assets_version ——
+        里面 get_game_version 是 REST、apply_assets_version 清旧图是磁盘 IO,
+        都可能在主线程卡顿。改由 _icon_pool 后台执行; 结果只打日志, 无需回 UI。
+
+        注意 _sync_assets_version 本身**保持同步实现不变**: cache_cleaner 清理完
+        缓存后需要同步对齐版本标记(否则刚清完又被当成"版本变了"白清一遍),
+        那条链路不能异步。本方法只服务"连接成功"这一条纯后台时机。
+        """
+        try:
+            self._icon_pool.submit(self._sync_assets_version)
+        except Exception as e:
+            print(f'[App] 版本对齐任务提交失败: {type(e).__name__}: {e}')
 
     def _prewarm_icon_cache_async(self):
         """v16:启动期后台预热磁盘图标缓存到内存。
@@ -1607,6 +1837,9 @@ class AppController(QObject):
             # 2. 缓存未命中 → 下载
             data = self._api.download_profile_icon(icon_id)
             if not data:
+                # v4.4.x(P1): 下载失败必须复位去重标记, 否则本会话内 icon_id 不再
+                # 变化 → 下轮探活不会重试, 头像永远空着(只能重启程序)。
+                self._last_icon_id = 0
                 return
             try:
                 path = self._avatar_disk_path(icon_id)
@@ -1640,6 +1873,8 @@ class AppController(QObject):
         except Exception as e:
             print(f'[App] 头像下载失败 icon={icon_id}: '
                   f'{type(e).__name__}: {e}')
+            # v4.4.x(P1): 同上 —— 整体异常也要复位去重标记, 让下轮探活重试
+            self._last_icon_id = 0
 
     def _apply_avatar(self, icon_id, data):
         """主线程:头像 bytes → 主窗账号卡头像。"""
@@ -1675,42 +1910,49 @@ class AppController(QObject):
         # 直接覆盖 `_detail_waiters[gid]`, 旧 callback 从此再无引用、永不触发 ——
         # 第一个弹窗就永久停在"读取中"(它连超时兜底都收不到, 因为 hard timeout
         # 是按 gid pop 的, 只会唤醒最后一个)。这里显式给旧回调一个终止答复。
-        old_cb = self._detail_waiters.get(gid)
-        if old_cb is not None:
+        # v4.4.x(P1): 同时引入请求代数 —— 旧的软/硬超时定时器到点时若代数已变,
+        # 直接忽略, 不会误杀新请求(此前旧超时会把新请求的 waiter pop 掉)。
+        old = self._detail_waiters.get(gid)
+        if old is not None:
             print(f'[详情] 该对局已有在途请求, 旧回调先收到"已被新请求取代" '
                   f'gameId={gid}')
-            self._safe_detail_cb(old_cb, None, '该对局详情已重新请求，本次读取被取代')
-        self._detail_waiters[gid] = callback
+            self._safe_detail_cb(old[0], None, '该对局详情已重新请求，本次读取被取代')
+        self._detail_gen += 1
+        gen = self._detail_gen
+        self._detail_waiters[gid] = (callback, gen)
         QTimer.singleShot(self._detail_soft_ms,
-                          lambda g=gid: self._detail_slow(g))
+                          lambda g=gid, ge=gen: self._detail_slow(g, ge))
         QTimer.singleShot(self._detail_hard_ms,
-                          lambda g=gid: self._detail_timeout(g))
+                          lambda g=gid, ge=gen: self._detail_timeout(g, ge))
         try:
-            self._detail_pool.submit(self._do_fetch_game_detail, gid)
+            self._detail_pool.submit(self._do_fetch_game_detail, gid, gen)
         except Exception as e:
             self._detail_waiters.pop(gid, None)
             print(f'[详情] 排入线程池失败: {type(e).__name__}: {e}')
             self._safe_detail_cb(callback, None, f'线程池繁忙({type(e).__name__})')
 
     @ui_slot
-    def _detail_slow(self, gid):
+    def _detail_slow(self, gid, gen):
         """软超时: 还在读。只提示, **不摘 waiter** —— 结果回来照样回填。"""
-        cb = self._detail_waiters.get(int(gid))
-        if cb is None:
+        cur = self._detail_waiters.get(int(gid))
+        # v4.4.x(P1): 代数不匹配 = 该请求已被新请求取代, 这个旧定时器是空转, 忽略
+        if cur is None or cur[1] != gen:
             return
         print(f'[详情] 读取较慢 gameId={gid} (>{self._detail_soft_ms}ms, 继续等待)')
-        self._safe_detail_cb(cb, None, '__slow__')
+        self._safe_detail_cb(cur[0], None, '__slow__')
 
     @ui_slot
-    def _detail_timeout(self, gid):
-        """硬超时: waiter 还在 = 真的没结果(客户端无响应/端点挂了)。"""
-        cb = self._detail_waiters.pop(int(gid), None)
-        if cb is None:
+    def _detail_timeout(self, gid, gen):
+        """硬超时: waiter 还在且代数匹配 = 真的没结果(客户端无响应/端点挂了)。"""
+        cur = self._detail_waiters.get(int(gid))
+        # v4.4.x(P1): 代数不匹配 → 是已被取代的旧请求的定时器, 不能误删新 waiter
+        if cur is None or cur[1] != gen:
             return
+        self._detail_waiters.pop(int(gid), None)
         print(f'[详情] 读取失败 gameId={gid} (>{self._detail_hard_ms}ms 无结果)')
-        self._safe_detail_cb(cb, None, '读取超时（客户端可能正忙，可重试）')
+        self._safe_detail_cb(cur[0], None, '读取超时（客户端可能正忙，可重试）')
 
-    def _do_fetch_game_detail(self, gid):
+    def _do_fetch_game_detail(self, gid, gen):
         """详情线程池执行: 拉详情 + 解析 + 补英雄名(只读 _champ_data, 字典读安全)。"""
         detail, err = None, ''
         try:
@@ -1748,16 +1990,19 @@ class AppController(QObject):
                 else:
                     err = '该对局记录已不可用'
         except Exception as e:
-            err = f'{type(e).__name__}: {e}'
+            err = f'{type(e).__name__}: {redact_sensitive(str(e))}'
             print(f'[详情] 拉取失败 gameId={gid}: {err}')
-        self._detail_ready.emit(int(gid), detail, err)
+        self._detail_ready.emit(int(gid), gen, detail, err)
 
     @ui_slot
-    def _on_detail_ready(self, gid, detail, err=''):
+    def _on_detail_ready(self, gid, gen, detail, err=''):
         """主线程槽: 把结果派回发起方(弹窗)。"""
-        cb = self._detail_waiters.pop(int(gid), None)
-        if cb is not None:
-            self._safe_detail_cb(cb, detail, err)
+        cur = self._detail_waiters.get(int(gid))
+        # v4.4.x(P1): 代数不匹配 = 这是已被新请求取代的旧结果, 丢弃(旧回调已在
+        # fetch 时收到"被取代"答复, 新请求会由它自己的 gen 收结果)
+        if cur is not None and cur[1] == gen:
+            self._detail_waiters.pop(int(gid), None)
+            self._safe_detail_cb(cur[0], detail, err)
 
     @staticmethod
     def _safe_detail_cb(cb, detail, err=''):
@@ -1878,6 +2123,19 @@ class AppController(QObject):
         except Exception as e:
             print(f'[App] 确认对局处理异常: {type(e).__name__}: {e}')
 
+    def _on_ready_response(self, response):
+        """本机 ReadyCheck 响应(自动/手动/客户端内点)统一回推小窗面板。
+
+        v5.0.x(用户要求): 面板要在确认窗口内常驻并可反悔 —— 已接受可再拒绝、
+        已拒绝可再接受。所以响应不再由 _on_action_done 单独写(那只能覆盖手动路径),
+        统一由 core 在四处 emit(Accepted/Declined)后转发到这里。
+        """
+        try:
+            if self._overlay and response in ('Accepted', 'Declined'):
+                self._overlay.set_ready_response(response)
+        except Exception as e:
+            print(f'[App] 确认对局响应处理异常: {type(e).__name__}: {e}')
+
     def _on_champ_select_info(self, info):
         """选人阶段信息回调"""
         try:
@@ -1931,12 +2189,18 @@ class AppController(QObject):
         """
         try:
             self._conn.reset()
-            self._core.refresh_connection()
+            # v4.4.x(P1): 原实现在这里调 self._core.refresh_connection() —— 它是
+            # 同步 REST(get_current_summoner), 而本函数由 _ws_disconnected_sig 排回
+            # **主线程**执行, 等于 WS 每次闪断都在主线程打一次可能超时数秒的 REST,
+            # 是卡顿源。重连(含刷新核心连接)统一交给下一轮定时器:
+            #   - _reconnect_timer(5s) → _try_connect → 后台线程 find_client + WS 重连;
+            #   - _ui_conn_refresh_timer(3s) → _refresh_ui_conn → 后台 QThread 探活;
+            # 这里只做轻量的连接器状态清理(毫秒级), 不再做任何同步网络请求。
             # 不再调用 self._main.update_connection_status(False)，
             # 改由 _ui_conn_refresh_timer 周期探活来刷新 UI。
         except Exception as e:
-            # WS 断开后的重连准备失败 —— 留痕,否则表现为"断线后永远重连不上"
-            print(f'[App] WS 断开后清理/重连准备失败: '
+            # WS 断开后的清理失败 —— 留痕,否则表现为"断线后永远重连不上"
+            print(f'[App] WS 断开后清理失败: '
                   f'{type(e).__name__}: {e}')
 
     # ==================== 连接（后台线程，不阻塞UI） ====================
@@ -2038,7 +2302,8 @@ class AppController(QObject):
             # 版本对齐(版本变了就清旧图)。放在这里而不是启动时: 启动时客户端
             # 往往还没开, 拿不到版本; 而且清缓存属于"发现过期"才做的事, 放在
             # 连接成功这个明确的边界上最自然。
-            self._sync_assets_version()
+            # v4.4.x(P1): 改为后台线程池执行, 不在主线程做 REST + 磁盘 IO。
+            self._sync_assets_version_async()
             self._on_connect_success()
         except Exception as e:
             print(f'[App] WS 连接成功处理异常: {type(e).__name__}: {e}')
@@ -2057,18 +2322,103 @@ class AppController(QObject):
             w = getattr(self, '_probe_worker', None)
             if w is None:
                 return
+            # v4.4.x(P1): 这里从调用线程(主线程/后台补拉定时器)裸写 worker 的标志
+            # `_force_profile`。依赖 CPython GIL 的原子性即可 —— 单字节 bool 赋值
+            # 在 GIL 下是原子的, worker 轮询读取要么见旧值要么见新值, 不会撕裂;
+            # 刻意不引入锁: worker 每 3s 轮询一次, 主线程若拿锁等 worker 会徒增
+            # 死锁/卡顿风险, 收益为零。
             w._force_profile = True
             print(f'[战绩] 触发强制刷新({reason}), 下一轮探活立即重拉')
         except Exception as e:
             print(f'[战绩] 强制刷新置位失败: {type(e).__name__}: {e}')
 
     def _schedule_recent_refresh(self):
-        """对局结束后按 [15s, 45s, 90s] 补拉战绩 —— 对抗 LCU 服务端入库延迟。"""
+        """对局结束后按 [15s, 45s, 90s] 补拉战绩 —— 对抗 LCU 服务端入库延迟。
+
+        v5.0.0 审计修复: 本方法可能被 _on_phase(poll/WS 后台线程)调用, 只 emit
+        信号; 真正的 QTimer.singleShot 由主线程槽 _schedule_recent_refresh_impl
+        执行 —— 否则定时器绑定到无事件循环的后台线程, timeout 永不触发。
+        """
+        try:
+            self._schedule_recent_refresh_sig.emit()
+        except Exception:
+            pass
+
+    @ui_slot
+    def _schedule_recent_refresh_impl(self):
+        """主线程: 排 [15s,45s,90s] 三次补拉(QTimer 线程亲和要求在主线程)。"""
         for delay in (15_000, 45_000, 90_000):
             try:
                 QTimer.singleShot(delay, lambda: self._force_profile_refresh('对局结束后补拉'))
             except Exception:
                 pass
+
+    # ==================== v4.9.x 对局结束后 EOG 即时战绩 ====================
+    def _try_fetch_eog(self):
+        """对局结束(PreEndOfGame/EndOfGame)时, 立刻从 EOG 端点拉最新一局。
+
+        EOG 块在结算页本地生成, 比 match-history 服务端入库快得多 —— 这是
+        "刚打完战绩页秒出"的唯一本地数据源。拉取走独立线程池(_detail_pool),
+        不阻塞主线程; 完成后经 _eog_ready 信号排回主线程回填。
+
+        防重: _eog_inflight(在途) + _eog_fetched_gid(同一局只回填一次);
+        失败静默 —— match-history 的 15s/45s/90s 补拉仍在, EOG 只做加速。
+        """
+        if getattr(self, '_eog_inflight', False):
+            return
+        puuid = (getattr(self, '_summoner_puuid', '') or '').strip()
+        if not puuid:
+            # 探活还没回过 puuid, 不硬拉(没有 puuid 无法认出"我")
+            return
+        self._eog_inflight = True
+        try:
+            self._detail_pool.submit(self._do_fetch_eog, puuid)
+        except Exception as e:
+            self._eog_inflight = False
+            print(f'[战绩] EOG 任务排入线程池失败: {type(e).__name__}: {e}')
+
+    def _do_fetch_eog(self, my_puuid: str):
+        """详情线程池执行: 拉 EOG 块 + 解析成本人单局结构。"""
+        game = None
+        err = ''
+        try:
+            raw = self._api.get_eog_stats_block()
+            if raw:
+                game = _parse_eog_stats(raw, my_puuid)
+                if not game:
+                    err = 'EOG 块无本人记录'
+            else:
+                err = 'EOG 暂不可用'
+        except Exception as e:
+            err = f'{type(e).__name__}: {e}'
+            print(f'[战绩] EOG 拉取失败: {err}')
+        self._eog_ready.emit(game, err)
+
+    @ui_slot
+    def _on_eog_ready(self, game, err=''):
+        """主线程槽: EOG 即时战绩回填 —— 有新局则合并进战绩列表并刷 UI。"""
+        self._eog_inflight = False
+        if not isinstance(game, dict) or not game.get('game_id'):
+            return
+        gid = game.get('game_id')
+        if gid == getattr(self, '_eog_fetched_gid', 0):
+            return
+        # 补英雄中文名(与探活回填同一规则)
+        cid = game.get('champion_id') or 0
+        game['champion_name'] = self._champ_data.get(
+            cid, game.get('champion_name') or (f'英雄#{cid}' if cid else ''))
+        try:
+            main = self._main
+            if main is not None and hasattr(main, 'prepend_recent_game'):
+                main.prepend_recent_game(game)
+                # v4.4.x(P1): 回填成功才置位 —— 原先在 prepend 之前就置位,
+                # 回填失败会让这一局被永久标记"已回填", 本会话不再重试
+                self._eog_fetched_gid = gid
+                print(f'[战绩] EOG 即时战绩已回填 gameId={gid}')
+            else:
+                print(f'[战绩] EOG 回填接口未就绪, gameId={gid}')
+        except Exception as e:
+            print(f'[战绩] EOG 回填失败: {type(e).__name__}: {e}')
 
     def _refresh_ui_conn(self):
         """v8：主线程只做轻量校验 + 派发任务,实际 REST 在 _ConnProbeWorker (QThread) 跑。
@@ -2200,6 +2550,9 @@ class AppController(QObject):
                         self._recent_icon_wired = True
                         # v4.3.0: 战绩详情数据回调(点击行 → 独立线程池拉 10 人明细)
                         self._main.set_recent_detail_cb(self.fetch_game_detail)
+                        # v4.9.x: 战绩页「立即刷新」按钮回调(复用强制刷新通道)
+                        self._main.set_recent_refresh_cb(
+                            lambda: self._force_profile_refresh('手动刷新'))
                 except Exception as e:
                     print(f'[App] 账号卡更新失败: {type(e).__name__}: {e}')
             # 头像:icon_id 变化才重新下载
@@ -2467,6 +2820,25 @@ class AppController(QObject):
         threading.Thread(target=self._lol_launch_worker, daemon=True,
                          name='lol-launch').start()
 
+    def _runas_restart(self, params: str, tag: str = '[提权]') -> bool:
+        """以管理员权限重启自身(ShellExecuteW runas)。
+
+        params: 传给新实例的完整命令行参数(不含 exe 路径本身)。
+                frozen 时 exe 直接用、cwd 取 exe 同级; 源码运行时 cwd 取当前目录。
+        返回 True  = ShellExecuteW 返回值 >32, 已成功请求提权(新实例即将接管);
+             False = 用户取消 UAC 或调用失败。
+        """
+        exe = sys.executable
+        cwd = os.path.dirname(exe) if getattr(sys, 'frozen', False) else os.getcwd()
+        shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+        shell32.ShellExecuteW.restype = ctypes.c_size_t
+        r = shell32.ShellExecuteW(None, 'runas', exe, params, cwd, 1)
+        print(f'{tag} ShellExecuteW(runas) 返回 {r}')
+        return r > 32
+
     def _elevate_for_lol(self, action: str = 'stop_all') -> bool:
         """「全部停止」前的管理员权限检查。
 
@@ -2483,6 +2855,10 @@ class AppController(QObject):
              False = 已触发提权重启, 或用户取消了 UAC, 调用方应中止本次流程。
         """
         if self._elevate_requested:
+            return False
+        # v4.10.x(P1): 提示框已在屏上(另一入口正在弹)时不再叠加
+        if getattr(self, '_elevate_prompting', False):
+            print('[全部停止] 提权提示框已在屏上, 跳过重复弹框')
             return False
         try:
             from lcu.clicker import is_admin
@@ -2507,33 +2883,26 @@ class AppController(QObject):
                 f'并在重启后自动继续关闭 LOL。')
             box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
             box.setDefaultButton(QMessageBox.Ok)
-            if box.exec_() != QMessageBox.Ok:
-                print(f'{tag} 用户取消了管理员授权')
-                return False
+            self._elevate_prompting = True
+            try:
+                if box.exec_() != QMessageBox.Ok:
+                    print(f'{tag} 用户取消了管理员授权')
+                    return False
+            finally:
+                self._elevate_prompting = False
         except Exception as e:
             print(f'{tag} 提权提示框异常: {type(e).__name__}: {e}')
 
-        r = 0
         try:
-            shell32 = ctypes.WinDLL('shell32', use_last_error=True)
-            shell32.ShellExecuteW.argtypes = [
-                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
-                ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
-            shell32.ShellExecuteW.restype = ctypes.c_size_t
-            exe = sys.executable
             if getattr(sys, 'frozen', False):
-                cwd = os.path.dirname(exe)
                 params = '--stop-all'
             else:
-                cwd = os.getcwd()
                 params = f'"{os.path.abspath(__file__)}" --stop-all'
-            r = shell32.ShellExecuteW(None, 'runas', exe, params, cwd, 1)
-            print(f'{tag} ShellExecuteW(runas) 返回 {r}')
+            if not self._runas_restart(params, tag=tag):
+                print(f'{tag} UAC 未授权')
+                return False
         except Exception as e:
             print(f'{tag} 提权异常: {type(e).__name__}: {e}')
-            return False
-        if r <= 32:
-            print(f'{tag} UAC 未授权(返回值 {r})')
             return False
 
         self._elevate_requested = True
@@ -2564,11 +2933,20 @@ class AppController(QObject):
         """启动 LOL 完成 → 主线程收尾。"""
         self._lol_launching = False
         if ok:
-            print(f'[启动LOL] ✅ {msg}')
+            # v4.10.x: print emoji 在 GBK 控制台会抛 UnicodeEncodeError, 若被
+            # ui_slot 吞掉则 _maybe_collapse_to_overlay 永不执行(主窗不隐藏)。
+            # 日志打印失败绝不能中断收尾逻辑, 故单独兜住。
+            try:
+                print(f'[启动LOL] ✅ {msg}')
+            except Exception:
+                pass
             # 连上大厅后, 若用户之前没跑脚本, 无需自动启动脚本; 仅提示
             self._maybe_collapse_to_overlay()
         else:
-            print(f'[启动LOL] ❌ {msg}')
+            try:
+                print(f'[启动LOL] ❌ {msg}')
+            except Exception:
+                pass
             try:
                 QMessageBox.information(
                     self._main, '启动 LOL',
@@ -2936,10 +3314,25 @@ class AppController(QObject):
 
             # 3. 启动脚本(内部可能 join 上一轮线程, 最多 3s —— 这正是必须放
             #    后台线程的原因之一)
+            # v5.0.0 审计修复(P2): core.start() 前**再查一次** _starting。
+            # 用户在"查找客户端/连接"期间点了停止 → _stop() 置 _starting=False
+            # 且 core.stop()(_stop_event.set()); 若不复查, 这里 core.start()
+            # 会 _stop_event.clear() 把停止意图抹掉、_running=True, loop 短暂
+            # 拉起直到 _on_start_done 回滚, 窗口期内可能真的发起一次匹配/接受。
+            if not self._starting:
+                print('[App] 启动完成前已收到停止请求, 不再拉起核心')
+                self._start_done_sig.emit(False, 'stopped')
+                return
             try:
                 self._core.start()
             except Exception as e:
+                # v4.4.x(P1): 原实现吞掉异常后仍 `ok = True`, 主线程会把 UI 拉成
+                # "运行中"而脚本其实没起来。这里置 ok=False 并带回错误, 让
+                # _on_start_done 走失败分支(回退按钮状态 + 日志留痕)。
                 print(f'[App] 启动核心失败: {type(e).__name__}: {e}')
+                err = f'启动核心失败: {type(e).__name__}: {e}'
+                self._start_done_sig.emit(False, err)
+                return
 
             ok = True
         except Exception as e:
@@ -3043,6 +3436,13 @@ class AppController(QObject):
         # 而脚本在后台真的跑起来。
         self._starting = False
         self._core.stop()
+        # v5.0.0 审计修复: **不**在这里 _ensure_stopped()。
+        # stop() 已置位 _stop_event 并 join 登记的工作线程(都有 stop_event 协作,
+        # 快速退出)。主 _loop 线程若正卡在 REST 请求里, join 它会在 UI 线程冻
+        # STOP_JOIN_S 秒 —— 而 _stop 由 stop_script/toggle/close/stop_all 全部在
+        # 主线程触发, 叠加最坏 6s 假死。主 loop 的 join 交给两处:
+        #   - core.start() 的前置检查(见 ScriptCore.start, 本来就等旧线程);
+        #   - _quit() 退出收尾(不在事件循环里, 阻塞可接受)。
         # v4.1.65: 脚本停了就不必再兜底收小窗
         try:
             self._overlay_guard_timer.stop()
@@ -3196,6 +3596,13 @@ class AppController(QObject):
             self._core.stop()
         except Exception:
             pass
+        # v5.0.0 审计修复(P3): 退出时等主 _loop 线程走完 _cleanup(), 让
+        # "本脚本发起的匹配队列"被 stop_matchmaking() 取消。_quit 不在事件循环
+        # 里, 阻塞 STOP_JOIN_S 可接受; loop 是 daemon, 超时也会被进程带走。
+        try:
+            self._core._ensure_stopped()
+        except Exception:
+            pass
         try:
             self._ws.disconnect()
         except Exception:
@@ -3290,6 +3697,9 @@ class AppController(QObject):
         self._main.clean_cache_signal.connect(self._on_clean_cache)
 
         self._overlay.swap_signal.connect(self._on_swap)
+        # v4.9.13: 小窗单击备选英雄 → 切换预输入(开关开时走这条, 关时小窗自己走
+        # swap_signal, 见 overlay_window._on_click)
+        self._overlay.sig_preinput.connect(self._on_preinput_click)
         self._overlay.accept_signal.connect(self._on_accept)
         self._overlay.decline_signal.connect(self._on_decline)
         # v4.6.11: **删除** `self._overlay.stop_signal.connect(self._stop)` ——
@@ -3308,10 +3718,12 @@ class AppController(QObject):
         if self._core.is_running:
             self._main.hide()
             # v4.1.65: 游戏中收起小窗(与"进游戏自动隐藏"语义一致), 否则会挂在画面上
-            if self._core.current_phase == 'InProgress':
-                self._overlay.safe_hide()
-            else:
-                self._overlay.safe_show()
+            # v4.4.x(P1): _overlay 加判空 —— 无托盘/小窗未初始化场景下直接访问会崩
+            if self._overlay:
+                if self._core.current_phase == 'InProgress':
+                    self._overlay.safe_hide()
+                else:
+                    self._overlay.safe_show()
             print('[窗口] 隐藏主窗口，显示小窗')
         else:
             if self._overlay and self._overlay.isVisible():
@@ -3329,6 +3741,7 @@ class AppController(QObject):
             'auto_accept': '自动接受', 'auto_accept_delay': '接受延迟',
             'auto_play_again': '自动返回', 'auto_play_again_delay': '返回延迟',
             'auto_select_champion': '自动选英雄', 'auto_pick_champion': '自动换英雄',
+            'auto_preinput_champion': '预输入选英雄',
             'preferred_champions': '偏好英雄',
             'auto_start_on_connect': '连上客户端自动启动脚本',
             'auto_start_on_connect_delay': '自动启动延时',
@@ -3391,11 +3804,21 @@ class AppController(QObject):
         if self._elevate_requested:
             print('[设置] 提权请求已发起过, 跳过重复触发')
             return True
+        # v4.10.x(P1): 提示框正在屏上时, 其它入口的重复触发直接当作"已处理"
+        # 返回, 不再叠第二个框(模态 exec_ 期间事件循环仍会派发其它入口的调用)。
+        if getattr(self, '_elevate_prompting', False):
+            print(f'[设置] 提权提示框已在屏上, 跳过重复弹框({reason})')
+            return True
         try:
             from lcu.clicker import is_admin
             elevated = is_admin()
-        except Exception:
-            elevated = False
+        except Exception as e:
+            # v4.4.x(P1): 判定失败时保守放弃本次提权 —— 原实现把异常当成
+            # "非管理员"继续走 runas, 会无谓弹 UAC 甚至重启。is_admin 失败说明
+            # 环境异常, 与其盲目提权重启, 不如留痕并安静退出本次流程。
+            print(f'[设置] 管理员权限判定失败, 放弃本次提权: '
+                  f'{type(e).__name__}: {e}')
+            return False
         print(f'[设置] 提权请求({reason}): 当前进程管理员={elevated}')
         if elevated:
             print('[设置] 已是管理员权限, 直接生效(不重启)')
@@ -3416,6 +3839,8 @@ class AppController(QObject):
                 print(f'[设置] 停止脚本异常: {type(e).__name__}: {e}')
 
         # 弹中文提示, 让用户知道接下来要做什么(不再无声重启)
+        # v4.10.x(P1): 弹框前置位 _elevate_prompting, exec_ 返回(无论确认/取消)
+        # 后 finally 复位 —— 模态循环期间其它入口只会命中"已在屏上"短路。
         try:
             from PyQt5.QtWidgets import QMessageBox
             if self._main:
@@ -3429,7 +3854,11 @@ class AppController(QObject):
                                        '请点「是」允许 → 程序将以管理员权限自动重启')
                 box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
                 box.setDefaultButton(QMessageBox.Ok)
-                ret = box.exec_()
+                self._elevate_prompting = True
+                try:
+                    ret = box.exec_()
+                finally:
+                    self._elevate_prompting = False
                 if ret != QMessageBox.Ok:
                     print('[设置] 用户取消了管理员授权')
                     # v4.7.3: **只回退本次真正相关的那项设置**。
@@ -3447,25 +3876,13 @@ class AppController(QObject):
 
         # 启动管理员实例
         try:
-            import ctypes
-            import os as _os
-            shell32 = ctypes.WinDLL('shell32', use_last_error=True)
-            shell32.ShellExecuteW.argtypes = [
-                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
-                ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
-            shell32.ShellExecuteW.restype = ctypes.c_size_t
-            exe = sys.executable
-            cwd = _os.path.dirname(exe) if getattr(sys, 'frozen', False) else _os.getcwd()
-            r = shell32.ShellExecuteW(None, 'runas', exe, '', cwd, 1)
-            print(f'[设置] ShellExecuteW(runas) 返回 {r}')
+            if not self._runas_restart('', tag='[设置]'):
+                # 用户在 UAC 弹窗选了「否」, 撤销开关
+                print('[设置] UAC 未授权, 自动选英雄回退为关闭')
+                self._revert_auto_select_champion()
+                return False
         except Exception as e:
             print(f'[设置] 提权异常: {type(e).__name__}: {e}')
-            self._revert_auto_select_champion()
-            return False
-
-        if r <= 32:
-            # 用户在 UAC 弹窗选了「否」, 撤销开关
-            print(f'[设置] UAC 未授权(返回值 {r}), 自动选英雄回退为关闭')
             self._revert_auto_select_champion()
             return False
 
@@ -3538,19 +3955,48 @@ class AppController(QObject):
     @ui_slot
     def _on_accept(self):
         # v4.4.2(P1-4): 同步 REST 挪后台线程, 结果经 _action_done_sig 排回主线程。
+        # v4.4.x(P1): 加在途标志 —— 每次点击都新建无单飞线程, 连点会并发打同一
+        # 个 REST(甚至多个 accept 同时发出)。在途时直接忽略重复点击。
+        if self._action_inflight.get('accept', False):
+            print('[操作] 接受请求已在途, 忽略重复点击')
+            return
+        self._action_inflight['accept'] = True
         threading.Thread(target=self._accept_worker, daemon=True,
                          name='app-accept').start()
 
     @ui_slot
     def _on_decline(self):
         # v4.4.2(P1-4): 同上, 拒绝走后台。
+        if self._action_inflight.get('decline', False):
+            print('[操作] 拒绝请求已在途, 忽略重复点击')
+            return
+        self._action_inflight['decline'] = True
         threading.Thread(target=self._decline_worker, daemon=True,
                          name='app-decline').start()
+
+    @ui_slot
+    def _on_preinput_click(self, cid):
+        """v4.9.13:小窗单击备选英雄 → 切换预输入, 并把结果回推给小窗画蓝光。
+
+        纯内存操作(不碰 REST), 主线程直接做即可 —— 换英雄本身由 core 的 1s 轮询
+        在下一拍执行, 与偏好换英雄完全同一条链路。
+        """
+        try:
+            got = self._core.toggle_preinput(cid)
+        except Exception as e:
+            print(f'[操作] 切换预输入异常: {type(e).__name__}: {e}')
+            got = 0
+        if self._overlay:
+            self._overlay.set_preinput(got)
 
     @ui_slot
     def _on_swap(self, cid):
         # v4.4.2(P1-4): 换英雄含 bench_swap 的 sleep+读回, 最坏 REST 超时级,
         # 必须移出主线程。
+        if self._action_inflight.get('swap', False):
+            print('[操作] 换英雄请求已在途, 忽略重复点击')
+            return
+        self._action_inflight['swap'] = True
         threading.Thread(target=self._swap_worker, args=(cid,), daemon=True,
                          name='app-swap').start()
 
@@ -3561,6 +4007,8 @@ class AppController(QObject):
         except Exception as e:
             print(f'[操作] 手动接受异常: {type(e).__name__}: {e}')
             ok = False
+        finally:
+            self._action_inflight['accept'] = False
         self._action_done_sig.emit('accept', ok, 0)
 
     def _decline_worker(self):
@@ -3570,6 +4018,8 @@ class AppController(QObject):
         except Exception as e:
             print(f'[操作] 手动拒绝异常: {type(e).__name__}: {e}')
             ok = False
+        finally:
+            self._action_inflight['decline'] = False
         self._action_done_sig.emit('decline', ok, 0)
 
     def _swap_worker(self, cid):
@@ -3579,6 +4029,8 @@ class AppController(QObject):
         except Exception as e:
             print(f'[操作] 手动换英雄异常: {type(e).__name__}: {e}')
             ok = False
+        finally:
+            self._action_inflight['swap'] = False
         self._action_done_sig.emit('swap', ok, cid)
 
     @ui_slot
@@ -3587,7 +4039,8 @@ class AppController(QObject):
         if kind == 'accept':
             if self._overlay:
                 if ok:
-                    self._overlay.set_ready_response('Accepted')
+                    # v5.0.x: 响应回推统一走 core 的 _on_ready_check_response →
+                    # _on_ready_response, 这里不再重复 set_ready_response(避免双写)。
                     self._overlay.update_status('✅ 已接受对局!')
                     print('[操作] 手动接受对局')
                 else:
@@ -3596,7 +4049,6 @@ class AppController(QObject):
         elif kind == 'decline':
             if self._overlay:
                 if ok:
-                    self._overlay.set_ready_response('Declined')
                     self._overlay.update_status('❌ 已拒绝，匹配已关闭')
                     print('[操作] 手动拒绝对局')
                 else:
@@ -3663,6 +4115,8 @@ class SplashWindow(QWidget):
         self._dots = 0
         self._icon = None
         # 加载应用图标（蛋标）
+        # v4.4.x(P1) 注: 与 _make_icon 同理, 图标需要 _MEIPASS / exe 同级多路径
+        # 回退, 不统一走 app_data_dir(那只有包外一处), 语义不同。
         if getattr(sys, 'frozen', False):
             base = sys._MEIPASS
             base2 = os.path.dirname(sys.executable)
@@ -3679,6 +4133,19 @@ class SplashWindow(QWidget):
             self._icon.fill(Qt.transparent)
         # v18:预缩放缓存 —— paintEvent 每帧(400ms tick)不再重复做平滑缩放
         self._icon_drawn = self._icon.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        # v4.4.x(P1): 渐变/字体在 __init__ 预建 —— 窗口尺寸固定 320x200,
+        # paintEvent 每帧(400ms tick)重建 QLinearGradient/QFont 是无谓开销,
+        # 现只在 paintEvent 里引用成员(渐变坐标按固定尺寸展开)。
+        self._grad_bg = QLinearGradient(0, 0, 0, 200)
+        self._grad_bg.setColorAt(0.0, QColor('#1e1b4b'))
+        self._grad_bg.setColorAt(0.5, QColor('#111827'))
+        self._grad_bg.setColorAt(1.0, QColor('#0b0f1a'))
+        self._grad_glow = QLinearGradient(0, 0, 0, 80)
+        self._grad_glow.setColorAt(0.0, QColor(99, 102, 241, 40))
+        self._grad_glow.setColorAt(1.0, QColor(99, 102, 241, 0))
+        self._font_title = QFont('Microsoft YaHei UI', 12, QFont.DemiBold)
+        self._font_sub = QFont('Microsoft YaHei UI', 9)
 
         self._dot_timer = QTimer(self)
         self._dot_timer.timeout.connect(self._tick)
@@ -3698,16 +4165,9 @@ class SplashWindow(QWidget):
         path.addRoundedRect(0, 0, self.width(), self.height(), 18, 18)
         p.setClipPath(path)
         # 渐变底
-        g = QLinearGradient(0, 0, 0, self.height())
-        g.setColorAt(0.0, QColor('#1e1b4b'))
-        g.setColorAt(0.5, QColor('#111827'))
-        g.setColorAt(1.0, QColor('#0b0f1a'))
-        p.fillRect(self.rect(), QBrush(g))
+        p.fillRect(self.rect(), QBrush(self._grad_bg))
         # 顶部柔光
-        g2 = QLinearGradient(0, 0, 0, self.height() * 0.4)
-        g2.setColorAt(0.0, QColor(99, 102, 241, 40))
-        g2.setColorAt(1.0, QColor(99, 102, 241, 0))
-        p.fillRect(0, 0, self.width(), int(self.height() * 0.4), QBrush(g2))
+        p.fillRect(0, 0, self.width(), int(self.height() * 0.4), QBrush(self._grad_glow))
         # 蛋标（带外发光）
         icon_size = 72
         ix = (self.width() - icon_size) // 2
@@ -3724,13 +4184,11 @@ class SplashWindow(QWidget):
         p.drawPixmap(ix, iy, self._icon_drawn)
         # 标题
         p.setPen(QColor('#f1f5f9'))
-        f = QFont('Microsoft YaHei UI', 12, QFont.DemiBold)
-        p.setFont(f)
+        p.setFont(self._font_title)
         p.drawText(self.rect().adjusted(0, 112, 0, 0), Qt.AlignHCenter | Qt.AlignTop, '大蛋小助手')
         # 副标题 + 三点动画
         p.setPen(QColor(148, 163, 184))
-        f2 = QFont('Microsoft YaHei UI', 9)
-        p.setFont(f2)
+        p.setFont(self._font_sub)
         p.drawText(self.rect().adjusted(0, 142, 0, 0), Qt.AlignHCenter | Qt.AlignTop,
                    '加载中' + '.' * self._dots + ' ' * (3 - self._dots))
         p.end()
@@ -3758,12 +4216,13 @@ def _crash_dir():
 
     _MEIPASS 临时目录退出即消失,写那里的日志用户永远看不到,所以 frozen 时
     只认 exe 同级。
+
+    v4.4.x(P1): 基准目录统一走 core.icon_cache.app_data_dir('logs') —— 源码时
+    返回 <项目根>/data/logs, frozen 时返回 <exe 同级>/data/logs, 与旧实现完全
+    一致, 且顺带 makedirs(与 _append_uncaught 的后续 makedirs 幂等)。
     """
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, 'data', 'logs')
+    from core.icon_cache import app_data_dir
+    return app_data_dir('logs')
 
 
 # v4.6.11: 与 core.logger 的 app.log 用**同一个**上限常量 —— 原先这里和

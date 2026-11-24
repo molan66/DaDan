@@ -28,6 +28,7 @@ import sys
 import os
 import re
 import json
+import time
 from collections import deque
 from typing import Optional, Tuple, List, Dict
 
@@ -88,6 +89,12 @@ _SKIP_TOP = ('windows', 'program files', 'program files (x86)', 'programdata',
              'documents and settings', 'boot', 'sources', 'python',
              'nodejs', 'workbuddy', '.workbuddy', 'appdata')
 
+# v4.4.x(P2): 未连接时后台重连定时器每 5s 调一次 find_client(quick=False),
+# 每次都触发完整全盘 walk(BFS + 日志递归)。机械盘上一次完整扫描可能比 5s 还长,
+# 导致扫描永远做不完。设完整扫描最小间隔: 间隔内跳过慢路径, 只跑轻量路径
+# (进程命令行 / 注册表 / 固定根) —— 不影响正确性, 下个周期会再试慢路径。
+FULL_SCAN_MIN_INTERVAL_S = 20.0
+
 
 class LCUConnector:
     def __init__(self):
@@ -97,6 +104,17 @@ class LCUConnector:
         # v4.4.0 修复：全盘 BFS 上限允许注入覆盖（默认值见 lcu/constants.py）
         self.bfs_budget: int = BFS_BUDGET
         self.bfs_max_depth: int = BFS_MAX_DEPTH
+        # v4.4.x(P2): 上次完整慢扫描(全盘 BFS + 日志递归)的时刻, 节流用
+        self._last_full_scan = 0.0
+
+    def _full_scan_due(self) -> bool:
+        """完整慢扫描(全盘 BFS + 日志递归)是否已过最小间隔。
+
+        P2: 未连接时 find_client(quick=False) 每 5s 被重连定时器调用一次,
+        每次都完整全盘 walk; 机械盘上单次扫描可能超过重连周期。记录上次完整
+        扫描时刻, 间隔内跳过慢路径 —— 只少跑一次慢扫描, 轻量路径照常。
+        """
+        return time.monotonic() - self._last_full_scan >= FULL_SCAN_MIN_INTERVAL_S
 
     @property
     def is_connected(self) -> bool:
@@ -231,13 +249,18 @@ class LCUConnector:
         if self._find_lockfile_fixed_roots(quick=quick) and self._accept('固定根快扫'):
             return True
 
-        # 5. 真·全盘 lockfile 扫描（慢，仅完整模式）
-        if not quick and self._scan_all_drives_lockfile() and self._accept('全盘扫描'):
-            return True
-
-        # 6. 日志 + 端口（慢，仅完整模式）—— 该方法内部已自行探活
-        if sys.platform == 'win32' and not quick and self._find_by_log_and_scan():
-            return True
+        # 5. 真·全盘 lockfile 扫描（慢，仅完整模式；P2: 加最小间隔节流,
+        #    未连接时每 5s 的重连周期内不重复全盘 walk）
+        _slow_ok = not quick and self._full_scan_due()
+        if _slow_ok:
+            if self._scan_all_drives_lockfile() and self._accept('全盘扫描'):
+                return True
+            # 6. 日志 + 端口（慢，仅完整模式）—— 该方法内部已自行探活。
+            #    与步骤 5 共用同一个节流时间戳: 本轮慢路径已跑, 扫描耗时也算在
+            #    间隔内, 跑完才记时刻, 下一个重连周期据此判断是否再扫。
+            if sys.platform == 'win32' and self._find_by_log_and_scan():
+                return True
+            self._last_full_scan = time.monotonic()
 
         # 7. psutil（仅开发模式）
         if not getattr(sys, 'frozen', False):
@@ -441,8 +464,8 @@ class LCUConnector:
     def _find_lockfile_near_exe(self, exe: str) -> bool:
         """从客户端 exe（或安装目录）向上逐层精确探测 lockfile。
 
-        lockfile 一定在 LeagueClient 进程 exe 同目录或安装根目录，
-        无需递归 walk，向上探测 0..3 层即可。
+        lockfile 一定在 LeagueClient 进程 exe 同目录或安装根目录附近,
+        无需递归 walk。向上探测当前目录 + 4 层(range(5))即可。
         """
         base = exe if os.path.isdir(exe) else os.path.dirname(exe)
         for _ in range(5):  # 当前目录 + 向上 4 层
@@ -647,7 +670,7 @@ class LCUConnector:
                 content = f.read().strip()
             if not content:
                 return False
-            parts = content.split(':')
+            parts = content.split(':', 4)
             if len(parts) < 4 or parts[0] != 'LeagueClient':
                 return False
             pid = int(parts[1])
@@ -700,15 +723,24 @@ class LCUConnector:
             port = token = None
             for _, fp in sorted(log_files, reverse=True):
                 try:
+                    # P3: 原 read(8000) 只读前 8000 字节 —— app-port/token 若落在
+                    # 文件更靠后的位置会漏匹配。改为按行流式读, 匹配到即停:
+                    # 大日志文件只读命中所需的前缀, 不再整段截断。
                     with open(fp, encoding='utf-8', errors='replace') as fh:
-                        content = fh.read(8000)
+                        for _line in fh:
+                            if not token:
+                                m = re.search(r'--remoting-auth-token=(\S+)', _line)
+                                if m:
+                                    token = m.group(1).strip('"')
+                            if not port:
+                                m2 = re.search(r'--app-port=(\d+)', _line)
+                                if m2:
+                                    port = int(m2.group(1))
+                            if port and token:
+                                break
                 except Exception:
                     continue
-                m = re.search(r'--remoting-auth-token=(\S+)', content)
-                m2 = re.search(r'--app-port=(\d+)', content)
-                if m and m2:
-                    token = m.group(1).strip('"')
-                    port = int(m2.group(1))
+                if port and token:
                     break
             if not port or not token:
                 return False

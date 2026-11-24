@@ -237,10 +237,12 @@ class LogCapture:
 
     def _open_log_file(self) -> None:
         """打开日志文件。失败只打一次提示, 之后静默(不影响主流程)。"""
+        d = self._log_dir or _default_log_dir()
+        # 先确定目标路径 —— 即使 makedirs/open 失败, _log_path 也必须可用,
+        # 否则 _try_reopen 永远拿不到路径、无法在目录恢复后自愈。
+        self._log_path = os.path.join(d, 'app.log')
         try:
-            d = self._log_dir or _default_log_dir()
             os.makedirs(d, exist_ok=True)
-            self._log_path = os.path.join(d, 'app.log')
             self._file_size = (os.path.getsize(self._log_path)
                                if os.path.exists(self._log_path) else 0)
             self._fh = open(self._log_path, 'a', encoding='utf-8')
@@ -264,7 +266,10 @@ class LogCapture:
                 self._fh = None
 
     def _to_file(self, msg: str) -> None:
-        if self._file_failed:
+        # 只有"句柄还在却已判失败"才直接放弃；句柄为 None(启动打开失败 /
+        # 轮转失败 / 写失败后关闭)时仍要走 _try_reopen 尝试自愈, 成功即复位
+        # _file_failed —— 否则启动时目录不可用会让本次会话日志永久停写。
+        if self._file_failed and self._fh is not None:
             return
         if self._fh is None:
             # v4.4.2(P0-1): 轮转失败后 _fh 可能为 None 但非永久失败 —— 尝试重开自愈
@@ -301,16 +306,27 @@ class LogCapture:
                 if self._file_size >= LOG_MAX_BYTES:
                     self._rotate_locked()
             except Exception as e:
-                # 写失败(磁盘满/文件被删) → 静默降级, 不死循环报错
-                self._file_failed = True
-                # v4.4.0 修复(P2-9 同族): 原先这里是**完全静默**的 —— windowed
-                # 打包(console=False)后用户看不到任何提示, 会以为"日志出问题了",
-                # 实际是磁盘满了。打一次诊断(直写原始流, 不走 _write, 避免递归),
-                # 且 _file_failed 已置位, 后续不会再重复刷屏。
+                # 写失败(磁盘满/文件被删) → 走 _try_reopen() 重试自愈,
+                # 而不是把 _file_failed 永久置 True。
+                # 原因(P2): 磁盘满/杀软锁/文件被删都是**暂时性**的。置位后
+                # _to_file 首行 `if self._file_failed: return` 会让本次会话
+                # 的日志永久停写(且无从取证), 与"轮转失败不再置位"的既有
+                # 口径自相矛盾。改为: 关掉坏句柄 + 诊断一次, 下次写入由
+                # _to_file 的 `_fh is None` 分支调 _try_reopen() 重试;
+                # 重开成功自然恢复落盘, 失败则下一条日志再试。
+                # 注意: 这里**已持有** _file_lock(见上方 with), 绝不能再套
+                # 一层 `with self._file_lock` —— 普通 Lock 不可重入, 会死锁。
+                self._file_failed = False
+                if self._fh is not None:
+                    try:
+                        self._fh.close()
+                    except Exception:
+                        pass
+                    self._fh = None
                 out = self._orig_out or sys.__stdout__
                 if out:
                     try:
-                        out.write(f'[日志] 落盘中断(仅界面显示): '
+                        out.write(f'[日志] 落盘中断(将自动重试): '
                                   f'{type(e).__name__}: {e}\n')
                     except Exception:
                         pass
@@ -360,9 +376,16 @@ class LogCapture:
             if self._fh is not None:
                 return
             try:
+                # 目录可能随失败一起消失(如用户删了 data/logs), 重开前先补建,
+                # 否则 open 会一直失败、自愈变成空转。
+                os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
                 self._fh = open(self._log_path, 'a', encoding='utf-8')
                 # 重开成功后按文件实际大小重算, 避免轮转阈值判断失真
                 self._file_size = os.path.getsize(self._log_path)
+                # P2: 重开成功即复位失败标记 —— 保证"写失败 → 自愈"闭环。
+                # 否则 _file_failed 一旦被任何路径置位, 即使句柄已经恢复,
+                # _to_file 首行仍会直接 return, 日志永久停写。
+                self._file_failed = False
             except Exception:
                 self._fh = None
         finally:

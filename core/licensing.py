@@ -103,6 +103,11 @@ _CACHE_LOCK = threading.Lock()
 # 凡"实测 XXms"这类结论性注释，都应标明**测量日期与机器**，否则它只会变成
 # 一句无法证伪、却会误导后来人的断言。
 _CACHE = {}
+# P3: 指纹采集的**独占锁**。原实现把 1.5s 的 subprocess 放在 _CACHE_LOCK 里,
+# 让只想读缓存的线程也一起排队等整段 PowerShell。现在快路径只碰 _CACHE_LOCK,
+# 真正采集串行化在 _COLLECT_LOCK 上; 等锁的线程拿到锁后 double-check 缓存,
+# 已填充就直接复用, 不会重复 spawn。两把锁从不嵌套持有, 无死锁。
+_COLLECT_LOCK = threading.Lock()
 
 
 # ------------------------------------------------------------------ 机器指纹
@@ -160,6 +165,13 @@ def collect_components(refresh=False):
         if not refresh and 'components' in _CACHE:
             return list(_CACHE['components'])
 
+    # 采集(1.5s 子进程)挪到 _CACHE_LOCK 之外, 用 _COLLECT_LOCK 保证同时只跑一份。
+    with _COLLECT_LOCK:
+        # double-check: 等锁期间别的线程可能已采集完并写回缓存, 直接复用。
+        with _CACHE_LOCK:
+            if not refresh and 'components' in _CACHE:
+                return list(_CACHE['components'])
+
         vals = ['', '', '', '']
         if os.name == 'nt':
             txt = None
@@ -183,7 +195,8 @@ def collect_components(refresh=False):
                                 vals[i] = parts[i].strip()
                         break
         comps = [_norm_component(v) for v in vals]
-        _CACHE['components'] = comps
+        with _CACHE_LOCK:
+            _CACHE['components'] = comps
         return list(comps)
 
 
@@ -226,11 +239,29 @@ def days_to_expiry_from_date(d):
     return delta
 
 
+#: payload 天数上限 = 100 年（36525 天 ≈ 2020-01-01 → 2120-01-01）。
+#: 与 license-server/src/issuer.js / shared.js 的签发上限一致 —— 超过它的天数
+#: 即便签名合法, 客户端也拒收（避免"签得出来、激活不了"的废码）。
+_MAX_EXPIRY_DAYS = 36525
+
+
 def expiry_date_from_days(days):
-    """payload 天数 → datetime.date；0 返回 None（永久）。"""
+    """payload 天数 → datetime.date；0 返回 None（永久）。
+
+    天数超出合法范围（负数或超过签发侧上限）抛 LicenseError —— 与签发侧
+    （license-server issuer）的 100 年上限对齐：宁可拒绝一张"签名合法但无法
+    激活"的码, 也不要让它在这里抛 OverflowError 变成"校验异常"的糊涂账。
+    """
     if not days:
         return None
-    return datetime.date(2020, 1, 1) + datetime.timedelta(days=int(days))
+    try:
+        n = int(days)
+    except (TypeError, ValueError):
+        raise LicenseError('授权码到期日非法（天数无法解析），请更新软件或联系作者。')
+    if n < 0 or n > _MAX_EXPIRY_DAYS:
+        raise LicenseError(
+            f'授权码到期日非法（天数 {n} 超出 0~{_MAX_EXPIRY_DAYS}），请更新软件或联系作者。')
+    return datetime.date(2020, 1, 1) + datetime.timedelta(days=n)
 
 
 # ------------------------------------------------------------------ 授权码校验
@@ -239,44 +270,77 @@ class LicenseError(Exception):
     """授权码不合法（格式错 / 签名假 / 绑定不符 / 已过期）。message 可直接给用户看。"""
 
 
+# ------------------------------------------------------------------ 到期日
+
+#: 时钟水位的三个落点（同目录、不同文件名）。与试用记录同策略：第一份是
+#: 给人看的，其余是兜底。读取时取三者里**最大**的日期（越晚 = 水位越高）。
+#: 任何一份缺失/损坏都只是不计入，不会让整体失败（单份被删仍能兜住）。
+_CLOCK_WATERMARK_FILENAMES = ('clock_watermark.json', '.clock_watermark', '.cw')
+
+
+def _clock_watermark_paths():
+    """时钟水位三份副本的完整路径列表。"""
+    d = os.path.dirname(state_path())
+    return [os.path.join(d, n) for n in _CLOCK_WATERMARK_FILENAMES]
+
+
 def _clock_watermark_path():
-    """时钟水位文件路径（与授权文件同目录）。
+    """时钟水位文件路径（**给人看的那一份**，兼容旧调用方）。
 
     为什么需要：到期判断原先只有 `datetime.date.today()` 一个输入，实测把系统
     时间调到 2020 年就能让一张 `expires=2026-10-20` 的过期年卡"复活"通过验签。
     这里持久化"本机见过的最大日期"，每次校验取 `max(系统日期, 水位)`，
     于是时间往前调不再有任何收益（水位已经记着真实进度）。
+
+    ⚠️ 诚实边界（P1 加固后）：水位现在**同时写三份**（含两个隐藏文件名），
+    读取时取三者最大。任意删掉一份还有另外两份兜底；但**三份全删**仍能清空
+    水位 —— 本地授权做不到绝对，只是把门槛从"删一个文件"抬到"知道有三个、
+    其中一个还是隐藏文件"。要真正堵死必须引入服务器或注册表（后者需要管理员
+    权限 / 会被安全软件拦截，本机规范也不允许未经许可动注册表），故不在此做。
     """
-    return os.path.join(os.path.dirname(state_path()), 'clock_watermark.json')
+    return _clock_watermark_paths()[0]
 
 
 def _read_clock_watermark():
-    """读历史最大日期（datetime.date）；没有/损坏返回 None。"""
-    try:
-        with open(_clock_watermark_path(), encoding='utf-8') as f:
-            d = json.load(f)
+    """读三份水位里**最大**的历史日期（datetime.date）；全无/损坏返回 None。"""
+    dates = []
+    for p in _clock_watermark_paths():
+        try:
+            with open(p, encoding='utf-8') as f:
+                d = json.load(f)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(d, dict):
+            continue
         iso = (d.get('max_date') or '').strip()
         if not iso:
-            return None
-        return datetime.date.fromisoformat(iso)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return None
+            continue
+        try:
+            dates.append(datetime.date.fromisoformat(iso))
+        except ValueError:
+            continue
+    return max(dates) if dates else None
 
 
 def _write_clock_watermark(d):
-    """原子写历史最大日期。失败静默（不抛，不影响主流程）。"""
-    p = _clock_watermark_path()
-    try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        tmp = p + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'max_date': d.isoformat(),
-                       'written_at': time.strftime('%Y-%m-%d %H:%M:%S')},
-                      f, ensure_ascii=False, indent=2)
-        os.replace(tmp, p)
-        return True
-    except OSError:
-        return False
+    """原子写历史最大日期到**全部三份**副本。失败静默（不抛，不影响主流程）。
+
+    返回是否有至少一份写成功。
+    """
+    ok_any = False
+    payload = {'max_date': d.isoformat(),
+               'written_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+    for p in _clock_watermark_paths():
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            tmp = p + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+            ok_any = True
+        except OSError:
+            continue
+    return ok_any
 
 
 def effective_today(now_date=None):
@@ -465,12 +529,14 @@ def _read_trial_record():
     """读三份试用记录并合并。
 
     返回 dict：
-        started_at : float|None  —— 三份里**最早**的有效起点（越早 = 试用越少）
-        max_seen_at: float|None  —— 三份里**最大**的"见过的当前时间"水位
+        started_at     : float|None  —— 三份里**最早**的有效起点（越早 = 试用越少）
+        max_seen_at    : float|None  —— 三份里**最大**的"见过的当前时间"水位
+        mtime_derived  : bool        —— 起点是否来自 exe 文件 mtime（而非用户时钟）
 
     任何一份缺失/损坏都只是不计入，不会让整体失败（单份被删仍能兜住）。
     """
     starts, seen = [], []
+    mtime_derived = False
     for p in _trial_paths():
         try:
             with open(p, encoding='utf-8') as f:
@@ -491,8 +557,11 @@ def _read_trial_record():
                 seen.append(float(w))
         except (TypeError, ValueError):
             pass
+        if d.get('mtime_derived'):
+            mtime_derived = True
     return {'started_at': min(starts) if starts else None,
-            'max_seen_at': max(seen) if seen else None}
+            'max_seen_at': max(seen) if seen else None,
+            'mtime_derived': mtime_derived}
 
 
 # v4.9.3: 删除 `_read_trial()` —— 引入三份记录后它退化成 `_read_trial_record()`
@@ -500,11 +569,12 @@ def _read_trial_record():
 # 留着会让后来人以为"读试用"有两条路径（一条读一份、一条读三份）。
 
 
-def _write_trial(ts, max_seen=None):
+def _write_trial(ts, max_seen=None, mtime_derived=False):
     """把试用起点写进**全部三份**记录。原子写。失败返回 False（不抛）。
 
     :param ts: 试用起始时间（epoch 秒）
     :param max_seen: 见过的最晚时间（时钟回拨水位）；None 时取 ts 与当前时间的较大者
+    :param mtime_derived: 起点是否来自 exe 文件 mtime（P1 修复用，见 trial_state）
     """
     if max_seen is None:
         max_seen = max(float(ts), time.time())
@@ -516,6 +586,7 @@ def _write_trial(ts, max_seen=None):
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump({'started_at': ts,
                            'max_seen_at': max_seen,
+                           'mtime_derived': bool(mtime_derived),
                            'started_text': time.strftime('%Y-%m-%d %H:%M:%S',
                                                          time.localtime(ts))},
                           f, ensure_ascii=False, indent=2)
@@ -556,23 +627,34 @@ def trial_state(now=None):
         rec = _read_trial_record()
         started = rec['started_at']
         max_seen = rec['max_seen_at']
+        mtime_derived = rec['mtime_derived']
 
         if started is None:
             # 首次运行：用"当前时间"与"程序文件时间"里较晚者作为起点。
             # 用较晚者是为了防"把系统时间调到过去再首次运行"。
             started = now
+            mtime_derived = False
             try:
                 exe = sys.executable if getattr(sys, 'frozen', False) else __file__
                 fts = os.path.getmtime(exe)
                 # 只在差异明显时采用（避免时钟/时区小误差导致误判）
                 if fts > started + 60:
                     started = fts
+                    mtime_derived = True
             except OSError:
                 pass
-            _write_trial(started, max_seen=max(now, started))
+            _write_trial(started,
+                         max_seen=(now if mtime_derived else max(now, started)),
+                         mtime_derived=mtime_derived)
 
-        # ① 起点在未来 → 记录被篡改，判失效（不重建、不给新试用）
-        if started > now + _TRIAL_FUTURE_TOLERANCE_S:
+        # ① 起点在未来 → 记录被篡改，判失效（不重建、不给新试用）。
+        #    但**起点来自 exe mtime 时豁免**：打包/发布流水线可能让 exe 的 mtime
+        #    早于文件实际送到用户机器的时间（拷贝时 mtime 常被保留成构建时刻,
+        #    而用户首次运行的系统时钟可能落后于构建机几分钟以上），这是正常安装
+        #    流程, 不是"用户把起点改到未来"。真正要防的是"试用记录被人为改到未来",
+        #    那种情况一定不是 mtime 来源（mtime 来源只在首次运行由本函数写入）。
+        if (not mtime_derived
+                and started > now + _TRIAL_FUTURE_TOLERANCE_S):
             print(f'[授权] 试用记录起点在未来({started:.0f} > {now:.0f})，'
                   f'判定为被篡改，试用作废')
             return (False, 0, started)
@@ -585,9 +667,11 @@ def trial_state(now=None):
                   f'试用作废')
             return (False, 0, started)
 
-        # 水位只升不降，每次回写（三份都写，避免删一份就丢水位）
+        # 水位只升不降，每次回写（三份都写，避免删一份就丢水位）。
+        # 必须把 mtime_derived 一并带上 —— 否则 exe mtime 超前的那次首启,
+        # 下一次轮询就会因为标志被抹掉而重新触发判据①、把试用误判成篡改。
         if not injected and (max_seen is None or now > max_seen + 1.0):
-            _write_trial(started, max_seen=now)
+            _write_trial(started, max_seen=now, mtime_derived=mtime_derived)
 
         elapsed_days = (now - started) / 86400.0
         remaining = TRIAL_DAYS - elapsed_days

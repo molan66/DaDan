@@ -45,10 +45,20 @@ RANDOM_DELAY_MIN_S = 1
 # 抖动幅度下限(base 的一半, 但不小于 0.5s), 防 base 很小时抖动为 0。
 RANDOM_DELAY_MIN_HALF_S = 0.5
 
+# ---- 停止/全停 ----
+# v5.0.0(#1): stop() 等待工作线程退出的最长时长(秒)。这些线程都是 daemon,
+# 即便超时主进程退出也会带走它们, 这里只是给一个"尽量同步"的上限, 不让 UI 卡死。
+STOP_JOIN_S = 3.0
+# v5.0.0(#2): bench_swap 读回未确认(返回 None)后的冷却。此前每 1s 轮询都会
+# 重新 POST 同一个 swap(日志实测连打 8~10 次), 这里在冷却期内不再重复提交。
+SWAP_UNCONFIRMED_RETRY_S = 3.0
+
 # ---- 自动返回 ----
-# playAgain 之后 start_matchmaking 的重试上限与间隔(等客户端回到房间)。
-PLAY_AGAIN_RETRY_MAX = 15
-PLAY_AGAIN_RETRY_INTERVAL_S = 1
+# v4.9.12: 原先这里的 PLAY_AGAIN_RETRY_MAX(15) / PLAY_AGAIN_RETRY_INTERVAL_S(1)
+# 已**删除**。它们只为 `_do_play_again` 里那段"playAgain 后循环抢开队列"服务,
+# 而那段与 `_handle_lobby` 的匹配倒计时重复抢开队列(日志实测: `匹配启动（第1次）`
+# 与 `开始匹配` 紧邻 3 次, 夹 54 次"非房主"噪音), 还绕过用户设置的匹配延迟。
+# 重排现在只由 `_handle_lobby` → `_do_queue` 一个写入点发起, 不再需要重试上限。
 
 # ---- 倒计时线程 ----
 # 倒计时每秒一跳(状态栏 "⏳ xx 倒计时 N..." 的刷新节奏)。
