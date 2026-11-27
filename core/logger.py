@@ -450,19 +450,38 @@ class LogCapture:
             return False
 
     class _Writer:
+        """替换 sys.stdout/stderr 的写入器。
+
+        v5.1(ultra M8): 按行缓冲。`print('a', 'b', c)` 会多次调用 write(每个
+        参数一次 + 分隔符/换行一次), 旧实现每次 write 都独立 rstrip 入库, 一条
+        print 碎成多行; `print(..., end='')` 流式输出也被截断成半行。现在累积
+        到换行才把完整行交给 _write; flush() 时提交无换行残留。原始流仍逐片透传
+        (控制台实时输出不受影响)。
+        """
         def __init__(self, orig, callback):
             self._orig = orig
             self._cb = callback
+            self._line_buf = ''
 
         def write(self, text):
             if self._orig:
                 self._orig.write(text)
                 self._orig.flush()
-            self._cb(text)
+            if not text:
+                return
+            self._line_buf += text
+            # 有换行就把完整行交给 _write（多行逐行提交）
+            while '\n' in self._line_buf:
+                line, self._line_buf = self._line_buf.split('\n', 1)
+                self._cb(line)
 
         def flush(self):
             if self._orig:
                 self._orig.flush()
+            # 无换行残留（如 print(..., end='')）在 flush 时提交
+            if self._line_buf:
+                self._cb(self._line_buf)
+                self._line_buf = ''
 
         def isatty(self):
             # v4.4.2(P2-10): 有意保留(协议方法) —— _Writer 替换 sys.stdout/stderr

@@ -752,7 +752,7 @@ class _TitleBtn(QPushButton):
         self.setIcon(self._ic_n); super().leaveEvent(e)
 
 
-def _title_btn(icon_n, icon_h, hover_bg, pressed_bg='rgba(255,255,255,0.20)'):
+def _title_btn(icon_n, icon_h, hover_bg, pressed_bg='rgba(0,0,0,0.18)'):
     """私有工厂: 建一枚 30×26 的标题栏按钮并套统一 QSS。
 
     v4.6.x 抽取: minimize/main/close 三处原本复制粘贴同一份 QSS(仅 hover/pressed
@@ -762,7 +762,7 @@ def _title_btn(icon_n, icon_h, hover_bg, pressed_bg='rgba(255,255,255,0.20)'):
     btn.setFixedSize(30, 26)
     btn.setStyleSheet(f"""
         QPushButton {{
-            background: rgba(255,255,255,0.04);
+            background: rgba(0,0,0,0.04);
             border: none; border-radius: {Glass.RADIUS_SM}px;
         }}
         QPushButton:hover {{
@@ -794,20 +794,20 @@ def make_title_buttons(minimize_cb=None, close_cb=None, main_cb=None):
     if minimize_cb is not None:
         mb = _title_btn(icon_minimize(Glass.TEXT_MUTED),
                         icon_minimize(Glass.TEXT_PRIMARY),
-                        'rgba(255,255,255,0.12)')
+                        'rgba(0,0,0,0.10)')
         mb.clicked.connect(minimize_cb)
         btns.append(mb)
     if main_cb is not None:
         rb = _title_btn(icon_back_to_main(Glass.TEXT_MUTED),
                         icon_back_to_main(Glass.TEXT_PRIMARY),
-                        'rgba(255,255,255,0.12)')
+                        'rgba(0,0,0,0.10)')
         rb.clicked.connect(main_cb)
         btns.append(rb)
     if close_cb is not None:
         cb = _title_btn(icon_close(Glass.TEXT_MUTED),
                         icon_close('#ffffff'),  # 红底上必须白图标,跟着 hover 切
                         Glass.DANGER,
-                        pressed_bg='#dc2626')
+                        pressed_bg=Glass.DANGER_PRESSED)
         cb.clicked.connect(close_cb)
         btns.append(cb)
     return btns
@@ -825,10 +825,10 @@ class AnimatedToggle(QPushButton):
     _PRESS_SCALE = 0.80          # 按压时圆点收缩比例
     _ANIM_MS = 220               # 圆点滑动动画时长
     _PRESS_ANIM_MS = 130         # 按压收缩动画时长
-    _TRACK_OFF_TOP = (58, 58, 70)
-    _TRACK_OFF_BOT = (40, 40, 52)
-    _TRACK_ON_TOP = (129, 140, 248)
-    _TRACK_ON_BOT = (99, 102, 241)
+    _TRACK_OFF_TOP = (216, 225, 220)        # 浅灰轨道（ULTRA，HIG.BORDER）
+    _TRACK_OFF_BOT = (200, 210, 205)
+    _TRACK_ON_TOP = (8, 127, 115)       # 品牌青绿 #087F73
+    _TRACK_ON_BOT = (6, 85, 79)         # 品牌深青绿 #06554F
 
     def _thumb_x_unchecked(self):
         """关态圆点中心 x(贴左端)。"""
@@ -934,7 +934,7 @@ class AnimatedToggle(QPushButton):
         w, h = self.width(), self.height()
         r = self._THUMB_RADIUS  # 圆点基准半径
 
-        # 轨道混色进度：跟随圆点滑动平滑切换 灰 <-> 靛蓝
+        # 轨道混色进度：跟随圆点滑动平滑切换 浅灰 <-> 品牌青绿
         x0 = self._thumb_x_unchecked()
         prog = max(0.0, min(1.0, (self._circle_x - x0) / self._thumb_travel()))
 
@@ -969,7 +969,7 @@ class AnimatedToggle(QPushButton):
         if prog >= 0.999:
             # 开启时外圈光晕
             glow_a = 70 if self._hovered else 34
-            p.setPen(QColor(99, 102, 241, glow_a))
+            p.setPen(QColor(8, 127, 115, glow_a))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
         else:

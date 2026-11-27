@@ -29,6 +29,7 @@ import os
 import re
 import json
 import time
+import threading
 from collections import deque
 from typing import Optional, Tuple, List, Dict
 
@@ -101,11 +102,33 @@ class LCUConnector:
         self._port: Optional[int] = None
         self._token: Optional[str] = None
         self._pid: Optional[int] = None
+        # 连接参数 (port, token, pid) 是跨线程共享的可变状态：
+        # find_client(quick=True) 在主线程跑、重连线程跑 find_client(quick=False)、
+        # websocket_listener 又读 port/auth —— 读者可能在"写了 port 还没写 token"
+        # 的间隙读到新旧混合值。此锁把"读三字段 / 写三字段 / 整体清空"全部串行化。
+        self._state_lock = threading.Lock()
         # v4.4.0 修复：全盘 BFS 上限允许注入覆盖（默认值见 lcu/constants.py）
         self.bfs_budget: int = BFS_BUDGET
         self.bfs_max_depth: int = BFS_MAX_DEPTH
         # v4.4.x(P2): 上次完整慢扫描(全盘 BFS + 日志递归)的时刻, 节流用
         self._last_full_scan = 0.0
+
+    def _set_params(self, port: Optional[int], token: Optional[str],
+                    pid: Optional[int]) -> None:
+        """一次性原子替换连接参数三件套 —— 唯一写入点。
+
+        原来 _try_lockfile / _find_by_log_and_scan / find_client 分三条语句各写
+        各的，读者可能读到"新 port + 旧 token"的混合态。现在统一经本方法进锁。
+        """
+        with self._state_lock:
+            self._port = port
+            self._token = token
+            self._pid = pid
+
+    def _params(self) -> Tuple[Optional[int], Optional[str], Optional[int]]:
+        """原子读取连接参数三件套（一致性快照）。"""
+        with self._state_lock:
+            return (self._port, self._token, self._pid)
 
     def _full_scan_due(self) -> bool:
         """完整慢扫描(全盘 BFS + 日志递归)是否已过最小间隔。
@@ -118,24 +141,28 @@ class LCUConnector:
 
     @property
     def is_connected(self) -> bool:
-        return self._port is not None and self._token is not None
+        port, token, _pid = self._params()
+        return port is not None and token is not None
 
     @property
     def base_url(self) -> str:
-        return f'https://127.0.0.1:{self._port}' if self._port else ''
+        port, _token, _pid = self._params()
+        return f'https://127.0.0.1:{port}' if port else ''
 
     @property
     def port(self) -> Optional[int]:
         """v4.4.2(P2-9): LCU 端口的只读公开入口 —— 原来 websocket_listener 直读
         私有 `_port`(跨文件读私有属性, 破坏封装且 grep 困难)。"""
-        return self._port
+        port, _token, _pid = self._params()
+        return port
 
     @property
     def auth(self) -> Tuple[str, str]:
-        return ('riot', self._token or '')
+        _port, token, _pid = self._params()
+        return ('riot', token or '')
 
     def reset(self):
-        self._port = self._token = self._pid = None
+        self._set_params(None, None, None)
 
     def _accept(self, why: str, validate: bool = True) -> bool:
         """统一"接受本次发现的连接参数"出口。
@@ -154,7 +181,8 @@ class LCUConnector:
             return False
         if not validate or self._validate_cached_connection():
             return True
-        print(f'[连接] {why} 参数探活失败(port={self._port}),继续尝试其它方法')
+        _port, _token, _pid = self._params()
+        print(f'[连接] {why} 参数探活失败(port={_port}),继续尝试其它方法')
         self.reset()
         return False
 
@@ -205,11 +233,12 @@ class LCUConnector:
         拿着旧参数反复 WS 10061 拒绝,但 is_connected 仍 True,UI 显示
         未连接但脚本能启动的撕裂 bug。
         """
-        if self._port and self._token:
+        _port, _token, _pid = self._params()
+        if _port and _token:
             if self._validate_cached_connection():
                 return True  # 缓存参数仍可用,直接接受
             # 缓存参数已失效(LOL 重启/换端口/换 token),重置走完整链路
-            print(f'[连接] 缓存参数已失效(port={self._port}),重新发现')
+            print(f'[连接] 缓存参数已失效(port={_port}),重新发现')
             self.reset()
 
         # 1. 进程命令行（最通用：不依赖安装路径/文件）
@@ -221,8 +250,8 @@ class LCUConnector:
                 # 重复跑正则)
                 parsed = self._parse_cmdline(args) if args else None
                 if parsed:
-                    self._port, self._token, self._pid = parsed
                     port, token, pid = parsed
+                    self._set_params(*parsed)
                     # v4.4.0 修复（P1-4）：解析成功不再无条件 return True，
                     # 先探活；失败则丢弃参数继续看下一个进程/下一级方法
                     if self._accept('进程命令行'):
@@ -271,7 +300,7 @@ class LCUConnector:
                         if proc.info['name'] and 'LeagueClient' in proc.info['name']:
                             result = self._parse_cmdline(proc.info['cmdline'])
                             if result:
-                                self._port, self._token, self._pid = result
+                                self._set_params(*result)
                                 # v4.4.0 修复（P1-4）：psutil 路径同样先探活
                                 if self._accept('psutil'):
                                     return True
@@ -651,12 +680,38 @@ class LCUConnector:
 
     @staticmethod
     def _get_drives() -> List[str]:
-        """枚举所有存在的盘符"""
-        drives = []
-        for letter in 'CDEFGHIJKLMNOPQRSTUVWXYZ':
-            d = f'{letter}:\\'
-            if os.path.exists(d):
-                drives.append(d)
+        """枚举所有存在的本地盘符。
+
+        v4.4.x(P1, 移植自 launcher._list_drives): 原实现用 os.path.exists() 逐盘
+        探测 —— 对断连的网络映射盘 (Z: 之类) 该调用会阻塞数十秒, 把重连定时器
+        卡死。改用 GetLogicalDrives + GetDriveTypeW: 位图枚举逻辑盘 + 类型过滤,
+        跳过 DRIVE_REMOTE(网络盘), 返回结构不变(各盘根目录字符串列表, 仅本地盘)。
+        """
+        drives: List[str] = []
+        try:
+            import ctypes
+            bitmap = ctypes.windll.kernel32.GetLogicalDrives()
+        except Exception:
+            bitmap = 0
+        if not bitmap:
+            # GetLogicalDrives 失败(极罕见)回退到旧的 os.path.exists 探测
+            for letter in 'CDEFGHIJKLMNOPQRSTUVWXYZ':
+                d = f'{letter}:\\'
+                if os.path.exists(d):
+                    drives.append(d)
+            return drives
+        DRIVE_REMOTE = 4
+        for i in range(26):
+            if not (bitmap >> i) & 1:
+                continue
+            d = f'{chr(65 + i)}:\\'
+            try:
+                import ctypes
+                if ctypes.windll.kernel32.GetDriveTypeW(d) == DRIVE_REMOTE:
+                    continue   # 跳过断连/慢速的网络盘
+            except Exception:
+                pass
+            drives.append(d)
         return drives
 
     def _try_lockfile(self, path: str) -> bool:
@@ -678,9 +733,7 @@ class LCUConnector:
             token = parts[3]
             if not (port and token):
                 return False
-            self._port = port
-            self._token = token
-            self._pid = pid
+            self._set_params(port, token, pid)
             return True
         except Exception:
             return False
@@ -744,8 +797,7 @@ class LCUConnector:
                     break
             if not port or not token:
                 return False
-            self._port = port
-            self._token = token
+            self._set_params(port, token, None)
             # v21:日志兜底写入后必须立即 REST 探活校验 —— 历史日志里的 port/token
             # 是上次 LOL 启动时写的,本次启动若 LOL 还没开/换端口,这就是无效值。
             # v14 修复只覆盖了"缓存已有值"场景,日志兜底这条路径是盲区(被用户

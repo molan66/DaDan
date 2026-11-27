@@ -506,20 +506,26 @@ class IconCache:
         界面在本次会话里仍显示旧图标(与版本清理的初衷矛盾)。
         """
         removed = 0
+        # v5.1(ultra M2): 磁盘遍历 + 删除全程持锁 —— 与 trim_disk 同一竞态。
+        # 否则版本变化/手动清理时, 下载 worker 的 put() 正在锁外 _write_atomic
+        # 落盘, 可能"刚下好的图被删"或"新文件在快照后残留"。v4.6.8 已为
+        # trim_disk 修过一模一样的竞态, 这里对齐。锁内只做 listdir/remove,
+        # 毫秒级, 且无嵌套加锁调用, 无死锁。
         try:
-            for f in os.listdir(self._dir):
-                p = os.path.join(self._dir, f)
-                try:
-                    if not os.path.isfile(p):
+            with self._lock:
+                for f in os.listdir(self._dir):
+                    p = os.path.join(self._dir, f)
+                    try:
+                        if not os.path.isfile(p):
+                            continue
+                        # v4.6.10 修: 临时文件判据独立 —— 实测 `{key}.png.tmp.{pid}.{tid}`
+                        # 既不匹配图片后缀、也不 endswith('.tmp'), 原先这里根本删不掉它
+                        # (文档却承诺"删除残留 .tmp")。现用 is_temp_file() 显式覆盖。
+                        if is_temp_file(f) or f.lower().endswith(IMAGE_SUFFIXES):
+                            os.remove(p)
+                            removed += 1
+                    except OSError:
                         continue
-                    # v4.6.10 修: 临时文件判据独立 —— 实测 `{key}.png.tmp.{pid}.{tid}`
-                    # 既不匹配图片后缀、也不 endswith('.tmp'), 原先这里根本删不掉它
-                    # (文档却承诺"删除残留 .tmp")。现用 is_temp_file() 显式覆盖。
-                    if is_temp_file(f) or f.lower().endswith(IMAGE_SUFFIXES):
-                        os.remove(p)
-                        removed += 1
-                except OSError:
-                    continue
         except Exception:
             pass
         with self._lock:

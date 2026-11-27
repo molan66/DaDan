@@ -1,11 +1,11 @@
-"""Main Window - 液态玻璃风格主窗口
+"""Main Window - ULTRA 旗舰浅色主窗口
 
 特性:
-- Windows 系统级毛玻璃（Mica/Acrylic）
-- 半透明玻璃分层
-- 弹簧动画
-- 发光卡片
-- 光晕高光
+- Windows 系统级 Acrylic 背景（DWM 降级自动回退）
+- 浅色分层：雾白底 + 暖白卡片 + 低对比边框
+- 页面快照淡出过渡（SpringStackedWidget）
+- 统一 ULTRA 设计令牌（HIG / Glass 兼容层）
+- 可缩放窗口（默认 720x540，内容页自适应滚动）
 """
 
 import json
@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit,
     QApplication, QScrollArea, QProgressBar,
-    QGraphicsOpacityEffect, QCheckBox, QMessageBox
+    QGraphicsOpacityEffect, QCheckBox, QMessageBox, QFrame
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation
 # v4.4.0 修复(P1-22): QFont 原来在 SidebarButton.paintEvent 内部 import
@@ -24,7 +24,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation
 from PyQt5.QtGui import (QColor, QPainter, QLinearGradient, QFont,
                          QPixmap, QPainterPath)
 
-from .styles import Glass
+from .styles import Glass, HIG
 # v4.3.0: 对局展示格式化抽到 match_fmt(详情弹窗也要用, 它不能反向 import 本模块);
 # 这里用原名别名导入, 模块内既有调用点无需改动。
 from .match_fmt import (LANE_CN as _LANE_CN, phase_text as _phase_text,
@@ -35,7 +35,7 @@ from .match_fmt import (LANE_CN as _LANE_CN, phase_text as _phase_text,
                         wan_compact as _wan_compact, num_text as _num_text)
 from .icons import (icon_home, icon_settings, icon_hero, icon_chart, icon_log,
                      AnimatedToggle, make_title_buttons, rounded_pixmap,
-                     icon_to_pixmap)
+                     icon_to_pixmap, icon_pixmap)
 from .animated_widgets import (SpringStackedWidget, GlassTitleBar, GlassCard,
                                HoverRow, StatusDot, paint_window_backdrop,
                                make_empty_state)
@@ -55,7 +55,7 @@ DOT_TICK_MS = 40                       # 状态点呼吸灯周期
 DOT_ALPHA_MIN = 150.0                  # 呼吸灯透明度下限
 DOT_ALPHA_MAX = 255.0                  # 呼吸灯透明度上限
 DOT_ALPHA_STEP = 4.0                   # 每 tick 透明度步进
-DOT_RGB_ONLINE = (52, 211, 153)        # 已连接: 翠绿
+DOT_RGB_ONLINE = (25, 132, 95)        # 已连接: 柔和绿（统一语义色 #4ADE80）
 DOT_RGB_OFFLINE = (248, 113, 113)      # 未连接: 红
 CONN_TEXT_ONLINE = '客户端已连接'
 CONN_TEXT_OFFLINE = '未连接到客户端'
@@ -66,24 +66,19 @@ SIDEBAR_ICON_FNS = {'🏠': icon_home, '⚙️': icon_settings, '⭐': icon_hero
 
 # v4.4.1(UI-B9 第一步): 账号卡 chip 的几何与 8 组色值收敛为模块常量。
 # **数值一个字都没改** —— 这一步只让"改一处即全局生效", 视觉零回归。
-# 第二步(统一到 Glass 语义色板、消除 #6ee7b7 与 Glass.ACCENT 的第三种绿)
-# 属于会改到观感的动作, 留待单独确认后再做。
-CHIP_FONT_PX = 10                      # chip 文字字号(前缀标签与数值同号)
+# v5.0.2(ULTRA 收口): 颜色值统一从 HIG/Glass 令牌取，不再重复写字面量。
+CHIP_FONT_PX = 12                      # chip 文字字号（对齐 Glass.FONT_SIZE_XS，≥12px 可读）
 CHIP_RADIUS_PX = 5                     # chip 圆角
 CHIP_PAD = '2px 7px'                   # chip 内边距
-CHIP_WAIT_BG = 'rgba(255,255,255,0.04)'  # 等待态弱背景
+CHIP_WAIT_BG = Glass.BG_CARD_ALT       # 等待态弱背景（次级内容色）
 CHIP_GAP = 6                           # chip 之间/与 label 列间距
 # (前景色, 背景色) —— 前景即 prefix 文字色, 背景为数值胶囊底色
-CHIP_SOLO = ('#a5b4fc', 'rgba(99,102,241,0.18)')       # 单排
-CHIP_FLEX = ('#6ee7b7', 'rgba(52,211,153,0.16)')       # 灵活
-CHIP_WALLET_IP = ('#93c5fd', 'rgba(59,130,246,0.16)')  # 蓝色精粹
-CHIP_WALLET_COSMETIC = ('#fca5a5', 'rgba(248,113,113,0.16)')  # 橙色精粹
-CHIP_WALLET_MYTHIC = ('#a78bfa', 'rgba(167,139,250,0.16)')    # 神话精粹
-CHIP_HONOR = ('#fcd34d', 'rgba(251,191,36,0.18)')      # 荣誉
-CHIP_MASTERY_1 = ('#c4b5fd', 'rgba(139,92,246,0.16)')  # 熟练度 top1
-CHIP_MASTERY_2 = ('#c4b5fd', 'rgba(139,92,246,0.12)')  # 熟练度 top2
-CHIP_MASTERY_3 = ('#c4b5fd', 'rgba(139,92,246,0.10)')  # 熟练度 top3
-CHIP_RECENT = ('#86efac', 'rgba(52,211,153,0.16)')     # 近 10 场
+CHIP_SOLO = ('#9A742E', 'rgba(176,131,58,0.14)')       # 单排（段位金色点缀）
+CHIP_FLEX = ('#9A742E', 'rgba(176,131,58,0.14)')       # 灵活
+CHIP_WALLET_IP = (Glass.TEXT_SECONDARY, Glass.BG_CARD_ALT)   # 蓝色精粹
+CHIP_WALLET_COSMETIC = (Glass.TEXT_SECONDARY, Glass.BG_CARD_ALT)  # 橙色精粹
+CHIP_WALLET_MYTHIC = (Glass.TEXT_SECONDARY, Glass.BG_CARD_ALT)    # 神话精粹
+CHIP_HONOR = ('#9A742E', 'rgba(176,131,58,0.16)')      # 荣誉（金色点缀，唯一游戏成就色）
 
 
 # v36:段位英文缩写 → 中文(LCU tier 字段恒为英文)
@@ -132,8 +127,8 @@ def _mini_btn_qss(primary: bool = False) -> str:
         bg, hover, pressed = Glass.PRIMARY, Glass.PRIMARY_HOVER, Glass.PRIMARY_PRESSED
         fg, bd = '#ffffff', 'transparent'
     else:
-        bg, hover, pressed = ('rgba(255,255,255,0.07)', 'rgba(255,255,255,0.12)',
-                              'rgba(255,255,255,0.16)')
+        bg, hover, pressed = ('rgba(0,0,0,0.04)', 'rgba(0,0,0,0.08)',
+                              'rgba(0,0,0,0.12)')
         fg, bd = Glass.TEXT_SECONDARY, Glass.BORDER_GLASS
     return f"""
             QPushButton {{
@@ -189,15 +184,51 @@ def _action_btn_qss(variant: str = 'primary') -> str:
     """首页主行动按钮样式(单一来源)。
 
     variant:
-        'accent'      —— 启动 LOL：翠绿, 表达"前进/执行"
-        'primary'     —— 启动脚本(空闲)：靛蓝品牌主色
-        'danger'      —— 启动脚本(运行中→"停止脚本")：红
-        'danger_deep' —— 全部停止：比上面更深一档的红
+        'primary'     —— 启动脚本(空闲)：海克斯青实心渐变(唯一主按钮)
+        'accent'      —— 保留兼容：同 primary 系的翠绿实心
+        'danger'      —— 启动脚本(运行中→"停止脚本")：红实心
+        'danger_deep' —— 全部停止实心红(兼容保留)
+        'ghost_green' —— 启动 LOL：玻璃底+青描边(次要动作)
+        'ghost_red'   —— 全部停止：玻璃底+红描边(危险确认感更强)
 
-    为什么 全部停止 用更深一档而不是同色: 脚本跑起来时「启动脚本」那枚本身也会变红,
-    两枚同色同尺寸会看着像同一个按钮; 靠**深浅 + 文案**区分, 既保持一套观感又不会认错。
-    四档的几何(宽高/圆角/字号/字重/按下位移)完全一致 —— 这是本次统一的核心。
+    四档实心变体的几何(宽高/圆角/字号/字重/按下位移)完全一致。
     """
+    if variant == 'ghost_green':
+        return f"""
+            QPushButton {{
+                background: {Glass.PRIMARY_SUBTLE}; color: {Glass.ACCENT};
+                border: 1px solid {Glass.PRIMARY_40};
+                border-radius: {Glass.RADIUS_BTN};
+                font-size: {Glass.FONT_SIZE_LG}; font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: {Glass.PRIMARY_20}; color: {Glass.ACCENT_HOVER};
+                border-color: {Glass.ACCENT_BORDER};
+            }}
+            QPushButton:pressed {{ background: {Glass.PRIMARY_30}; padding-top: 2px; }}
+            QPushButton:disabled {{
+                background: {Glass.BG_CARD_ALT}; color: {Glass.TEXT_DISABLED};
+                border: 1px solid {Glass.BORDER};
+            }}
+        """
+    if variant == 'ghost_red':
+        return f"""
+            QPushButton {{
+                background: rgba(248,113,113,0.10); color: {Glass.DANGER};
+                border: 1px solid rgba(248,113,113,0.35);
+                border-radius: {Glass.RADIUS_BTN};
+                font-size: {Glass.FONT_SIZE_LG}; font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: rgba(248,113,113,0.16); color: {Glass.DANGER_HOVER};
+                border-color: rgba(248,113,113,0.55);
+            }}
+            QPushButton:pressed {{ background: rgba(248,113,113,0.24); padding-top: 2px; }}
+            QPushButton:disabled {{
+                background: {Glass.BG_CARD_ALT}; color: {Glass.TEXT_DISABLED};
+                border: 1px solid {Glass.BORDER};
+            }}
+        """
     if variant == 'accent':
         c1, c2 = Glass.ACCENT_HOVER, Glass.ACCENT_DARK
         h1, h2 = Glass.ACCENT, Glass.ACCENT_PRESSED
@@ -230,24 +261,15 @@ def _action_btn_qss(variant: str = 'primary') -> str:
             QPushButton:pressed {{
                 background: {pressed}; padding-top: 2px;
             }}
+            QPushButton:disabled {{
+                background: {Glass.BG_CARD_ALT}; color: {Glass.TEXT_DISABLED};
+            }}
         """
 
 
 def _fab_qss(running: bool) -> str:
-    """启动/停止按钮的完整样式表(单一来源)。
-
-    v4.4.1(UI-A1) 修复两件事:
-    ① **字号不一致**: 构造时(:914)写的是 FONT_SIZE_LG(14px), 而首次点启动后
-       _do_run 两态都写 FONT_SIZE_XL(16px) → 按钮文字点一下就永久变大一号。
-       现在统一走 FONT_SIZE_XL。
-    ② **QSS 双份拷贝**: 蓝态原本在 __init__ 与 _do_run(False) 里各写一份、
-       逐字相同, 改一处必漏另一处; 红色三档 hex 也硬编在 _do_run 里。
-       现在四态样式只此一处, 色值取 Glass.STOP_RED* / PRIMARY*。
-    """
-    # v4.4.18: 委托给 _action_btn_qss —— 两态配色与工厂里的 'danger'/'primary'
-    # 逐字一致, 留两份实现迟早会漂移(改了一处忘了另一处)。保留本函数是因为
-    # _do_run 与构造点都按"running 布尔"调用, 语义比 variant 字符串更直观。
-    return _action_btn_qss('danger' if running else 'primary')
+    """启动/停止按钮样式：空闲=青描边，运行=红描边线框（dsh 意见：停止降干扰）。"""
+    return _action_btn_qss('ghost_red' if running else 'ghost_green')
 
 
 # v4.4.1(UI-B1): Toast 语义类型 → 左侧 3px 色条。键就是 kind 取值。
@@ -264,7 +286,7 @@ def _toast_qss(kind='info') -> str:
     bar = TOAST_KIND_COLORS.get(kind, Glass.PRIMARY)
     return f"""
         QLabel {{
-            background: rgba(28, 30, 42, 200);
+            background: rgba(253, 254, 252, 245);
             color: {Glass.TEXT_PRIMARY};
             border: none;
             border-left: 3px solid {bar};
@@ -341,7 +363,7 @@ class SidebarButton(QPushButton):
         self._label = label
         self._active = False
         self._hovered = False
-        self.setFixedWidth(80)
+        self.setFixedWidth(60)   # 跟随侧边栏宽（原 80 在 60 宽栏里溢出导致内容偏右）
         self.setMinimumHeight(52)
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet("QPushButton{background:transparent;border:none;outline:none;}")
@@ -406,33 +428,22 @@ class SidebarButton(QPushButton):
         # 不填充背景 - 完全透明，让父容器的背景透出来
         # 只在激活时绘制指示条
 
-        # 激活态：背景高光 + 左侧指示条
+        # 激活态：轻量品牌色背景 + 左侧竖条（颜色 + 形状共同体现选中）
         if self._active:
-            # 整行背景微光
-            bg = QColor(99, 102, 241, 18)
             p.setPen(Qt.NoPen)
-            p.setBrush(bg)
+            p.setBrush(QColor(8, 127, 115, 26))
             p.drawRoundedRect(0, int(h * 0.08), w, int(h * 0.84), 8, 8)
             # 左侧指示条（更宽更亮）
-            bar = QLinearGradient(0, h * 0.12, 0, h * 0.88)
-            bar.setColorAt(0, QColor(99, 102, 241, 60))
-            bar.setColorAt(0.5, QColor(129, 140, 248, 200))
-            bar.setColorAt(1, QColor(99, 102, 241, 60))
-            p.setPen(Qt.NoPen)
-            p.setBrush(bar)
-            p.drawRoundedRect(0, int(h * 0.12), 3, int(h * 0.76), 2, 2)
+            p.setBrush(QColor(8, 127, 115, 220))
+            p.drawRoundedRect(0, int(h * 0.16), 3, int(h * 0.68), 2, 2)
 
-        # hover 背景（柔和渐变）
+        # hover 背景（柔和深灰透明，浅色主题）
         if self._hovered and not self._active:
-            hover_bg = QLinearGradient(0, int(h * 0.08), 0, int(h * 0.92))
-            hover_bg.setColorAt(0, QColor(255, 255, 255, 3))
-            hover_bg.setColorAt(0.5, QColor(255, 255, 255, 6))
-            hover_bg.setColorAt(1, QColor(255, 255, 255, 2))
             p.setPen(Qt.NoPen)
-            p.setBrush(hover_bg)
+            p.setBrush(QColor(0, 0, 0, 10))
             p.drawRoundedRect(0, int(h * 0.08), w, int(h * 0.84), 8, 8)
 
-        # 图标
+        # 图标（图标+文字作为整体在按钮内垂直居中，随实际高度自适应）
         icons = self._icon_char2fn
         fn = icons.get(self._icon_char)
         if fn:
@@ -440,10 +451,27 @@ class SidebarButton(QPushButton):
             # dict + 重新栅格化矢量图标(见 __init__ / _state_icon)
             icon_pixmap = self._state_icon()
             if icon_pixmap is not None:
+                # 内容块高 = 图标 + 间距(2) + 文字(≈15)；整体居中，避免"偏下"
+                text_h = 15
+                content_h = SIDEBAR_BUTTON_ICON_PX + 2 + text_h
+                top = max(2, (h - content_h) // 2)
                 x = (w - SIDEBAR_BUTTON_ICON_PX) // 2
-                p.drawPixmap(x, 8, icon_pixmap)
+                p.drawPixmap(x, top, icon_pixmap)
+                text_rect = self.rect().adjusted(
+                    0, top + SIDEBAR_BUTTON_ICON_PX + 2, 0, 0)
+                # ⚠️ 文字颜色必须在 drawText 前设置：画背景时 pen 已被置成
+                # NoPen，NoPen 下 drawText 不渲染任何文字（激活/hover 项
+                # 文字"消失"就是这个原因——非激活项没画背景所以幸存）。
+                label_color = Glass.TEXT_PRIMARY if self._active else (
+                    Glass.TEXT_SECONDARY if self._hovered else Glass.TEXT_MUTED)
+                p.setPen(QColor(label_color))
+                p.setFont(self._font)
+                p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop,
+                           self._label)
+                p.end()
+                return
 
-        # 标签
+        # 标签（无图标时的兜底路径）
         label_color = Glass.TEXT_PRIMARY if self._active else (
             Glass.TEXT_SECONDARY if self._hovered else Glass.TEXT_MUTED)
         p.setPen(QColor(label_color))
@@ -497,7 +525,9 @@ def _make_toggle_row(label, toggle_key, settings, toggles_dict, on_toggle_fn):
     lbl.setStyleSheet(
         f"font-size:{Glass.FONT_SIZE_MD};color:{Glass.TEXT_PRIMARY};background:transparent;")
     lbl.setCursor(Qt.PointingHandCursor)
-    lbl.mousePressEvent = lambda e, b=btn: b.toggle()
+    # v5.1(ultra M5): 点标签走 click() 而非 toggle() —— toggle 直接跳变不带动画,
+    # 与点按钮的 220ms 滑动动画手感不一致(overlay_window 已修过同一问题)。
+    lbl.mousePressEvent = lambda e, b=btn: b.click()
     rl.addWidget(lbl)
     rl.addStretch()
 
@@ -570,7 +600,7 @@ class _MatchRow(QWidget):
         self._icon_lbl.setFixedSize(self.ICON, self.ICON)
         self._icon_lbl.setAlignment(Qt.AlignCenter)
         self._icon_lbl.setStyleSheet(
-            'background: rgba(255,255,255,0.06);'
+            f'background: {Glass.BG_INSET};'
             f'border-radius: {Glass.RADIUS_SM}px;'
             f'color: {Glass.TEXT_MUTED}; font-size: {Glass.FONT_SIZE_MD};')
 
@@ -694,13 +724,13 @@ class _MatchRow(QWidget):
         if g.get('win') is True:
             self._badge.setText('胜')
             self._badge.setStyleSheet(
-                'background: rgba(248,113,113,0.18); color: #f87171;'
+                f'background: {Glass.DANGER_BG}; color: {Glass.DANGER};'
                 f'border-radius: {Glass.RADIUS_SM}px;'
                 f'font-size: {Glass.FONT_SIZE_XS}; font-weight: 700;')
         else:
             self._badge.setText('负')
             self._badge.setStyleSheet(
-                'background: rgba(52,211,153,0.16); color: #34d399;'
+                f'background: {Glass.SUCCESS_SUBTLE}; color: {Glass.SUCCESS};'
                 f'border-radius: {Glass.RADIUS_SM}px;'
                 f'font-size: {Glass.FONT_SIZE_XS}; font-weight: 700;')
         # 胜负色变了, 竖条也要跟着重画
@@ -735,15 +765,15 @@ class _MatchRow(QWidget):
         super().paintEvent(event)
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        # alpha = 0.09 / 0.035 → 23 / 9 (与旧样式表逐位等价)
+        # alpha 对应旧样式表逐位等价（浅色主题：悬停深灰微底）
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, 23 if self._hovered else 9))
+        p.setBrush(QColor(0, 0, 0, 20 if self._hovered else 6))
         r = Glass.RADIUS_BTN
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), r, r)
         # 胜负竖条: 红=胜 / 绿=负(与徽章同色系), 未定(脏数据)不画
         win = self._game.get('win')
         if isinstance(win, bool):
-            bar = QColor('#f87171') if win else QColor('#34d399')
+            bar = QColor(Glass.DANGER) if win else QColor(Glass.SUCCESS)
             p.setBrush(bar)
             p.drawRoundedRect(
                 0, 8, self.WIN_BAR_W, self.height() - 16, 2, 2)
@@ -830,6 +860,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     # v4.9.3(P1): 复制机器码后台采集完成 → 主线程写剪贴板/恢复按钮
     sig_machine_id_ready = pyqtSignal(str)
     sig_machine_id_failed = pyqtSignal(str)
+    # 熟练度 top3 英雄头像：后台线程下载的图标 bytes → 主线程渲染
+    sig_mastery_icon = pyqtSignal(int, object)
 
     def __init__(self):
         super().__init__()
@@ -873,7 +905,11 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self.setWindowTitle('大蛋小助手')
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(680, 520)
+        # 可缩放窗口（ULTRA 验收 §C 要求最大化/拉伸）：
+        # 默认 720x540，允许放大；内容页均为 ScrollArea，放大后自适应。
+        # 下限略低于默认值，给 150% 缩放的小屏（如 1366x768）留出余量。
+        self.setMinimumSize(680, 500)
+        self.resize(720, 540)
 
         # v4.4.0 修复(P1-15): 原 `QApplication.primaryScreen().geometry()` 拿的是
         # **设备像素**, 再喂给 **逻辑像素** 的 move(), 125%/150% 缩放下窗口会偏出
@@ -965,6 +1001,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self.sig_append_log.connect(self._do_log)
         self.sig_machine_id_ready.connect(self._on_machine_id_ready)
         self.sig_machine_id_failed.connect(self._on_machine_id_failed)
+        self.sig_mastery_icon.connect(self._do_mastery_icon)
 
     # ==================== 标题栏 ====================
     def _make_title_bar(self):
@@ -977,6 +1014,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         t.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XL};font-weight:bold;color:{Glass.TEXT_PRIMARY};background:transparent;")
         lay.addWidget(t)
+        # 版本号移到标题栏（豆包意见：移出首页侧栏）
+        ver = QLabel(f'v{APP_VERSION}')
+        ver.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};"
+            f"background:transparent;padding-top:2px;")
+        lay.addWidget(ver)
         lay.addStretch()
 
         # 窗口控制按钮（统一工厂：主窗口/小窗共用同一样式）
@@ -993,12 +1036,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     # ==================== 侧边栏 ====================
     def _make_sidebar(self):
         sidebar = QWidget()
-        sidebar.setFixedWidth(80)
+        sidebar.setFixedWidth(60)
         # v4.4.0 修复(P2 设计令牌): 内联 rgba 改走 Glass.BG_SIDEBAR
         sidebar.setStyleSheet(f'background:{Glass.BG_SIDEBAR};')
         lay = QVBoxLayout(sidebar)
-        lay.setContentsMargins(0, 6, 0, 6)
-        lay.setSpacing(2)
+        lay.setContentsMargins(0, 8, 0, 8)
+        lay.setSpacing(4)   # ds 意见：导航项垂直间距加大
 
         self._nav_buttons = []
         # v4.4.0(P2 硬编码): 页表抽成模块级常量 SIDEBAR_PAGES
@@ -1009,12 +1052,6 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             self._nav_buttons.append(btn)
 
         lay.addStretch()
-
-        ver = QLabel(f'v{APP_VERSION}')
-        ver.setAlignment(Qt.AlignCenter)
-        ver.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;padding-bottom:4px;")
-        lay.addWidget(ver)
 
         self._nav_buttons[0].set_active(True)
         return sidebar
@@ -1041,6 +1078,13 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
 
     # ==================== 首页 ====================
     def _make_home_page(self):
+        """首页（液态玻璃版三段式布局）：
+
+        ① 状态条卡（合并「连接状态」+「当前状态」为一条，当前阶段放大到右端）
+        ② 中部横排 = 账号卡(左, 弹性) + 操作卡(右, 固定宽)
+        ③ 底部近期战绩速览条
+        消除旧版「两张一行卡 + 中部大空洞 + 按钮贴底」的断裂节奏。
+        """
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1050,122 +1094,129 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         content = QWidget()
         content.setStyleSheet("background:transparent;")
         lay = QVBoxLayout(content)
-        lay.setContentsMargins(20, 16, 16, 16)
-        lay.setSpacing(10)
+        lay.setContentsMargins(24, 20, 24, 18)   # 呼吸感：内边距加大
+        lay.setSpacing(12)
 
-        # 连接状态
-        card = GlassCard()
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(14, 12, 14, 12)
-        cl.setSpacing(8)
-        status_row = QHBoxLayout()
-        status_row.setSpacing(8)
-        # v4.4.0 修复(P1-18): 原来是 QLabel + 每次 tick 重写 background 样式表
-        # (40ms 一次 = 每秒 25 次 QSS 解析 + polish)。改用自绘 StatusDot,
-        # 透明度变化只触发一次轻量 update()。
+        # ===== ① 状态条：左=连接状态 pill，右=当前阶段 pill（胶囊化） =====
+        status_card = GlassCard()
+        sc = QHBoxLayout(status_card)
+        sc.setContentsMargins(16, 12, 16, 12)
+        sc.setSpacing(10)
+        # 连接状态 pill（自绘 StatusDot 呼吸灯）
+        conn_pill = QWidget()
+        conn_pill.setStyleSheet(
+            f"background:{Glass.BG_CARD_ALT};border-radius:10px;")
+        cp = QHBoxLayout(conn_pill)
+        cp.setContentsMargins(10, 4, 12, 4)
+        cp.setSpacing(6)
         self._dot = StatusDot(10, color=DOT_RGB_OFFLINE, alpha=170)
         self._update_dot(False)
-        status_row.addWidget(self._dot)
+        cp.addWidget(self._dot)
         self._conn_label = QLabel('未连接到客户端')
         self._conn_label.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_MD};color:{Glass.TEXT_SECONDARY};background:transparent;")
-        status_row.addWidget(self._conn_label)
-        status_row.addStretch()
-        # v4.4.0(P2) 清理: 原 v36 起这里保留了一个空 QLabel `_summoner_label`
-        # (不在布局里、永远 hide()), 只为接住 `_do_conn` 里的旧 setText。
-        # 召唤师名自 v36 起已由下方账号卡大号展示, 该 label 从不出现在界面上,
-        # 属于纯残留 —— 连同 `_do_conn` 里那一行一起删除。
-        cl.addLayout(status_row)
-        lay.addWidget(card)
+            f"font-size:{Glass.FONT_SIZE_MD};font-weight:600;"
+            f"color:{Glass.TEXT_SECONDARY};background:transparent;")
+        cp.addWidget(self._conn_label)
+        sc.addWidget(conn_pill)
+        sc.addStretch()
+        # 当前状态 pill（当前阶段放大）
+        phase_pill = QWidget()
+        phase_pill.setStyleSheet(
+            f"background:{Glass.PRIMARY_SUBTLE};border-radius:10px;")
+        pp = QHBoxLayout(phase_pill)
+        pp.setContentsMargins(10, 4, 12, 4)
+        pp.setSpacing(6)
+        phase_tag = QLabel('当前状态')
+        phase_tag.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        pp.addWidget(phase_tag)
+        self._phase_label = QLabel('等待启动')
+        self._phase_label.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XL};font-weight:600;"
+            f"color:{Glass.TEXT_PRIMARY};background:transparent;")
+        pp.addWidget(self._phase_label)
+        sc.addWidget(phase_pill)
+        lay.addWidget(status_card)
 
-        # ===== 启动 LOL(跳过 WeGame 主面板) =====
-        # v4.4.6: 按钮改放到「启动脚本」正上方(同一右侧竖排), 不再单独占一张卡片;
-        # 宽度与 fab 一致(170)且同为右对齐, 两枚按钮上下严丝合缝。
-        # v4.4.18: 样式改走 _action_btn_qss 工厂, 与另两枚统一几何与字号。
-        # v4.8.0: 文案去掉"一键" —— 它已不做任何自动点击, 保留"一键"会让买家
-        # 以为点下去会自动登录/自动进大厅。
-        self._launch_lol_btn = QPushButton('🚀  启动 LOL')
+        # ===== ② 中部：账号卡(左, 弹性) + 操作卡(右, 固定宽) =====
+        mid = QHBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(12)
+
+        acct_card = self._build_account_card()
+        self._acct_card = acct_card
+        mid.addWidget(acct_card, 1)
+
+        ops_card = GlassCard()
+        ol = QVBoxLayout(ops_card)
+        ol.setContentsMargins(14, 14, 14, 14)
+        ol.setSpacing(8)   # ds 意见：按钮间距收紧，避免留白过多
+        ops_title = QLabel('操作')
+        ops_title.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};font-weight:600;"
+            f"color:{Glass.TEXT_MUTED};background:transparent;")
+        ol.addWidget(ops_title)
+
+        # 启动 LOL：绝对主操作（青色实心），压过其它按钮
+        self._launch_lol_btn = QPushButton('启动 LOL')
         self._launch_lol_btn.setFixedSize(_BTN_W, _BTN_H)
         self._launch_lol_btn.setCursor(Qt.PointingHandCursor)
         self._launch_lol_btn.setStyleSheet(_action_btn_qss('accent'))
         self._launch_lol_btn.clicked.connect(self._on_launch_lol)
+        ol.addWidget(self._launch_lol_btn, 0, Qt.AlignHCenter)
 
-        # v4.4.15: 按钮下方一行小字, 说明这个按钮到底做什么。
-        # v4.8.0: 固定为"只打开登录器" —— 不再有"已录制N步: 启动并自动点击"这种状态。
+        # 说明小字：正下方居中，12px 灰
         self._launch_lol_hint = QLabel('')
         self._launch_lol_hint.setWordWrap(True)
-        self._launch_lol_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._launch_lol_hint.setFixedWidth(170)
+        self._launch_lol_hint.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self._launch_lol_hint.setFixedWidth(_BTN_W)
         self._launch_lol_hint.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+            f"font-size:{Glass.FONT_SIZE_SM};color:#8A8F99;background:transparent;")
         self._refresh_launch_hint()
+        ol.addWidget(self._launch_lol_hint)
 
-        # ===== 账号信息卡(v37:四行规范结构, 挪到红框位置) =====
-        # v4.6.11: 150 行的构建过程抽到 _build_account_card(), 这里只留调用。
-        acct_card = self._build_account_card()
-        self._acct_card = acct_card
-
-        # 当前状态
-        card2 = GlassCard()
-        c2l = QVBoxLayout(card2)
-        c2l.setContentsMargins(14, 12, 14, 12)
-        c2l.setSpacing(8)
-        t2 = QLabel('当前状态')
-        t2.setStyleSheet(f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;color:{Glass.TEXT_SECONDARY};background:transparent;")
-        c2l.addWidget(t2)
-        self._phase_label = QLabel('等待启动')
-        self._phase_label.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_LG};color:{Glass.TEXT_PRIMARY};background:transparent;font-weight:600;")
-        c2l.addWidget(self._phase_label)
-        lay.addWidget(card2)
-
-        # 启动按钮（右对齐）
-        # v4.1.45: 缩到 170x44, 原 200x50 + acct 实测 404 + spacing 12 = 616
-        # > 内容区 564 → fab 起点 516+200=716 > 窗口 680 越界 36px
-        self._fab = QPushButton('⚡  启动脚本')
+        # 启动脚本：次级操作（青描边），运行中变「停止脚本」红描边（降低视觉干扰）
+        self._fab = QPushButton('启动脚本')
         self._fab.setFixedSize(_BTN_W, _BTN_H)
         self._fab.setCursor(Qt.PointingHandCursor)
-        # v4.4.1(UI-A1): 样式表抽到模块级 _fab_qss(), 与 _do_run 共用同一份,
-        # 字号统一 FONT_SIZE_XL(原先这里 14px、_do_run 里 16px, 点一下跳一号)。
         self._fab.setStyleSheet(_fab_qss(False))
         self._fab.clicked.connect(self._on_start)
-        lay.addStretch()
+        ol.addWidget(self._fab, 0, Qt.AlignHCenter)
 
-        # v4.4.16: 「全部停止」—— 关掉 LOL 并停脚本(用户要求放在「启动脚本」下方)
-        # v4.4.18: 原先是"透明底 + 红描边 + 高40 + 字号13", 与上面两枚实心渐变按钮
-        # 明显不是一套(用户看截图指出)。现改走同一工厂: 实心渐变 + 同尺寸同字号,
-        # 只把颜色换成更深一档的红(避免与"运行中的启动脚本"那枚红撞色)。
-        self._stop_all_btn = QPushButton('⏹  全部停止')
+        # 全部停止：红描边（危险确认感更强，且运行中不与「停止脚本」实心红撞型）
+        self._stop_all_btn = QPushButton('全部停止')
         self._stop_all_btn.setFixedSize(_BTN_W, _BTN_H)
         self._stop_all_btn.setCursor(Qt.PointingHandCursor)
-        self._stop_all_btn.setStyleSheet(_action_btn_qss('danger_deep'))
+        self._stop_all_btn.setStyleSheet(_action_btn_qss('ghost_red'))
         self._stop_all_btn.clicked.connect(self._on_stop_all)
+        ol.addWidget(self._stop_all_btn, 0, Qt.AlignHCenter)
+        ol.addStretch()
 
-        # v37c:底部横排 = 账号信息卡(左下) + 启动按钮(右下) 同处一行。
-        # 此前账号卡整行塞在按钮下方会把按钮顶离底部, 现在按钮保持右下贴底不动。
-        # v4.1.45: maxWidth 380 给 fab 让出空间; fab 缩 170x44 + 直接 addWidget
-        # + AlignBottom | AlignRight 贴底(原 QVBoxLayout 包装会被 HBox 拉伸到同高)
-        acct_card.setMaximumWidth(380)
-        bottom = QHBoxLayout()
-        bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.setSpacing(12)
-        bottom.addWidget(acct_card)                 # 账号卡占左侧(可随空间伸缩)
-        bottom.addStretch(1)                        # 弹性把按钮推到右侧
-        # v4.4.6: 右侧改为竖排 —— 「启动 LOL」在上、「启动脚本」在下,
-        # 两枚同为 170x44 且右对齐; 组内顶部 addStretch 让整组贴底。
-        right_col = QVBoxLayout()
-        right_col.setContentsMargins(0, 0, 0, 0)
-        right_col.setSpacing(8)
-        right_col.addStretch(1)
-        right_col.addWidget(self._launch_lol_hint, 0, Qt.AlignRight)
-        right_col.addWidget(self._launch_lol_btn, 0, Qt.AlignRight)
-        right_col.addWidget(self._fab, 0, Qt.AlignRight)
-        right_col.addWidget(self._stop_all_btn, 0, Qt.AlignRight)
-        bottom.addLayout(right_col)
-        bottom_w = QWidget()
-        bottom_w.setLayout(bottom)
-        bottom_w.setStyleSheet('background:transparent;')
-        lay.addWidget(bottom_w)
+        mid.addWidget(ops_card)
+        lay.addLayout(mid, 1)
+
+        # ===== ③ 底部：近期战绩速览条（背景与主面板融合，顶部分隔线，贴底） =====
+        recent_bar = QWidget()
+        recent_bar.setStyleSheet("background:transparent;")
+        rc = QHBoxLayout(recent_bar)
+        rc.setContentsMargins(4, 10, 4, 2)
+        rc.setSpacing(8)
+        rtitle = QLabel('近期战绩')
+        rtitle.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_MD};font-weight:600;"
+            f"color:{Glass.TEXT_PRIMARY};background:transparent;")
+        rc.addWidget(rtitle)
+        # 提示文案随连接态切换（已连接不再显示"自动加载"）
+        self._recent_hint = QLabel('连接客户端后自动加载')
+        self._recent_hint.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        rc.addWidget(self._recent_hint)
+        rc.addStretch()
+        rc.addWidget(self._chip_recent)
+        # 整条可点击 → 跳转战绩页（第 4 页，索引 3）
+        recent_bar.setCursor(Qt.PointingHandCursor)
+        recent_bar.mousePressEvent = lambda e: self._switch_page(3)
+        lay.addWidget(recent_bar)
 
         scroll.setWidget(content)
         return scroll
@@ -1184,7 +1235,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         acct_card = GlassCard()
         # v4.1.48: 按用户截图红框宽 = 380, 给账号卡固定宽让右侧 fab 区域稳定;
         # 头像缩 48 / label 列缩 44 让 7 行内容可塞下不溢出.
-        acct_card.setFixedWidth(380)
+        acct_card.setMinimumWidth(340)   # 液态玻璃版：放开固定宽，随中部横排弹性伸缩
         acl = QVBoxLayout(acct_card)
         acl.setContentsMargins(14, 10, 14, 12)
         acl.setSpacing(6)
@@ -1199,8 +1250,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._avatar_lbl = QLabel('🎮')
         self._avatar_lbl.setFixedSize(48, 48)
         self._avatar_lbl.setAlignment(Qt.AlignCenter)
+        # 头像：纯圆形，无底色无描边（用户反馈：描边+底色看着像"绿色底子"）
         self._avatar_lbl.setStyleSheet(
-            f"background:rgba(255,255,255,0.06);border-radius:24px;"
+            f"background:transparent;border:none;border-radius:24px;"
             f"font-size:20px;color:{Glass.TEXT_MUTED};font-weight:600;")
         # v4.1.39:真头像已成功上屏的 icon_id(0=无)。探活轮询(3s)刷新账号卡
         # 时,若 icon_id 与已渲染真头像一致则不再覆盖成"首字生成式占位"。
@@ -1223,8 +1275,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         row1.addLayout(name_col, 1)
         acl.addLayout(row1)
 
-        # 行2:等级 + 经验进度
-        row2 = QHBoxLayout(); row2.setSpacing(6)
+        # 行2:等级 + 经验进度（进度条与数字间距拉开）
+        row2 = QHBoxLayout(); row2.setSpacing(8)
         k = QLabel('等级'); k.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         k.setFixedWidth(LBL_W)
@@ -1241,9 +1293,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._acct_xp.setTextVisible(False)
         self._acct_xp.setFixedHeight(4)
         self._acct_xp.setStyleSheet(f"""
-            QProgressBar {{ background: rgba(255,255,255,0.08);
+            QProgressBar {{ background: {Glass.BORDER};
                 border: none; border-radius: 2px; }}
-            QProgressBar::chunk {{ background: {Glass.PRIMARY_HOVER};
+            QProgressBar::chunk {{ background: {Glass.PRIMARY};
                 border-radius: 2px; }}
         """)
         row2.addWidget(self._acct_xp, 1)
@@ -1255,79 +1307,52 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         row2.addWidget(self._acct_xp_txt)
         acl.addLayout(row2)
 
-        # 行3:段位(单排/灵活) —— prefix='单排'/'灵活' 永远显示, value=段位文本
-        # v4.1.51 改: 创建时 default_value 必须都是 '未定级', 否则未连接/未拉取到段位
-        # 时 chip 会显示残留旧数据「白银 I · 60胜点」造成误导。prefix 加「单排/灵活」
-        # 便于区分两条队列(用户反馈两 chip 文字相同时分不清)
+        # 行3:段位(单排/灵活) —— ultra 版：两个等分统计块（label 上 / 值下）
         row3 = QHBoxLayout(); row3.setSpacing(CHIP_GAP)
         k = QLabel('段位'); k.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         k.setFixedWidth(LBL_W)
         row3.addWidget(k)
-        self._chip_solo = self._mk_rank_chip(*CHIP_SOLO, '单排', '--')
-        self._chip_flex = self._mk_rank_chip(*CHIP_FLEX, '灵活', '--')
-        row3.addWidget(self._chip_solo)
-        row3.addWidget(self._chip_flex)
-        row3.addStretch()
+        self._chip_solo = self._mk_stat_chip(CHIP_SOLO[0], '单排', '--')
+        self._chip_flex = self._mk_stat_chip(CHIP_FLEX[0], '灵活', '--')
+        row3.addWidget(self._chip_solo, 1)
+        row3.addWidget(self._chip_flex, 1)
         acl.addLayout(row3)
 
-        # 行4:资产 蓝精粹 / 橙精粹 —— prefix=中文标签, value=数字
+        # 行4:资产 + 荣誉 —— ultra 版：四个等分统计块一行
         row4 = QHBoxLayout(); row4.setSpacing(CHIP_GAP)
         k = QLabel('资产'); k.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         k.setFixedWidth(LBL_W)
         row4.addWidget(k)
-        self._chip_wallet_ip = self._mk_rank_chip(*CHIP_WALLET_IP, '蓝色精粹', '--')
-        self._chip_wallet_cosmetic = self._mk_rank_chip(
-            *CHIP_WALLET_COSMETIC, '橙色精粹', '--')
-        row4.addWidget(self._chip_wallet_ip)
-        row4.addWidget(self._chip_wallet_cosmetic)
-        row4.addStretch()
+        self._chip_wallet_ip = self._mk_stat_chip(CHIP_WALLET_IP[0], '蓝色精粹', '--', mono=True)
+        self._chip_wallet_cosmetic = self._mk_stat_chip(
+            CHIP_WALLET_COSMETIC[0], '橙色精粹', '--', mono=True)
+        self._chip_wallet_mythic = self._mk_stat_chip(
+            CHIP_WALLET_MYTHIC[0], '神话精粹', '--', mono=True)
+        self._chip_honor = self._mk_stat_chip(CHIP_HONOR[0], '荣誉', '--', mono=True)
+        for c in (self._chip_wallet_ip, self._chip_wallet_cosmetic,
+                  self._chip_wallet_mythic, self._chip_honor):
+            row4.addWidget(c, 1)
         acl.addLayout(row4)
 
-        # 行5:资产(续) 神话精粹 / 荣誉(无 label, 沿用上行"资产"语义)
+        # 行5:熟练度 top3 —— 液态玻璃 ultra 版：改为「英雄头像 + 等级」统计块，
+        # 三个等分撑满一行（不再显示英雄名，用户指定）。
         row5 = QHBoxLayout(); row5.setSpacing(CHIP_GAP)
-        k5 = QLabel(''); k5.setFixedWidth(LBL_W)
-        k5.setStyleSheet('background:transparent;')
-        row5.addWidget(k5)
-        self._chip_wallet_mythic = self._mk_rank_chip(
-            *CHIP_WALLET_MYTHIC, '神话精粹', '--')
-        self._chip_honor = self._mk_rank_chip(*CHIP_HONOR, '荣誉', '--')
-        row5.addWidget(self._chip_wallet_mythic)
-        row5.addWidget(self._chip_honor)
-        row5.addStretch()
-        acl.addLayout(row5)
-
-        # 行6:熟练度 top3 —— 单段紧凑 chip, expanding 模式自动均分一行宽度
-        # v4.1.52 修: 创建时 prefix=空(原 prefix='堕落天使 72级' 导致未连接时残留显示
-        # 「堕落天使 72级」+ val='--' 双段, 看起来像"有数据但未完整体"误导)
-        # v4.1.54 修: 去掉 expanding/stretch, 与其他行 chip 一样靠左对齐(label 列右侧);
-        # expanding 让 chip 拉伸到卡右半, 起点偏右与段位/资产/战绩行不对齐
-        row6 = QHBoxLayout(); row6.setSpacing(CHIP_GAP)
         k = QLabel('熟练度'); k.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
         k.setFixedWidth(LBL_W)
-        row6.addWidget(k)
-        self._chip_m1 = self._mk_rank_chip(*CHIP_MASTERY_1, '', '--')
-        self._chip_m2 = self._mk_rank_chip(*CHIP_MASTERY_2, '', '--')
-        self._chip_m3 = self._mk_rank_chip(*CHIP_MASTERY_3, '', '--')
-        row6.addWidget(self._chip_m1)
-        row6.addWidget(self._chip_m2)
-        row6.addWidget(self._chip_m3)
-        row6.addStretch()
-        acl.addLayout(row6)
+        row5.addWidget(k)
+        self._chip_m1 = self._mk_mast_chip()
+        self._chip_m2 = self._mk_mast_chip()
+        self._chip_m3 = self._mk_mast_chip()
+        row5.addWidget(self._chip_m1, 1)
+        row5.addWidget(self._chip_m2, 1)
+        row5.addWidget(self._chip_m3, 1)
+        acl.addLayout(row5)
 
-        # 行7:最近战绩 —— prefix='近10场'(分类标签), value='3胜8负'(数字)
-        # v4.1.51 改: prefix='近10场 3胜8负' 双重数据, 与 val 重复; 拆 prefix=分类, val=数字
-        row7 = QHBoxLayout(); row7.setSpacing(CHIP_GAP)
-        k = QLabel('战绩'); k.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
-        k.setFixedWidth(LBL_W)
-        row7.addWidget(k)
-        self._chip_recent = self._mk_rank_chip(*CHIP_RECENT, '近10场', '--')
-        row7.addWidget(self._chip_recent)
-        row7.addStretch()
-        acl.addLayout(row7)
+        # 行6:最近战绩 —— chip 挪到首页底部速览条（双色胜负 tag）
+        self._chip_recent = self._mk_recent_chip()
         # 注:v37b 移到启动按钮下方, 此处不再 addWidget(延迟到 fab 后)
         return acct_card
     # ==================== 设置页 ====================
@@ -1349,6 +1374,15 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             f"font-size:{Glass.FONT_SIZE_XL};font-weight:700;color:{Glass.TEXT_PRIMARY};background:transparent;")
         lay.addWidget(title)
 
+        def _group(text, first=False):
+            g = QLabel(text)
+            g.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
+                f"color:{Glass.TEXT_SECONDARY};background:transparent;"
+                f"padding-left:2px;padding-top:{'0px' if first else '6px'};")
+            lay.addWidget(g)
+
+        _group('自动化操作', first=True)
         lay.addWidget(self._make_delay_card('自动匹配', 'auto_queue', 'auto_queue_delay', 2, 0, 30, '进入房间后自动开始匹配'))
         lay.addWidget(self._make_delay_card('自动接受', 'auto_accept', 'auto_accept_delay', 1, 0, 15, '匹配成功后自动接受对局'))
         lay.addWidget(self._make_delay_card('自动返回', 'auto_play_again', 'auto_play_again_delay', 2, 0, 30, '游戏结束后自动返回房间'))
@@ -1360,6 +1394,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             'auto_start_on_connect_delay', 5, 0, 120,
             '检测到连上 LOL 客户端后，等设定秒数自动启动脚本'))
 
+        _group('界面行为')
         # v4.8.1(用户要求): 点「启动 LOL」成功后隐藏主界面并打开小窗。
         # 做成"开关 + 说明"的独立卡片(不带延时控件 —— 它与时间无关)。
         card_lo = GlassCard()
@@ -1380,6 +1415,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         clo.addWidget(desc_lo)
         lay.addWidget(card_lo)
 
+        _group('英雄选择')
         # v34: 自动选英雄(进选人界面2-3 张卡时主动点选; 默认关; 打开时若非管理员则请求提权)
         card = GlassCard()
         cl = QVBoxLayout(card)
@@ -1485,7 +1521,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         # ---- 标题行：🔑 授权 + 右侧状态 ----
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-        title = QLabel('🔑 授权 / 激活')
+        title = QLabel('授权 / 激活')
         title.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
             f"color:{Glass.TEXT_SECONDARY};background:transparent;")
@@ -1713,7 +1749,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
 
-        title = QLabel('🧹 清理缓存')
+        title = QLabel('清理缓存')
         title.setStyleSheet(
             f"font-size:{Glass.FONT_SIZE_SM};font-weight:600;"
             f"color:{Glass.TEXT_SECONDARY};background:transparent;")
@@ -1750,7 +1786,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             cb.setStyleSheet(
                 "QCheckBox{background:transparent;}"
                 "QCheckBox::indicator{width:14px;height:14px;border-radius:3px;"
-                f"border:1px solid {Glass.BORDER_HOVER};background:rgba(255,255,255,0.04);}}"
+                f"border:1px solid {Glass.BORDER_HOVER};background:rgba(0,0,0,0.04);}}"
                 "QCheckBox::indicator:checked{"
                 f"background:{Glass.PRIMARY};border-color:{Glass.PRIMARY};}}")
             cb.setCursor(Qt.PointingHandCursor)
@@ -1760,7 +1796,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_SECONDARY};"
                 f"background:transparent;")
             lbl.setCursor(Qt.PointingHandCursor)
-            lbl.mousePressEvent = lambda e, b=cb: b.toggle()
+            # v5.1(ultra): 与 _make_toggle_row 同款 —— QCheckBox 用 click() 也走
+            # 原生动画/点击语义, 统一手感(此处是 QCheckBox 非 AnimatedToggle)。
+            lbl.mousePressEvent = lambda e, b=cb: b.click()
             rl.addWidget(lbl)
             rl.addStretch()
             size_lbl = QLabel('')
@@ -1927,7 +1965,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     def _make_delay_ctrl(self, parent, key, default, mn, mx):
         btn_style = f"""
             QPushButton{{
-                background: rgba(99, 102, 241, 0.12);
+                background: {Glass.PRIMARY_SUBTLE};
                 color: {Glass.TEXT_PRIMARY};
                 border: none;
                 border-radius: {Glass.RADIUS_XS};
@@ -1938,10 +1976,10 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 min-height: 22px;
             }}
             QPushButton:hover{{
-                background: rgba(99, 102, 241, 0.22);
+                background: {Glass.PRIMARY_20};
             }}
             QPushButton:pressed{{
-                background: rgba(99, 102, 241, 0.30);
+                background: {Glass.PRIMARY_30};
                 padding-top: 1px;
             }}
         """
@@ -2032,16 +2070,16 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._recent_rate_lbl.setVisible(False)
         # v4.9.x: 手动刷新按钮 —— 复用 main 的 _force_profile_refresh 通道,
         # 置位后下一轮探活(≤3s)立即重拉战绩, 不等 30s 周期。
-        self._recent_refresh_btn = QPushButton('🔄 刷新')
+        self._recent_refresh_btn = QPushButton('刷新')
         self._recent_refresh_btn.setFixedHeight(26)
         self._recent_refresh_btn.setCursor(Qt.PointingHandCursor)
         self._recent_refresh_btn.setStyleSheet(f"""
-            QPushButton {{ background: rgba(99,102,241,0.08); color: {Glass.TEXT_SECONDARY};
+            QPushButton {{ background: {Glass.PRIMARY_06}; color: {Glass.TEXT_SECONDARY};
                 border: none; border-radius: 6px; font-size: {Glass.FONT_SIZE_XS};
                 padding: 0 10px; }}
-            QPushButton:hover {{ background: rgba(99,102,241,0.18); color: {Glass.TEXT_PRIMARY}; }}
-            QPushButton:pressed {{ background: rgba(99,102,241,0.26); }}
-            QPushButton:disabled {{ background: rgba(255,255,255,0.04); color: {Glass.TEXT_MUTED}; }}
+            QPushButton:hover {{ background: {Glass.PRIMARY_18}; color: {Glass.TEXT_PRIMARY}; }}
+            QPushButton:pressed {{ background: {Glass.PRIMARY_30}; }}
+            QPushButton:disabled {{ background: rgba(0,0,0,0.05); color: {Glass.TEXT_MUTED}; }}
         """)
         self._recent_refresh_btn.clicked.connect(self._on_recent_refresh)
         head.addWidget(title)
@@ -2171,7 +2209,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             return
         pending = bool(getattr(self, '_refresh_pending', False))
         btn.setEnabled(not pending)
-        btn.setText('🔄 刷新中…' if pending else '🔄 刷新')
+        btn.setText('刷新中…' if pending else '刷新')
 
     def _clear_refresh_pending(self):
         """刷新兜底复位: 探活结果正常到达时也会调, 幂等。"""
@@ -2485,8 +2523,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         clear_btn.setFixedHeight(32)
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.setStyleSheet(f"""
-            QPushButton {{ background: rgba(99,102,241,0.08); color: {Glass.TEXT_SECONDARY}; border: none; border-radius: 6px; font-size: {Glass.FONT_SIZE_SM}; }}
-            QPushButton:hover {{ background: rgba(99,102,241,0.18); color: {Glass.TEXT_PRIMARY}; }}
+            QPushButton {{ background: {Glass.PRIMARY_06}; color: {Glass.TEXT_SECONDARY}; border: none; border-radius: 6px; font-size: {Glass.FONT_SIZE_SM}; }}
+            QPushButton:hover {{ background: {Glass.PRIMARY_18}; color: {Glass.TEXT_PRIMARY}; }}
         """)
         clear_btn.clicked.connect(lambda: self._log_text.clear())
         lay.addWidget(clear_btn)
@@ -2541,7 +2579,11 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._settings[key] = value
         for k, b in self._toggles.items():
             if k == key and b.isChecked() != value:
-                b.setChecked(value)
+                blocked = b.blockSignals(True)
+                try:
+                    b.setChecked(value)
+                finally:
+                    b.blockSignals(blocked)
         self._save_settings()
         self.settings_changed_signal.emit(self._settings)
 
@@ -2646,10 +2688,17 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
 
     @ui_slot
     def sync_setting(self, key, value):
+        # v5.1(ultra H6): 用 blockSignals 包住 setChecked —— 否则按钮 toggled 信号
+        # 会再走一遍 _on_setting → _save_settings + settings_changed emit, 与调用方
+        # (persist_setting) 自己那次落盘/广播叠加成双写。overlay_window 已是此写法。
         if key in self._toggles:
             btn = self._toggles[key]
             if btn.isChecked() != value:
-                btn.setChecked(value)
+                blocked = btn.blockSignals(True)
+                try:
+                    btn.setChecked(value)
+                finally:
+                    btn.blockSignals(blocked)
         self._settings[key] = value
 
     def init_champion_picker(self, champ_data, preferred, icon_cb, download_cb=None, **kw):
@@ -2686,92 +2735,195 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._toast.show_toast(f'已保存 {len(ids)} 个偏好英雄', kind='success')
 
     # ==================== v37 账号卡更新 ====================
-    def _mk_rank_chip(self, color, bg, label, default_value):
-        """段位/荣誉标签-值双段胶囊(带前缀 label,如「单双 白银 I·60胜点」)。
+    def _mk_mast_chip(self):
+        """熟练度统计块（液态玻璃 ultra 版）：英雄头像 + 成就等级。
 
-        v4.1.46 改: 数据态 vs 等待态分两种 style, **chip 默认 visible 不隐藏**。
-        v4.1.54 起 size_policy_expanding 已无任何调用点(熟练度行改回左对齐),
-        该参数与不可达分支删除。
-        原 set_default 用 setVisible(False) 会让整行塌陷, 未连接时账号卡
-        比连接时矮 24px, 顶部连接/未连接状态卡 + fab 高度都不变, 看起来
-        不协调。现在让两种状态行高一致, 仅 chip 背景透明度区分:
-        数据态  bg=原色(0.16)  text=原色
-        等待态  bg=rgba(255,255,255,0.04)  text=TEXT_MUTED
+        接口与 rank chip 一致（set_value / set_default），_prefix 为 None
+        （update_account_info 已不再触碰 _prefix）。
+        """
+        wrap = QFrame()
+        wrap.setStyleSheet(
+            f"QFrame{{background:{Glass.BG_CARD_ALT};"
+            f"border:1px solid {Glass.BORDER};border-radius:8px;}}")
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(8, 6, 10, 6)
+        h.setSpacing(8)
+        avatar = QLabel('')
+        avatar.setFixedSize(32, 32)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setStyleSheet(
+            f"background:{Glass.BG_INSET};border-radius:8px;border:none;")
+        h.addWidget(avatar)
+        val = QLabel('--')
+        val.setStyleSheet(
+            f"font-size:13px;font-weight:700;color:{Glass.TEXT_MUTED};"
+            f"font-family:'Cascadia Code','Consolas','Microsoft YaHei UI';"
+            f"background:transparent;border:none;")
+        h.addWidget(val, 1)
+        wrap._avatar = avatar
+        wrap._value = val
+        wrap._prefix = None
+        _last = {'key': None}
+
+        def _apply_value(text, data_mode):
+            key = (text, bool(data_mode))
+            if key == _last['key']:
+                return
+            _last['key'] = key
+            color = Glass.TEXT_PRIMARY if data_mode else Glass.TEXT_MUTED
+            val.setText(text)
+            val.setStyleSheet(
+                f"font-size:13px;font-weight:700;color:{color};"
+                f"font-family:'Cascadia Code','Consolas','Microsoft YaHei UI';"
+                f"background:transparent;border:none;")
+
+        wrap.set_value = lambda v: _apply_value(v, True)
+        wrap.set_default = lambda: _apply_value('--', False)
+        return wrap
+
+    def _mk_stat_chip(self, color, label, default_value, mono=False):
+        """统计块（液态玻璃 ultra 版）：垂直排布，label 上 / value 下，统一底。
+
+        接口与 rank chip 一致（set_value / set_default）。段位/资产/荣誉共用，
+        等分撑满一行 —— 消除旧 chip「前缀+值水平拼接」导致的尺寸参差。
+        mono=True 时 value 用等宽字体（资产/荣誉等数字）。
+        """
+        wrap = QFrame()
+        wrap.setStyleSheet(
+            f"QFrame{{background:{Glass.BG_CARD_ALT};"
+            f"border:1px solid {Glass.BORDER};border-radius:8px;}}")
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(3)
+        lab = QLabel(label)
+        lab.setStyleSheet(
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;border:none;")
+        mono_fam = ("font-family:'Cascadia Code','Consolas','Microsoft YaHei UI';"
+                    if mono else '')
+        val = QLabel(default_value)
+        val.setStyleSheet(
+            f"font-size:13px;font-weight:700;color:{Glass.TEXT_MUTED};"
+            f"{mono_fam}background:transparent;border:none;")
+        v.addWidget(lab)
+        v.addWidget(val)
+        wrap._value = val
+        wrap._lab = lab
+        wrap._color = color
+        _last = {'key': None}
+
+        def _apply_value(text, data_mode):
+            key = (text, bool(data_mode))
+            if key == _last['key']:
+                return
+            _last['key'] = key
+            vc = Glass.TEXT_PRIMARY if data_mode else Glass.TEXT_MUTED
+            lc = color if data_mode else Glass.TEXT_MUTED
+            val.setText(text)
+            val.setStyleSheet(
+                f"font-size:13px;font-weight:700;color:{vc};"
+                f"{mono_fam}background:transparent;border:none;")
+            lab.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_XS};color:{lc};background:transparent;border:none;")
+
+        wrap.set_value = lambda x: _apply_value(x, True)
+        wrap.set_default = lambda: _apply_value(default_value, False)
+        return wrap
+
+    def _mk_recent_chip(self):
+        """近期战绩 chip：'近10场' 前缀 + N胜(红 tag) + N负(绿 tag)。
+
+        胜负语义全局统一：胜=红 / 负=绿（国服习惯，与战绩页徽章、
+        对局详情 WIN_COLOR/LOSE_COLOR 一致）。
         """
         wrap = QWidget()
         wrap.setStyleSheet('background:transparent;')
         h = QHBoxLayout(wrap)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
-        # v4.1.50: prefix 文字跟随 chip 主色(蓝 chip 的「蓝精粹」也染蓝、橙 chip 的
-        # 「橙精粹」也染橙), 与 value 视觉统一; 等待态弱化为 TEXT_MUTED。
-        prefix = QLabel(label)
+        prefix = QLabel('近10场')
         prefix.setStyleSheet(
-            f"font-size:{CHIP_FONT_PX}px;color:{color};background:transparent;")
-        val = QLabel(default_value)
-        val.setAlignment(Qt.AlignCenter)
-        # 初始为等待态:弱背景 + 弱文字
-        val.setStyleSheet(
-            f"background:{CHIP_WAIT_BG};color:{Glass.TEXT_MUTED};"
-            f"border-radius:{CHIP_RADIUS_PX}px;padding:{CHIP_PAD};"
-            f"font-size:{CHIP_FONT_PX}px;font-weight:600;")
+            f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_MUTED};background:transparent;")
+        win = QLabel('--')
+        win.setStyleSheet(
+            f"background:rgba(195,79,85,0.13);color:{Glass.DANGER};"
+            f"border-radius:6px;padding:2px 8px;font-size:{Glass.FONT_SIZE_XS};font-weight:600;")
+        loss = QLabel('--')
+        loss.setStyleSheet(
+            f"background:rgba(25,132,95,0.13);color:{Glass.SUCCESS};"
+            f"border-radius:6px;padding:2px 8px;font-size:{Glass.FONT_SIZE_XS};font-weight:600;")
         h.addWidget(prefix)
-        h.addWidget(val)
-        # v4.1.46: chip 默认 visible, 行高稳定
-        wrap.setVisible(True)
-        wrap._prefix = prefix
-        wrap._value = val
-        wrap._color = color
-        wrap._bg = bg
-
-        # v4.4.0 修复(P1-18): 脏值比较 —— 账号卡每 3 秒刷新一次, 10 个 chip 的
-        # set_value/set_default 会把「文本没变、样式没变」的标签也重写一遍样式
-        # (每次 setStyleSheet 都要 QSS 解析 + style polish + 重排)。记住上次
-        # 的 (text, data_mode), 完全相同时直接 return。
+        h.addWidget(win)
+        h.addWidget(loss)
+        wrap._win = win
+        wrap._loss = loss
         _last = {'key': None}
 
-        def _apply_value(text, data_mode):
-            """data_mode=True 用原色背景, False 用等待态弱背景。"""
-            key = (text, bool(data_mode))
+        def _set_result(w, l):
+            key = (w, l)
             if key == _last['key']:
                 return
             _last['key'] = key
-            if data_mode:
-                bg_use = wrap._bg
-                color_use = wrap._color
-            else:
-                bg_use = CHIP_WAIT_BG
-                color_use = Glass.TEXT_MUTED
-            val.setText(text)
-            # v4.1.48: chip 字号缩到 10px, padding 2px 7px, 让熟练度三个 chip 在
-            # 380 宽账号卡内可放下不溢出.
-            val.setStyleSheet(
-                f"background:{bg_use};color:{color_use};"
-                f"border-radius:{CHIP_RADIUS_PX}px;"
-                f"padding:{CHIP_PAD};font-size:{CHIP_FONT_PX}px;"
-                f"font-weight:600;")
-            # v4.1.50: prefix 跟随状态切换颜色, 数据态亮、等待态弱
-            prefix.setStyleSheet(
-                f"font-size:{CHIP_FONT_PX}px;color:{color_use};"
-                f"background:transparent;font-weight:600;")
-            wrap.setVisible(True)
+            win.setText(f'{w}胜')
+            loss.setText(f'{l}负')
 
-        wrap.set_value = lambda v: _apply_value(v, True)
-        wrap.set_default = lambda: _apply_value(default_value, False)
+        def _set_default():
+            key = ('--', '--')
+            if key == _last['key']:
+                return
+            _last['key'] = key
+            win.setText('--')
+            loss.setText('--')
+
+        wrap.set_result = _set_result
+        wrap.set_default = _set_default
+        # set_value 兼容占位（不用于本 chip）
+        wrap.set_value = lambda v: _set_default()
         return wrap
 
+    def set_mastery_icon(self, idx, data):
+        """线程安全入口：熟练度 top3 英雄图标 bytes → 信号回主线程渲染头像。"""
+        self.sig_mastery_icon.emit(idx, data)
+
+    @ui_slot
+    def _do_mastery_icon(self, idx, data):
+        """主线程渲染熟练度头像（QPixmap 只能在主线程创建）。"""
+        try:
+            idx = int(idx)
+            chip = (self._chip_m1, self._chip_m2, self._chip_m3)[idx]
+            pm = icon_pixmap(data, 32, widget=self)
+            if pm is not None and not pm.isNull():
+                chip._avatar.setPixmap(pm)
+        except Exception as e:
+            print(f'[ui_slot] 熟练度头像渲染失败: {type(e).__name__}: {e}')
+
     def _set_acct_id(self, text, connected):
-        """v4.4.x(P3): 账号 ID 标签脏值比较 —— 探活每 3s 刷新一次, (text, connected)
-        没变就跳过 setStyleSheet, 避免反复 QSS 解析 + polish。"""
+        """账号 ID 标签：昵称 + #tag 胶囊（tag 降低对比度，与主昵称拉开层次）。
+
+        v4.4.x(P3): 脏值比较 —— 探活每 3s 刷新一次，(text, connected)
+        没变就跳过 setStyleSheet。
+        """
         key = (text, bool(connected))
         if key == getattr(self, '_acct_id_state', None):
             return
         self._acct_id_state = key
         color = Glass.TEXT_PRIMARY if connected else Glass.TEXT_MUTED
-        self._acct_id_lbl.setText(text)
-        self._acct_id_lbl.setStyleSheet(
-            f"font-size:{Glass.FONT_SIZE_LG};font-weight:600;"
-            f"color:{color};background:transparent;")
+        if text and '#' in text:
+            base, tag = text.rsplit('#', 1)
+            base = (base or '--').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            tag = tag.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            # 用户反馈：#数字 的胶囊底看着像阴影 → 改普通文字，仅用次级色弱化
+            self._acct_id_lbl.setText(
+                f'<span style="color:{color};">{base}</span>'
+                f'&nbsp;<span style="color:{Glass.TEXT_MUTED};">#{tag}</span>')
+            self._acct_id_lbl.setTextFormat(Qt.RichText)
+            self._acct_id_lbl.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_LG};font-weight:600;background:transparent;")
+        else:
+            self._acct_id_lbl.setTextFormat(Qt.PlainText)
+            self._acct_id_lbl.setText(text)
+            self._acct_id_lbl.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_LG};font-weight:600;"
+                f"color:{color};background:transparent;")
 
     def update_account_info(self, info):
         """主线程调用(连接探活数据/断线重置)。info=None → 等待态。
@@ -2847,31 +2999,21 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
             self._chip_honor.set_value(str(honor))
         else:
             self._chip_honor.set_default()
-        # 行6:熟练度 top3 —— v4.1.48 单段紧凑 chip(prefix 留空, 整个文本进 value)
+        # 行6:熟练度 top3 —— 只显示等级（头像由 set_mastery_icon 异步回填）
         mt = info.get('mastery_top') or []
         chips = (self._chip_m1, self._chip_m2, self._chip_m3)
         for i, chip in enumerate(chips):
             if i < len(mt):
                 m = mt[i]
-                nm = m.get('name') or f"#{m.get('champion_id')}"
                 lv = _as_int(m.get('level'))
-                # v4.1.49: 去掉 grade, 紧凑单段 = "英雄名 等级级", 与游戏"英雄成就"页一致
-                if lv > 0:
-                    text = f'{nm} {lv}级'
-                else:
-                    text = nm
-                # prefix 永远留空(本行 chip 已是单段), 避免重复显示
-                chip._prefix.setText('')
-                chip.set_value(text)
+                chip.set_value(f'{lv}级' if lv > 0 else '--')
             else:
-                chip._prefix.setText('')
                 chip.set_default()
-        # 行6:最近战绩
+        # 行6:最近战绩 —— 双色胜负 tag
         recent = info.get('recent')
         if recent and recent.get('total', 0) > 0:
-            w = recent.get('wins', 0)
-            l = recent.get('losses', 0)
-            self._chip_recent.set_value(f'{w}胜{l}负')
+            self._chip_recent.set_result(
+                recent.get('wins', 0), recent.get('losses', 0))
         else:
             self._chip_recent.set_default()
         # v4.1.66: 同批数据驱动战绩页(签名去重, 内容没变不重建)
@@ -3001,6 +3143,11 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
                 self._set_recent_empty('offline')
             elif connected and getattr(self._recent_empty, '_state', '') == 'offline':
                 self._set_recent_empty('loading')
+            # 速览条提示随连接态切换（用户反馈：已连接还显示"自动加载"不合适）
+            hint = getattr(self, '_recent_hint', None)
+            if hint is not None:
+                hint.setText('点击查看对局详情' if connected
+                             else '连接客户端后自动加载')
         except Exception as e:
             print(f'[ui_slot] MainWindow._do_conn 异常已被拦下: '
                   f'{type(e).__name__}: {e}')
@@ -3016,7 +3163,9 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         self._dot_alpha = 170.0
         self._dot_dir = 1
         if not hasattr(self, '_dot_timer') or self._dot_timer is None:
-            self._dot_timer = QTimer()
+            # v5.1(ultra M4): QTimer 带 parent —— 窗口销毁时随父对象自动回收,
+            # 与项目内其余 QTimer(_recent_icon_timer / PulseGlow._timer)一致。
+            self._dot_timer = QTimer(self)
             self._dot_timer.timeout.connect(self._dot_tick)
             self._dot_timer.setInterval(DOT_TICK_MS)
         # 立即把颜色同步到圆点(不等下一 tick, 避免状态切换后 40ms 内还是旧色)
@@ -3067,12 +3216,12 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         try:
             self._running = running
             if running:
-                self._fab.setText('⏹  停止脚本')
+                self._fab.setText('停止脚本')
                 # v4.4.1(UI-A1): 与构造时共用 _fab_qss(), 消除双份拷贝
                 # (顺便把硬编的 #dc2626/#b91c1c/#991b1b 收进 Glass.STOP_RED*)
                 self._fab.setStyleSheet(_fab_qss(True))
             else:
-                self._fab.setText('⚡  启动脚本')
+                self._fab.setText('启动脚本')
                 self._fab.setStyleSheet(_fab_qss(False))
         except Exception as e:
             print(f'[ui_slot] MainWindow._do_run 异常已被拦下: '

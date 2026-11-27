@@ -149,11 +149,11 @@ def _apply_native_rounded(widget, enable_shadow=False):
     if not hwnd:
         return False
     _clear_shadow_styles(hwnd)
-    # 深色模式/圆角失败不致命(降级为原生外观), 但 Acrylic 失败要如实上报。
-    # 失败也打印 debug: 静默丢弃返回值会让"深色/圆角没生效"无从排查。
-    hr_dark = _dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
+    # 浅色主题：关闭沉浸式深色模式，Acrylic 背景随系统浅色化。
+    # 失败也打印 debug: 静默丢弃返回值会让"模式没生效"无从排查。
+    hr_dark = _dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 0)
     if hr_dark not in (0,):
-        print(f'[Glass] 深色模式应用失败: hwnd={hwnd}, HRESULT={hr_dark}')
+        print(f'[Glass] 浅色模式应用失败: hwnd={hwnd}, HRESULT={hr_dark}')
     # 先重置再应用：窗口 hide/show 后 DWM 会清除 backdrop，
     # 不重置直接设 Acrylic 可能不生效（表现为关闭再打开后玻璃效果丢失）
     _dwm_attr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE)
@@ -175,10 +175,9 @@ def _apply_legacy(widget, enable_shadow=False):
 
     accentPolicy = ACCENT_POLICY()
     accentPolicy.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND
-    # v4.4.2(P1-14): 原 0x292929 是 ABGR, 最高字节 alpha=0 → Win10 回退
-    # Acrylic 完全透明无着色(看不见磨砂)。补 alpha=0x99(约 60% 不透明),
-    # 其余 RGB 保持原 0x29 灰。ABGR 布局 = 0xAABBGGRR。
-    accentPolicy.GradientColor = 0x99292929
+    # 浅色主题：0x99F0F0F0 是浅灰白着色(ABGR = 0xAABBGGRR, alpha 约 60%)，
+    # 老式 Acrylic 下透出柔和磨砂，而非深色玻璃。
+    accentPolicy.GradientColor = 0x99F0F0F0
     accentPolicy.AccentFlags = (0x20 | 0x40 | 0x80 | 0x100) if enable_shadow else 0
 
     winCompAttrData = WINDOW_COMPOSITION_ATTRIBUTES()

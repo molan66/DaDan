@@ -1,9 +1,10 @@
-"""Animated Widgets - 液态玻璃动效组件 v3
+"""Animated Widgets - ULTRA 动效组件
 
-小米风格核心：边框外圈柔光扩散
-- 每张卡片边框绘制多层扩散光晕（3层递减透明度）
-- 顶部折射高光
-- hover 时光晕增强
+设计对齐：Linear / Fluent 2 的克制动效。
+- 页面切换：快照淡出交叉淡化（SpringStackedWidget）
+- 卡片：hover 轻上浮 + 微弱投影（GlassCard）
+- 脉冲：单层边框透明度变化（PulseGlow）
+禁止大面积渐变、霓虹光晕、多层扩散光斑。
 """
 
 import math as _math
@@ -14,33 +15,33 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout,
 )
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, QPointF
-from PyQt5.QtGui import QColor, QPainter, QPainterPath, QLinearGradient
+from PyQt5.QtGui import QColor, QPainter, QPainterPath, QLinearGradient, QRadialGradient
 
 # v4.6.11: 用主题令牌替代硬编码的 '#6366f1' —— 该值与 Glass.PRIMARY 同色,
 # 各写一份会让"改主色"漏掉这里(PulseGlow 的默认值)。
-# v4.9.3: 原来上面这行下面还重复了一次 `from .styles import Glass`（两行相邻、
-# 完全一样）。无害但是纯噪音, 已删。
-from .styles import Glass
+# v5.0.2(ULTRA 收口): 模块级背景色不再重复写字面量，统一从 HIG 令牌解析。
+from .styles import Glass, HIG
 
 from .window_base import ui_slot
 
-# 模块级近黑背景色令牌: 窗口底色 / 标题栏底色 / 卡片底色三处原本各自硬编码,
-# 统一到这里方便整体调暗度(与 Glass 色板保持同一档深色玻璃观感)。
-_BG_WINDOW = (8, 10, 18, 155)      # 主窗/小窗顶层半透明底色
-_BG_TITLEBAR = (14, 16, 24, 160)   # 标题栏半透明底色
-_BG_CARD = (12, 14, 24, 180)       # 玻璃卡片底色
+
+def _hex_rgba(h):
+    """'#RRGGBB' → (r, g, b, 255)。"""
+    h = h.lstrip('#')
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+
+
+# 模块级背景色令牌: 窗口底 / 标题栏底（ULTRA 浅色：雾白底 + 暖白卡片）。
+_BG_WINDOW = _hex_rgba(HIG.BG_WINDOW)     # #F2F4F1 雾白基底
+_BG_TITLEBAR = _hex_rgba(HIG.BG_WINDOW)   # 标题栏底（与窗口底同色）
+_BG_CARD = _hex_rgba(HIG.BG_CARD)         # #FAFBF8 暖白卡片
 
 
 def paint_window_backdrop(p, w, h):
-    """主窗/小窗统一的顶层玻璃背景: 深色半透明底色 + 顶部柔光
-    （底层由 DWM 系统 Acrylic 模糊提供, 此处只画半透明着色层）"""
+    """ULTRA 浅色基底：纯色雾白 #F2F4F1，不加装饰。"""
     p.setPen(Qt.NoPen)
     p.setBrush(QColor(*_BG_WINDOW))
     p.drawRect(0, 0, w, h)
-    # 顶部柔光线
-    cr, cg, cb = Glass.NEON_QCOLOR
-    p.setPen(QColor(cr, cg, cb, 18))
-    p.drawLine(0, 0, w, 0)
 
 
 class SpringStackedWidget(QStackedWidget):
@@ -156,74 +157,27 @@ class HoverRow(QWidget):
 
 
 def _draw_glow_border(p, w, h, r, base_alpha=28, glow_expand=4, color=None):
-    """绘制精致多层柔光边框
-    
-    5层递进光晕：外扩散→中光→内光→核心→折射高光
-    base_alpha: 核心描边透明度 (0-255)
-    glow_expand: 外层光晕向外扩展的像素数
-    color: 光晕主色(RGB 元组)。缺省用 Glass.NEON_QCOLOR —— v4.4.2(P2-17) 之前
-           该参数不存在, PulseGlow(color=...) 传的色被丢弃, 恒用 NEON 色。
+    """现代浅色描边：低对比度细边框（HIG.BORDER 系）。
+
+    color=None 时用中性边框色；传色则画主题色边（如青绿选中框）。
+    签名保留 base_alpha / glow_expand / color 以兼容既有调用。
     """
     if color is None:
-        cr, cg, cb = Glass.NEON_QCOLOR
+        cr, cg, cb = _hex_rgba(HIG.BORDER)[:3]   # #D8E1DC 弱化边框
+        alpha = 255
     else:
         cr, cg, cb = color[0], color[1], color[2]
-
-    # 第1层：最外层柔光扩散（大面积低透明度）
-    outer_a = max(6, int(base_alpha * 0.18))
-    p.setPen(QColor(cr, cg, cb, outer_a))
+        alpha = base_alpha
+    p.setPen(QColor(cr, cg, cb, alpha))
     p.setBrush(Qt.NoBrush)
-    ext = glow_expand + 3
-    path1 = QPainterPath()
-    path1.addRoundedRect(-ext * 0.5, -ext * 0.5, w + ext, h + ext, r + ext, r + ext)
-    p.drawPath(path1)
-
-    # 第2层：中层光晕
-    mid_a = max(10, int(base_alpha * 0.35))
-    p.setPen(QColor(cr, cg, cb, mid_a))
-    path2 = QPainterPath()
-    path2.addRoundedRect(-1, -1, w + 2, h + 2, r + 1, r + 1)
-    p.drawPath(path2)
-
-    # 第3层：内光晕
-    inner_a = max(15, int(base_alpha * 0.6))
-    p.setPen(QColor(cr, cg, cb, inner_a))
-    path3 = QPainterPath()
-    path3.addRoundedRect(0, 0, w, h, r, r)
-    p.drawPath(path3)
-
-    # 第4层：核心描边（最亮）
-    p.setPen(QColor(cr, cg, cb, base_alpha))
-    path4 = QPainterPath()
-    path4.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
-    p.drawPath(path4)
-
-    # 第5层：白色折射边（玻璃质感关键）
-    p.setPen(QColor(255, 255, 255, max(3, int(base_alpha * 0.12))))
-    path5 = QPainterPath()
-    path5.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
-    p.drawPath(path5)
+    path = QPainterPath()
+    path.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
+    p.drawPath(path)
 
 
 def _draw_top_highlight(p, w, h, r, intensity=6):
-    """绘制顶部折射高光 - 多层细腻渐变"""
-    # 主高光带（更窄更集中）
-    hl = QLinearGradient(0, 0, 0, int(h * 0.28))
-    hl.setColorAt(0, QColor(255, 255, 255, intensity))
-    hl.setColorAt(0.15, QColor(255, 255, 255, max(3, int(intensity * 0.7))))
-    hl.setColorAt(0.4, QColor(255, 255, 255, max(2, int(intensity * 0.35))))
-    hl.setColorAt(0.7, QColor(255, 255, 255, max(1, int(intensity * 0.15))))
-    hl.setColorAt(1, QColor(255, 255, 255, 0))
-    p.setPen(Qt.NoPen)
-    p.setBrush(hl)
-    p.drawRoundedRect(2, 1, w - 4, int(h * 0.28), r, r)
-    # 次高光带（更宽更淡，增加层次感）
-    hl2 = QLinearGradient(0, 0, 0, int(h * 0.45))
-    hl2.setColorAt(0, QColor(255, 255, 255, max(1, intensity // 3)))
-    hl2.setColorAt(0.5, QColor(255, 255, 255, max(1, intensity // 6)))
-    hl2.setColorAt(1, QColor(255, 255, 255, 0))
-    p.setBrush(hl2)
-    p.drawRoundedRect(4, 2, w - 8, int(h * 0.45), r, r)
+    """现代深色：不再绘制装饰性顶部高光（保留签名以兼容既有调用）。"""
+    return
 
 
 class GlassTitleBar(QWidget):
@@ -239,26 +193,14 @@ class GlassTitleBar(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
 
-        # 半透明背景
+        # 纯色标题栏底（与窗口底同色）
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(*_BG_TITLEBAR))
         p.drawRect(0, 0, w, h)
 
-        # 顶部折射高光
-        _draw_top_highlight(p, w, h, 0, intensity=7)
-
-        # 底部柔光描边
-        cr, cg, cb = Glass.NEON_QCOLOR
-        p.setPen(QColor(cr, cg, cb, 25))
+        # 底部 1px 弱化分隔线
+        p.setPen(QColor(216, 225, 220, 255))
         p.drawLine(0, h - 1, w, h - 1)
-
-        # 底部外溢光晕
-        glow = QLinearGradient(0, h - 6, 0, h)
-        glow.setColorAt(0, QColor(cr, cg, cb, 0))
-        glow.setColorAt(1, QColor(cr, cg, cb, 12))
-        p.setPen(Qt.NoPen)
-        p.setBrush(glow)
-        p.drawRect(0, h - 6, w, 6)
 
         p.end()
 
@@ -298,24 +240,30 @@ class GlassCard(QWidget):
         r = Glass.RADIUS_CARD
         offset = int(self._lift)
 
-        # 投影（hover时加深）
+        # 柔和投影（hover 时轻微加深，模拟卡片浮起，不得出现明显黑投影）
         if offset > 0:
-            shadow_alpha = min(40, 15 + offset * 5)
+            shadow_alpha = min(22, 8 + offset * 4)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, shadow_alpha))
-            p.drawRoundedRect(0, offset, w, h, r, r)
+            p.setBrush(QColor(38, 51, 66, shadow_alpha))
+            p.drawRoundedRect(0, offset + 1, w, h, r, r)
 
-        # 卡片背景
+        # 暖白卡片底 #FAFBF8（hover 时微亮）
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(*_BG_CARD))
+        if self._hovered:
+            p.setBrush(QColor(255, 255, 253, 255))
+        else:
+            p.setBrush(QColor(*_BG_CARD))
         p.drawRoundedRect(0, 0, w, h, r, r)
 
-        # 顶部折射高光
-        _draw_top_highlight(p, w, h, r, intensity=8 if self._hovered else 5)
-
-        # 多层柔光边框
-        alpha = 45 if self._hovered else 32
-        _draw_glow_border(p, w, h, r, base_alpha=alpha, glow_expand=4 if self._hovered else 3)
+        # 弱化边框（hover 时提亮）
+        if self._hovered:
+            p.setPen(QColor(*_hex_rgba(HIG.BORDER_HOVER)))
+        else:
+            p.setPen(QColor(*_hex_rgba(HIG.BORDER)))
+        p.setBrush(Qt.NoBrush)
+        path = QPainterPath()
+        path.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
+        p.drawPath(path)
 
         p.end()
 
@@ -392,12 +340,11 @@ class PulseGlow(QWidget):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        base_alpha = int(20 + 50 * self._pulse_value)
-        # v4.4.2(P2-17): 把构造时传入的 _color 透传给 _draw_glow_border,
-        # 否则 color 形参是死的(原恒用 NEON 色)。
+        # HIG 对齐：脉冲只做单层边框透明度变化，不再扩散光晕
+        alpha = int(80 + 120 * self._pulse_value)
         rgb = (self._color.red(), self._color.green(), self._color.blue())
-        _draw_glow_border(p, self.width(), self.height(), 10,
-                          base_alpha=base_alpha, glow_expand=4, color=rgb)
+        _draw_glow_border(p, self.width(), self.height(), Glass.RADIUS_CARD,
+                          base_alpha=alpha, glow_expand=0, color=rgb)
         p.end()
 
 
@@ -435,7 +382,7 @@ class StatusDot(QWidget):
     已经高度优化的绘制路径, 每秒 25 帧的圆点几乎零成本。
     """
 
-    def __init__(self, size=10, color=(52, 211, 153), alpha=170,
+    def __init__(self, size=10, color=(25, 132, 95), alpha=220,
                  parent=None):
         super().__init__(parent)
         self._size = int(size)

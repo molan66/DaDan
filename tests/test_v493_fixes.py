@@ -207,7 +207,7 @@ class TestExpiryUsesClockWatermark(_IsolatedState):
         sk = ed25519.Ed25519PrivateKey.generate()
         pk = sk.public_key().public_bytes_raw().hex()
         comps = ['BOARD-X', 'CPU-X', '', '']
-        digs = [L._slot_digest(L.SLOTS[i][0], comps[i]) for i in range(4)]
+        digs = [L._slot_digest(L.SLOT_TAGS[i], comps[i]) for i in range(4)]
         ad = (exp_date - datetime.date(2020, 1, 1)).days
         payload = (bytes([1]) + b''.join(digs)
                    + ad.to_bytes(4, 'big') + bytes([1]))

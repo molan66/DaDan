@@ -1,163 +1,210 @@
-"""Styles - 液态玻璃设计系统 v2
+"""styles.py - 设计令牌系统（ULTRA 旗舰浅色 · 深青绿强调）
 
-灵感: 小米澎湃OS / iOS液态玻璃
-核心: 半透明背景 + 霓虹描边 + 统一圆角 + 深度层次
+规范依据：ULTRA 设计系统 v6.0
+参考来源：Linear（信息密度与视觉注意力）、Vercel Geist（10 级色彩分层与
+组件背景/边框/文字三级递进）、Microsoft Fluent 2（组件状态完整性与可访问性）、
+WCAG 2.2 AA（文字对比度 ≥4.5:1、交互目标尺寸）。
+
+核心：雾白底 + 暖白卡片 + 浅灰分区 + 深青绿品牌色。四级层次（窗口/内容/
+卡片/浮层）明确区分，禁用纯白铺底、大面积渐变、荧光色与粗重描边。
+
+结构：
+  - HIG     —— 语义令牌（单一事实来源）
+  - Glass   —— 兼容层：保留全部历史字段名（全项目引用不破），值对齐 ULTRA
 """
 
 
+class HIG:
+    """ULTRA 浅色语义令牌（单一事实来源）。"""
+
+    # ===== 品牌色（深青绿 #087F73，沉稳旗舰感）=====
+    BRAND = '#087F73'             # 主色 / 选中 / 连接
+    BRAND_HOVER = '#07685F'
+    BRAND_PRESSED = '#06574F'
+    ON_BRAND = '#FFFFFF'          # 主色上的文字（白，对比度 ≥5:1）
+    BRAND_GLOW = 'rgba(8, 127, 115, 0.16)'
+
+    # ===== 语义色（浅底上保证 WCAG 对比度）=====
+    SUCCESS = '#19845F'           # 成功 / 胜利
+    SUCCESS_SUBTLE = 'rgba(25, 132, 95, 0.12)'   # 成功/胜利 浅底
+    WARN = '#B77928'              # 警告 / 连接中 / 预输入
+    PREF = '#2E6E9E'              # 偏好 / 收藏（浅底可读蓝）
+    DANGER = '#C34F55'            # 危险 / 停止 / 失败
+    DANGER_HOVER = '#AF444A'
+    DANGER_PRESSED = '#9C3A40'
+    DANGER_SUBTLE = '#FBEAEA'     # 危险浅色背景（验收文档指定）
+    BRAND_BG = '#DDF2EC'          # 品牌浅色背景（验收文档指定）
+
+    # ===== 背景四级（窗口 → 内容 → 卡片 → 浮层）=====
+    BG_WINDOW = '#F2F4F1'         # L0 应用主背景（雾白）
+    BG_SIDEBAR = '#E9EFEC'        # L0b 侧边导航（浅灰绿）
+    BG_CONTENT = '#F5F7F4'        # L1 主要内容背景
+    BG_CARD = '#FAFBF8'           # L2 主卡片（暖白）
+    BG_CARD_ALT = '#EAF0ED'       # L2b 次级内容 / 分区
+    BG_ELEVATED = '#FDFEFC'       # L3 弹层 / 菜单
+    BG_INSET = '#EDF1EE'          # 内凹（输入框 / 日志 / 占位）
+    BG_HOVER = 'rgba(8, 127, 115, 0.08)'      # 悬停：淡青绿提示
+    BG_PRESSED = 'rgba(8, 127, 115, 0.14)'
+
+    # ===== 边框（弱化，三级递进：默认 / hover / active）=====
+    BORDER = '#D8E1DC'            # 常规边框
+    BORDER_HOVER = '#C2CFC8'      # hover 边框
+    BORDER_STRONG = '#ADBFB6'     # 强调边框
+    SEPARATOR = '#D8E1DC'
+
+    # ===== 文字层级 =====
+    TEXT_PRIMARY = '#202D35'      # 深灰蓝（非纯黑）
+    TEXT_SECONDARY = '#52616D'
+    TEXT_MUTED = '#5E6C75'
+    TEXT_DISABLED = '#9AA6AC'
+    TEXT_ON_PRIMARY = '#FFFFFF'
+
+    # ===== 间距（4px 基础体系）=====
+    SPACE_SMALL = 4
+    SPACE_MEDIUM = 8
+    SPACE_LARGE = 12
+    SPACE_XL = 16
+    SPACE_XX = 20
+    SPACE_XXL = 24
+    GRID_UNIT = 4
+
+    # ===== 圆角档位 =====
+    RADIUS_WIN = 16               # 窗口外框
+    RADIUS_CARD = 14              # 大面板 / 卡片
+    RADIUS_BTN = 10               # 按钮
+    RADIUS_SM = 8                 # 小元素 / 内部数据卡
+    RADIUS_PILL = 999             # 胶囊
+
+    # ===== 字号（WCAG 可读，逐级清晰）=====
+    FONT_SIZE_XS = '12px'         # 辅助说明
+    FONT_SIZE_SM = '13px'         # 辅助
+    FONT_SIZE_MD = '14px'         # 正文 / 数据
+    FONT_SIZE_LG = '16px'         # 卡片标题 / 强调正文
+    FONT_SIZE_XL = '18px'         # 区域标题
+    FONT_SIZE_XXL = '22px'        # 页面标题
+
+
 class Glass:
-    """液态玻璃配色系统 - 统一规范"""
+    """兼容层：保留历史字段名，值统一对齐 ULTRA（不再维护旧浅色色板）。
 
-    # ===== 背景层级（由底到顶，透明度递增）=====
-    BG_BASE = 'rgba(14, 16, 24, 0.60)'         # 窗口底层 - 60%
-    BG_GLASS = 'rgba(16, 18, 26, 0.65)'        # 玻璃层 - 65%
-    BG_CARD = 'rgba(16, 18, 28, 0.90)'         # 卡片层 - 90%（确保文字可读）
-    BG_ELEVATED = 'rgba(22, 24, 36, 0.92)'     # 顶层 - 92%
-    BG_HOVER = 'rgba(255, 255, 255, 0.05)'     # 悬浮反馈
-    BG_PRESSED = 'rgba(255, 255, 255, 0.08)'   # 按下反馈
-    BG_INPUT = 'rgba(14, 16, 24, 0.95)'        # 输入框
+    新代码请直接用 HIG.*；旧引用点无需改动即可获得新视觉。
+    """
 
-    # v4.4.0 修复(P2 设计令牌): 以下三个值原本散落在 main_window/champion_picker/
-    # overlay_window 里当内联字符串硬写, 同一种底色出现 3~4 份拷贝, 改主题要满项目搜。
-    # 集中到这里, 调用点一律用 Glass.XXX 引用, 不要再各页各写一份。
-    BG_SIDEBAR = 'rgba(10, 12, 20, 0.65)'      # 主窗左侧导航条
-    BG_LIST_ITEM = '#1c1c28'                   # 英雄选择器右侧面板底
-    BG_LIST_ROW = '#131320'                    # 英雄选择器已选列表 / 排序按钮底
-    BG_OVERLAY_DOT = 'rgba(10, 12, 20, 0.01)'  # 小窗标题栏(近全透明, 仅占位接收拖拽)
-    BG_SEPARATOR = 'rgba(255, 255, 255, 0.07)'  # 小窗 mini_log 上方的 1px 分隔线
-    # v4.4.1(UI-B7): 托盘右键菜单底 —— 故意用**不透明**色。
-    # 菜单是独立的顶层弹出窗口, 半透明底在部分系统主题/关掉合成的环境下会露出
-    # 桌面或渲染成灰块; 这种小面积弹层不值得冒该风险。
-    BG_MENU = '#191b25'
+    # ===== 背景层级 =====
+    BG_BASE = HIG.BG_WINDOW
+    BG_GLASS = HIG.BG_WINDOW
+    BG_CONTENT = HIG.BG_CONTENT
+    BG_CARD = HIG.BG_CARD
+    BG_CARD_ALT = HIG.BG_CARD_ALT
+    BG_ELEVATED = HIG.BG_ELEVATED
+    BG_HOVER = HIG.BG_HOVER
+    BG_PRESSED = HIG.BG_PRESSED
+    BG_INPUT = HIG.BG_INSET
+    BG_INSET = HIG.BG_INSET
 
-    # ===== 霓虹描边 =====
-    NEON_BORDER = 'rgba(99, 102, 241, 0.18)'     # 靛蓝霓虹
-    NEON_BORDER_HOVER = 'rgba(99, 102, 241, 0.30)'
-    NEON_GLOW = 'rgba(99, 102, 241, 0.08)'       # 外发光
-    BORDER_GLASS = 'rgba(255, 255, 255, 0.06)'   # 玻璃折射边
-    BORDER_HOVER = 'rgba(255, 255, 255, 0.10)'
+    BG_SIDEBAR = HIG.BG_SIDEBAR
+    BG_LIST_ITEM = HIG.BG_CARD_ALT
+    BG_LIST_ROW = 'rgba(0, 0, 0, 0.025)'
+    BG_OVERLAY_DOT = 'rgba(242, 244, 241, 0.02)'
+    BG_SEPARATOR = HIG.SEPARATOR
+    BG_MENU = HIG.BG_ELEVATED
 
-    # ===== 品牌色（靛蓝）=====
-    PRIMARY = '#6366f1'
-    PRIMARY_HOVER = '#818cf8'
-    PRIMARY_PRESSED = '#4f46e5'
-    PRIMARY_GLOW = 'rgba(99, 102, 241, 0.15)'
-    PRIMARY_SUBTLE = 'rgba(99, 102, 241, 0.10)'
+    # ===== 边框（浅色弱化）=====
+    BORDER = HIG.BORDER
+    BORDER_STRONG = HIG.BORDER_STRONG
+    NEON_BORDER = HIG.BORDER
+    NEON_BORDER_HOVER = HIG.BORDER_HOVER
+    NEON_GLOW = 'transparent'
+    BORDER_GLASS = HIG.BORDER
+    BORDER_HOVER = HIG.BORDER_HOVER
 
-    # v4.4.0 修复(P2): 品牌色透明度令牌 —— 原 champion_picker 里 rgba(99,102,241,x)
-    # 散落各 QSS 内联, 与 PRIMARY 语义同源却各有各的透明度写法。集中到这里:
-    # 名字 = PRIMARY_透明度百分比。改动品牌色时只需改 PRIMARY 一处。
-    PRIMARY_06 = 'rgba(99, 102, 241, 0.06)'
-    PRIMARY_10 = 'rgba(99, 102, 241, 0.10)'
-    PRIMARY_12 = 'rgba(99, 102, 241, 0.12)'
-    PRIMARY_18 = 'rgba(99, 102, 241, 0.18)'
-    PRIMARY_20 = 'rgba(99, 102, 241, 0.20)'
-    PRIMARY_30 = 'rgba(99, 102, 241, 0.30)'
-    PRIMARY_40 = 'rgba(99, 102, 241, 0.40)'
+    # ===== 品牌色（深青绿 #087F73）=====
+    PRIMARY = HIG.BRAND
+    PRIMARY_HOVER = HIG.BRAND_HOVER
+    PRIMARY_PRESSED = HIG.BRAND_PRESSED
+    PRIMARY_GLOW = HIG.BRAND_GLOW
+    PRIMARY_SUBTLE = 'rgba(8, 127, 115, 0.10)'
 
-    # ===== 语义色 =====
-    ACCENT = '#34d399'
-    DANGER = '#f87171'
-    DANGER_SUBTLE = 'rgba(248, 113, 113, 0.10)'
-    # v4.4.0 修复(P2): DANGER 透明度令牌, 供 champion_picker 清空按钮 hover 描边使用
-    DANGER_30 = 'rgba(248, 113, 113, 0.30)'
-    WARNING = '#fbbf24'
-    # v4.4.0 修复(P3): SUCCESS 与 ACCENT 同值, 收口为别名避免两处漂移
-    SUCCESS = ACCENT
+    PRIMARY_06 = 'rgba(8, 127, 115, 0.06)'
+    PRIMARY_10 = 'rgba(8, 127, 115, 0.10)'
+    PRIMARY_12 = 'rgba(8, 127, 115, 0.12)'
+    PRIMARY_18 = 'rgba(8, 127, 115, 0.18)'
+    PRIMARY_20 = 'rgba(8, 127, 115, 0.20)'
+    PRIMARY_30 = 'rgba(8, 127, 115, 0.30)'
+    PRIMARY_40 = 'rgba(8, 127, 115, 0.40)'
 
-    # v4.4.1(UI-B5): 连接"中间态"专用色(与 WARNING 同值, 但语义独立)。
-    # 原来连接指示只有红/绿两态, 于是"应用刚启动、正在扫客户端"和"客户端真的
-    # 没开"显示得一模一样(都是红色未连接), 用户会以为软件坏了。中间态用琥珀,
-    # 与"断开"的红色"危险语义"区分开。
-    CONNECTING = WARNING
+    ACCENT = HIG.BRAND
+    ACCENT_BG = HIG.BRAND_BG
+    DANGER = HIG.DANGER
+    DANGER_BG = HIG.DANGER_SUBTLE
+    DANGER_SUBTLE = 'rgba(195, 79, 85, 0.10)'
+    DANGER_30 = 'rgba(195, 79, 85, 0.30)'
+    WARNING = HIG.WARN
+    SUCCESS = HIG.SUCCESS
+    SUCCESS_SUBTLE = HIG.SUCCESS_SUBTLE
+    CONNECTING = HIG.WARN
 
-    # v4.4.1(UI-A2): 按钮三档色。原来 ACCENT/DANGER 的 hover/pressed/渐变末端
-    # 散落在 overlay_window 里硬写成 #6ee7b7/#059669/#047857/#fca5a5/#dc2626/#b91c1c,
-    # 且 hover 渐变写成 `stop:0 X, stop:0 Y`(两档同一个 stop, 后半段被丢弃 → 描边
-    # 颜色不生效/渐变退化成纯色)。集中到这里, 语义色只有一处定义。
-    ACCENT_HOVER = '#6ee7b7'
-    ACCENT_DARK = '#059669'
-    ACCENT_PRESSED = '#047857'
-    DANGER_HOVER = '#fca5a5'
-    DANGER_DARK = '#dc2626'
-    DANGER_PRESSED = '#b91c1c'
+    ACCENT_HOVER = HIG.BRAND_HOVER
+    ACCENT_DARK = HIG.BRAND_PRESSED
+    ACCENT_PRESSED = HIG.BRAND_PRESSED
+    DANGER_HOVER = HIG.DANGER_HOVER
+    DANGER_DARK = '#B0484E'
+    DANGER_PRESSED = HIG.DANGER_PRESSED
 
-    # v4.4.1(UI-A1): 主窗启动按钮的"红色(停止)"三档 —— 原先 3 处硬编 hex
-    STOP_RED = '#dc2626'
-    STOP_RED_HOVER = '#b91c1c'
-    STOP_RED_PRESSED = '#991b1b'
+    STOP_RED = HIG.DANGER
+    STOP_RED_HOVER = HIG.DANGER_HOVER
+    STOP_RED_PRESSED = HIG.DANGER_PRESSED
 
-    # v4.4.1(UI-A6): 偏好态翠绿。原来 overlay_window 的偏好英雄框用
-    # rgba(34,197,94,*) = #22c55e, 与 ACCENT(#34d399) 并存 —— 全项目第三种绿。
-    # 统一由 ACCENT 派生(54→52 微调到 ACCENT 的 52,211,153), 语义绿只此一处。
-    ACCENT_SUBTLE = 'rgba(52, 211, 153, 0.10)'
-    ACCENT_SOFT = 'rgba(52, 211, 153, 0.18)'
-    ACCENT_BORDER = 'rgba(52, 211, 153, 0.85)'
-    ACCENT_BORDER_HOVER = 'rgba(52, 211, 153, 1.0)'
+    ACCENT_SUBTLE = 'rgba(8, 127, 115, 0.09)'
+    ACCENT_SOFT = 'rgba(8, 127, 115, 0.14)'
+    ACCENT_BORDER = 'rgba(8, 127, 115, 0.85)'
+    ACCENT_BORDER_HOVER = 'rgba(8, 127, 115, 1.0)'
 
-    # v4.9.13(用户要求): 小窗「预输入选英雄」态 = 蓝光。
-    # 与"偏好绿 / 当前选中靛"同屏并存, 所以三个颜色必须一眼可分。
-    # 取偏青的 sky-400(#38bdf8) 而不是再深一档的蓝: 靛(#6366f1)本身就在蓝区,
-    # 两枚 52px 头像挨在一起时, 同色相不同明度**肉眼分不出来**(已在本机小窗
-    # 实测过 #6366f1 vs #3b82f6 的对比度不足)。sky-400 明度高、偏青, 与靛拉开。
-    PREINPUT = '#38bdf8'
-    PREINPUT_SUBTLE = 'rgba(56, 189, 248, 0.12)'
-    PREINPUT_SOFT = 'rgba(56, 189, 248, 0.20)'
-    PREINPUT_BORDER = 'rgba(56, 189, 248, 0.90)'
-    PREINPUT_BORDER_HOVER = 'rgba(56, 189, 248, 1.0)'
+    # 预输入 = 温和橙（非默认状态），配合形状角标，不单靠颜色
+    PREINPUT = HIG.WARN
+    PREINPUT_SUBTLE = 'rgba(183, 121, 40, 0.12)'
+    PREINPUT_SOFT = 'rgba(183, 121, 40, 0.20)'
+    PREINPUT_BORDER = 'rgba(183, 121, 40, 0.90)'
+    PREINPUT_BORDER_HOVER = 'rgba(183, 121, 40, 1.0)'
 
-    # ===== 海克斯强化稀有度色（v4.4.20）=====
-    # 起因: 用户反馈"海克斯好多没有颜色"。实测 LCU 的 augmentSmallIconPath
-    # 指向的 *_small.png 绝大多数是**纯白剪影蒙版**(整图只有 #ffffff+透明),
-    # 官方客户端是把它当遮罩、按稀有度现染色的; 我们原样贴图, 于是九成格子发白。
-    # ⚠️ 比例随版本变(16.21 实测 594 条里 527 条白蒙版), 且**不是全部** ——
-    #    仍有约 67 条自带颜色, 其中 5 条 kEventChoice 也是白蒙版。见 AUG_EVENT 说明。
-    #
-    # 取值不是拍脑袋: 直接采样官方自带的稀有度占位图
-    # (Kiwi/Augments/Icons/GenericAbilityAugmentIcon_{Silver,Gold,Prismatic}.png)
-    # 的主色, 保证与游戏内观感同源 —— 改这三个值等于改"游戏里那个颜色"。
-    #   Silver    #adc2c6   冷银灰
-    #   Gold      #e3c49f   暖金
-    #   Prismatic 官方是纯白描边 + 彩虹高光, 蒙版单色染不出彩虹, 取偏品红的
-    #             亮色以与 Gold 拉开区分度(纯白会和 Silver 的白蒙版混淆)
-    AUG_SILVER = '#adc2c6'
-    AUG_GOLD = '#e3c49f'
-    AUG_PRISMATIC = '#e8b3ff'
-    # kEventChoice(事件类)多数官方图自带颜色, 不会被着色; 这里只作为兜底同名键,
-    # 与 Gold 同值以免将来出现未着色的事件图标时观感突兀。
-    # ⚠️ 但**不能假设 kEventChoice 一定自带颜色**: 16.21 实测 25 条 kEventChoice
-    #    里有 5 条(340/341/342/355/364)是白蒙版, 会真的走到这条着色分支。
-    AUG_EVENT = '#e3c49f'
+    # 偏好 = 浅底可读蓝
+    PREF_BORDER = 'rgba(46, 110, 158, 0.85)'
 
-    # ===== 文字色（对比度 7:1+）=====
-    TEXT_PRIMARY = '#ffffff'        # 主文字 - 纯白
-    TEXT_SECONDARY = '#c8c8d8'     # 次文字 - 亮灰
-    TEXT_MUTED = '#9aa0b8'         # 弱化文字 - 中亮灰（v15：原 #8888a0 在玻璃透底时跌破 4.5:1，提亮一档保 AA）
-    TEXT_ON_PRIMARY = '#ffffff'
+    # 海克斯强化稀有度色（游戏内容色，非 UI 状态色，保留）
+    AUG_SILVER = '#6F7E86'
+    AUG_GOLD = '#9A742E'
+    AUG_PRISMATIC = '#8A5FA0'
+    AUG_EVENT = '#9A742E'
 
-    # ===== 统一圆角规范 =====
-    RADIUS_WIN = 12      # 窗口级（DWM 原生圆角）
-    RADIUS_CARD = 10     # 卡片/面板
-    RADIUS_BTN = 8       # 按钮/开关
-    RADIUS_SM = 6        # 小元素（输入框、进度条）
+    # ===== 文字色 =====
+    TEXT_PRIMARY = HIG.TEXT_PRIMARY
+    TEXT_SECONDARY = HIG.TEXT_SECONDARY
+    TEXT_MUTED = HIG.TEXT_MUTED
+    TEXT_DISABLED = HIG.TEXT_DISABLED
+    TEXT_ON_PRIMARY = HIG.TEXT_ON_PRIMARY
 
-    # 兼容旧代码
-    RADIUS_MD = RADIUS_BTN
-    RADIUS_LG = RADIUS_CARD
-    RADIUS_XL = 14
-    RADIUS_XS = 6
+    # ===== 统一圆角 =====
+    RADIUS_WIN = HIG.RADIUS_WIN
+    RADIUS_CARD = HIG.RADIUS_CARD
+    RADIUS_BTN = HIG.RADIUS_BTN
+    RADIUS_SM = HIG.RADIUS_SM
+    RADIUS_MD = HIG.RADIUS_BTN
+    RADIUS_LG = HIG.RADIUS_CARD
+    RADIUS_XL = HIG.RADIUS_WIN
+    RADIUS_XS = HIG.RADIUS_SM
 
     # ===== 字号 =====
-    FONT_SIZE_XS = '11px'
-    FONT_SIZE_SM = '12px'
-    FONT_SIZE_MD = '13px'
-    FONT_SIZE_LG = '14px'
-    FONT_SIZE_XL = '16px'
+    FONT_SIZE_XS = HIG.FONT_SIZE_XS
+    FONT_SIZE_SM = HIG.FONT_SIZE_SM
+    FONT_SIZE_MD = HIG.FONT_SIZE_MD
+    FONT_SIZE_LG = HIG.FONT_SIZE_LG
+    FONT_SIZE_XL = HIG.FONT_SIZE_XL
+    FONT_SIZE_XXL = HIG.FONT_SIZE_XXL
 
-    # ===== 霓虹描边颜色值（QColor 用）=====
-    NEON_QCOLOR = (99, 102, 241)     # #6366f1 RGB
-    NEON_ALPHA_MIN = 15              # 静态最低透明度
-    NEON_ALPHA_MAX = 40              # 脉冲最高透明度
+    # ===== 描边颜色值（QColor 用）=====
+    NEON_QCOLOR = (8, 127, 115)      # 对齐深青绿 #087F73
+    NEON_ALPHA_MIN = 15
+    NEON_ALPHA_MAX = 40
 
     # ===== 输入框 =====
     INPUT_STYLE = f"""
@@ -165,33 +212,35 @@ class Glass:
             background-color: {BG_INPUT};
             color: {TEXT_PRIMARY};
             border: 1px solid {NEON_BORDER};
-            border-radius: {RADIUS_SM};
+            border-radius: {RADIUS_BTN};
             padding: 8px 12px;
-            font-size: {FONT_SIZE_SM};
+            font-size: {FONT_SIZE_MD};
             selection-background-color: {PRIMARY};
+            selection-color: {TEXT_ON_PRIMARY};
         }}
         QLineEdit:focus {{
             border-color: {PRIMARY};
         }}
+        QLineEdit:disabled {{
+            color: {TEXT_MUTED};
+            background-color: {BG_INPUT};
+        }}
     """
 
-    # ===== 统一细滚动条（全项目唯一来源，勿再各页各写一份）=====
-    # v4.3.0: 之前首页/设置页各写一份、英雄页偏好列表和小窗干脆没写 → 露出 Windows 原生
-    # 粗滚动条(带箭头/凹槽), 各页观感不一致。这里集中一份, 所有
-    # QScrollArea / QListWidget / QTextEdit 复用: `bg_qss + Glass.SCROLL_QSS`。
+    # ===== 统一细滚动条（全项目唯一来源）=====
     SCROLL_QSS = """
         QScrollBar:vertical {
             background: transparent;
-            width: 4px;
-            margin: 0;
+            width: 8px;
+            margin: 2px;
         }
         QScrollBar::handle:vertical {
-            background: rgba(255, 255, 255, 0.10);
-            border-radius: 2px;
+            background: rgba(32, 45, 53, 0.18);
+            border-radius: 4px;
             min-height: 30px;
         }
         QScrollBar::handle:vertical:hover {
-            background: rgba(255, 255, 255, 0.22);
+            background: rgba(32, 45, 53, 0.32);
         }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
@@ -201,16 +250,16 @@ class Glass:
         }
         QScrollBar:horizontal {
             background: transparent;
-            height: 4px;
-            margin: 0;
+            height: 8px;
+            margin: 2px;
         }
         QScrollBar::handle:horizontal {
-            background: rgba(255, 255, 255, 0.10);
-            border-radius: 2px;
+            background: rgba(32, 45, 53, 0.18);
+            border-radius: 4px;
             min-width: 30px;
         }
         QScrollBar::handle:horizontal:hover {
-            background: rgba(255, 255, 255, 0.22);
+            background: rgba(32, 45, 53, 0.32);
         }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;
@@ -220,24 +269,20 @@ class Glass:
         }
     """
 
-    # ===== 托盘右键菜单（v4.4.1 UI-B7）=====
-    # 原托盘 QMenu 裸用系统默认渲染: 浅色底 + 系统字体, 与整个应用的深色玻璃
-    # 观感完全脱节。这里给一份深色 QSS —— 注意 QMenu 是**系统弹出窗口**,
-    # 部分系统主题/高对比度模式下 Qt 会忽略自定义样式, 那属于可接受的降级
-    # (回落到原生菜单, 不会渲染坏), 所以只做"锦上添花"式着色, 不依赖它承重。
+    # ===== 托盘右键菜单 =====
     MENU_QSS = f"""
         QMenu {{
             background-color: {BG_MENU};
-            color: {TEXT_SECONDARY};
+            color: {TEXT_PRIMARY};
             border: 1px solid {NEON_BORDER};
             border-radius: {RADIUS_SM}px;
             padding: 4px;
         }}
         QMenu::item {{
             background: transparent;
-            padding: 6px 22px 6px 12px;
-            border-radius: 4px;
-            font-size: {FONT_SIZE_SM};
+            padding: 7px 24px 7px 14px;
+            border-radius: 5px;
+            font-size: {FONT_SIZE_MD};
         }}
         QMenu::item:selected {{
             background-color: {PRIMARY_SUBTLE};
@@ -259,11 +304,11 @@ class Glass:
     # ===== 日志 =====
     LOG_STYLE = f"""
         QTextEdit {{
-            background-color: rgba(12, 14, 20, 0.85);
+            background-color: {BG_INPUT};
             color: {TEXT_SECONDARY};
             border: 1px solid {NEON_BORDER};
             border-radius: {RADIUS_CARD};
-            font-size: {FONT_SIZE_XS};
+            font-size: {FONT_SIZE_SM};
             font-family: 'Cascadia Code', 'Consolas', 'Microsoft YaHei UI', 'Microsoft YaHei', monospace;
             padding: 12px;
             selection-background-color: {PRIMARY};

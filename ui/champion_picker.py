@@ -1,4 +1,4 @@
-"""Champion Picker - 液态玻璃风格英雄偏好选择器（左网格 + 右已选列表）"""
+"""Champion Picker - ULTRA 英雄偏好选择器（左网格 + 右已选列表）"""
 
 from typing import Dict, List
 from PyQt5.QtWidgets import (
@@ -20,6 +20,9 @@ LIST_ICON_PX = 28               # 右侧已选列表图标边长
 # v4.4.0 修复(P3 魔法数字): 卡片尺寸 / 图标批量加载 / 失败上限抽成模块级常量
 CARD_W = 56                     # 英雄卡宽
 CARD_H = 60                     # 英雄卡高
+GRID_GAP = 10                   # 网格间距（用户反馈 6 太挤）
+GRID_GAP_MIN_COLS = 4           # 自适应列数下限
+GRID_GAP_MAX_COLS = 9           # 自适应列数上限
 ICON_TICK_BATCH = 16            # 每个 tick 最多提交的下载请求数
 ICON_FAIL_LIMIT = 8             # 连续失败上限, 超过则放弃该英雄图标
 
@@ -37,7 +40,7 @@ except Exception:
 
 
 class ChampionCard(QPushButton):
-    """英雄头像卡片（液态玻璃风格）"""
+    """英雄头像卡片（ULTRA 浅色）"""
 
     def __init__(self, cid, name, parent=None):
         super().__init__(parent)
@@ -71,21 +74,27 @@ class ChampionCard(QPushButton):
         if self._has_icon:
             self.setText('')
             self.setStyleSheet(f"""
-                QPushButton{{background:rgba(20,22,30,140);border:none;border-radius:8px;padding:1px;}}
-                QPushButton:hover{{background:{Glass.PRIMARY_06};}}
+                QPushButton{{background:{Glass.BG_CARD};border:1px solid {Glass.BORDER_GLASS};
+                    border-radius:{Glass.RADIUS_SM}px;padding:1px;}}
+                QPushButton:hover{{background:{Glass.PRIMARY_SUBTLE};
+                    border-color:{Glass.PRIMARY_40};}}
             """)
         else:
             self.setText(self.name[:2] if self.name else '?')
             self.setStyleSheet(f"""
-                QPushButton{{background:rgba(20,22,30,120);border:none;border-radius:8px;padding:1px;{self._text_qss()}}}
+                QPushButton{{background:{Glass.BG_INPUT};border:1px solid {Glass.BORDER_GLASS};
+                    border-radius:{Glass.RADIUS_SM}px;padding:1px;{self._text_qss()}}}
+                QPushButton:hover{{border-color:{Glass.BORDER_HOVER};}}
             """)
 
     def set_selected(self, sel):
         self._sel = sel
         if sel:
             self.setStyleSheet(f"""
-                QPushButton{{background:{Glass.PRIMARY_12};border:1px solid {Glass.PRIMARY_30};border-radius:8px;padding:1px;{self._text_qss()}}}
-                QPushButton:hover{{background:{Glass.PRIMARY_18};}}
+                QPushButton{{background:{Glass.PRIMARY_SUBTLE};
+                    border:2px solid {Glass.PRIMARY};border-radius:{Glass.RADIUS_SM}px;
+                    padding:1px;{self._text_qss()}}}
+                QPushButton:hover{{background:{Glass.PRIMARY_12};}}
             """)
         else:
             self._apply_normal()
@@ -104,13 +113,13 @@ class ChampionCard(QPushButton):
         super().paintEvent(event)
         if not self.underMouse() or self._sel:
             return
-        # 液态玻璃 hover 发光效果
+        # hover 轻量品牌色提示
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
 
-        # 外层光晕
-        glow = QColor(99, 102, 241, 25)
+        # 品牌青绿微底
+        glow = QColor(8, 127, 115, 25)
         painter.setPen(Qt.NoPen)
         painter.setBrush(glow)
         painter.drawRoundedRect(QRectF(0, 0, w, h), 8, 8)
@@ -174,7 +183,7 @@ class ChampionCard(QPushButton):
 
 
 class ChampionPickerWidget(QWidget):
-    """英雄偏好选择器 - 液态玻璃风格"""
+    """英雄偏好选择器 - ULTRA 浅色"""
     champions_selected = pyqtSignal(list)
     # v4.4.0 修复(P2 死代码): 原此处有 `icon_ready = pyqtSignal(int, bytes)`,
     # 全项目 grep 确认只有定义行、**从未 emit 也从未 connect**(图标回填走
@@ -204,6 +213,7 @@ class ChampionPickerWidget(QWidget):
         self._shown_ids = set()
         self._sel_state: Dict[int, bool] = {}
         self._pending_search = None
+        self._max_cols = self.MAX_COLS   # 自适应列数（resizeEvent 动态调整）
         self._init_ui()
 
     def _init_ui(self):
@@ -222,7 +232,7 @@ class ChampionPickerWidget(QWidget):
         fr = QHBoxLayout()
         fr.setSpacing(4)
         self._input = QLineEdit()
-        self._input.setPlaceholderText('🔍 搜索')
+        self._input.setPlaceholderText('搜索')
         self._input.setMaximumWidth(140)
         self._input.setStyleSheet(Glass.INPUT_STYLE)
         # v4.4.0 修复(P1-20): 原来 textChanged 直连 _on_search —— 每敲一个字符
@@ -258,8 +268,9 @@ class ChampionPickerWidget(QWidget):
         inner.setStyleSheet('background:transparent;')
         self._gl = QGridLayout(inner)
         self._gl.setContentsMargins(0, 0, 0, 0)
-        self._gl.setSpacing(6)
+        self._gl.setSpacing(GRID_GAP)
         self._gl.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self._scroll = scroll
         scroll.setWidget(inner)
         ll.addWidget(scroll, 1)
 
@@ -353,7 +364,7 @@ class ChampionPickerWidget(QWidget):
         clear_btn.setFixedHeight(24)
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.setStyleSheet(f"""
-            QPushButton{{background:transparent;color:{Glass.TEXT_MUTED};border:1px solid rgba(255,255,255,0.04);border-radius:6px;font-size:{Glass.FONT_SIZE_XS};padding:0 6px;}}
+            QPushButton{{background:transparent;color:{Glass.TEXT_MUTED};border:1px solid rgba(0,0,0,0.10);border-radius:6px;font-size:{Glass.FONT_SIZE_XS};padding:0 6px;}}
             QPushButton:hover{{color:{Glass.DANGER};border-color:{Glass.DANGER_30};}}
         """)
         clear_btn.clicked.connect(self._clear)
@@ -493,7 +504,7 @@ class ChampionPickerWidget(QWidget):
                 self._gl.addWidget(self._cards[cid], r, c)
                 shown.add(cid)
                 c += 1
-                if c >= self.MAX_COLS:
+                if c >= self._max_cols:
                     c = 0
                     r += 1
         # _shown_ids/_sel_state 已在 __init__ 初始化, 这里直接增量更新可见性
@@ -508,6 +519,45 @@ class ChampionPickerWidget(QWidget):
             if self._sel_state.get(cid) != sel:
                 card.set_selected(sel)
         self._sel_state = {cid: (cid in self._preferred) for cid in self._cards}
+
+    def _recalc_cols(self):
+        """按当前视口宽度重算列数并按需重排。"""
+        try:
+            vw = self._scroll.viewport().width()
+        except Exception:
+            return
+        if vw < 100:
+            return
+        cols = max(GRID_GAP_MIN_COLS,
+                   min(GRID_GAP_MAX_COLS, vw // (CARD_W + GRID_GAP)))
+        if cols != self._max_cols:
+            self._max_cols = cols
+            self._rebuild_grid()
+
+    def showEvent(self, event):
+        # 首次显示时布局才定型 —— resizeEvent 拿到的 viewport 宽度可能还是
+        # 构造期的默认值, 延迟到布局完成后校准一次列数。
+        super().showEvent(event)
+        QTimer.singleShot(0, self._recalc_cols)
+
+    def resizeEvent(self, event):
+        """列数随宽度自适应（用户反馈：网格间距挤、两侧留白大）。
+
+        按滚动区视口宽度计算可容纳列数（4~9），跨越阈值时重排网格，
+        让卡片行基本铺满可用宽度，消除大片侧向留白。
+        """
+        super().resizeEvent(event)
+        try:
+            vw = self._scroll.viewport().width()
+        except Exception:
+            return
+        if vw < 100:
+            return
+        cols = max(GRID_GAP_MIN_COLS,
+                   min(GRID_GAP_MAX_COLS, vw // (CARD_W + GRID_GAP)))
+        if cols != self._max_cols:
+            self._max_cols = cols
+            self._rebuild_grid()
 
     def _set_card_selected(self, cid, sel):
         """v4.4.0 修复(P1-20): set_selected 带样式重写, 统一走这里保持 _sel_state 同步。"""

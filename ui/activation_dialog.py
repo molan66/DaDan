@@ -299,7 +299,7 @@ class ActivationDialog(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet(
-            f"QScrollArea{{background:rgba(12,14,24,0.45);"
+            f"QScrollArea{{background:rgba(0,0,0,0.04);"
             f"border:1px solid {Glass.NEON_BORDER};border-radius:{Glass.RADIUS_CARD};}}"
             f"QScrollArea > QWidget > QWidget {{background:transparent;}}"
             + Glass.SCROLL_QSS)
@@ -354,7 +354,7 @@ class ActivationDialog(QWidget):
             }}
             QPushButton:pressed {{ background: {Glass.PRIMARY_PRESSED}; padding-top: 2px; }}
             QPushButton:disabled {{
-                background: rgba(255,255,255,0.06); color: {Glass.TEXT_MUTED};
+                background: rgba(0,0,0,0.05); color: {Glass.TEXT_MUTED};
             }}
         """)
 
@@ -362,7 +362,7 @@ class ActivationDialog(QWidget):
     def _style_ghost_btn(btn):
         btn.setStyleSheet(f"""
             QPushButton {{
-                background: rgba(255,255,255,0.06);
+                background: rgba(0,0,0,0.05);
                 color: {Glass.TEXT_SECONDARY};
                 border: 1px solid {Glass.BORDER_GLASS};
                 border-radius: {Glass.RADIUS_BTN};

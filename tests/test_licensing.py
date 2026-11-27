@@ -279,8 +279,8 @@ class TestMachineFingerprint(unittest.TestCase):
         否则"主板序列号恰好等于 CPU ID"这种巧合会让槽位互相冒充。
         """
         v = 'SAME-VALUE-1234'
-        d0 = L._slot_digest(L.SLOTS[0][0], v)
-        d1 = L._slot_digest(L.SLOTS[1][0], v)
+        d0 = L._slot_digest(L.SLOT_TAGS[0], v)
+        d1 = L._slot_digest(L.SLOT_TAGS[1], v)
         self.assertNotEqual(d0, d1)
 
 

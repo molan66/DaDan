@@ -1,15 +1,12 @@
-"""Overlay Window - 液态玻璃风格小窗 v12
+"""Overlay Window - ULTRA 浅色悬浮控制窗
 
-v12 改动（用户明确诉求：只动日志区，不要改"上面"区域）：
-- 备选英雄头像宫格已回 v10 完整形态（4×N ChampionIcon + PulseGlow + ScrollArea）
-- mini_log 4 行 → 5 行（用户明确指定）
-- 删 v11 临时加入的"偏好/当前/即将切换"三行 widget 与对应 API
-- 窗口尺寸回 v10 的 300×420（容下备选宫格）
+- 备选英雄头像宫格（4×N ChampionIcon + PulseGlow + ScrollArea）
+- mini_log 5 行
+- 窗口 300×420（悬浮控制窗固定尺寸）
 
 特性：
-- 霓虹发光描边
-- Windows 系统级 Acrylic 模糊
-- 统一圆角和配色
+- Windows 系统级 Acrylic 背景（DWM 降级自动回退）
+- 统一 ULTRA 设计令牌与圆角
 - 与主窗口视觉风格一致
 """
 
@@ -20,7 +17,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import (Qt, pyqtSignal, QSize, QTimer, QPropertyAnimation,
                           QEasingCurve, QRectF)
-from PyQt5.QtGui import QColor, QIcon, QPainter
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath
 
 from .styles import Glass
 from .icons import AnimatedToggle, make_title_buttons, icon_pixmap
@@ -35,8 +32,8 @@ from .window_base import DragMixin, GlassEffectMixin, ui_slot
 # v4.4.0 修复(P2 硬编码): 小窗内几处魔数/文案提到具名常量, 只抽常量不改文案。
 CHAMP_ICON_PX = 46          # 备选英雄格子里图标显示尺寸(原写死 .scaled(46,46))
 MINI_LOG_ROWS = 5           # v12 起 5 行
-MINI_LOG_LINE_H = 14        # 一行 11px 字的行高(含行距)
-MINI_LOG_PAD = 6            # 上下 padding 合计 → 5*14+6 = 76
+MINI_LOG_LINE_H = 16        # 一行 11px 字的行高(含行距)，ds 意见加大行高
+MINI_LOG_PAD = 8            # 上下 padding 合计 → 5*16+8 = 88
 MINI_LOG_HEIGHT = MINI_LOG_ROWS * MINI_LOG_LINE_H + MINI_LOG_PAD
 MINI_LOG_MAX_CHARS = 36     # 超出则截断加省略号
 MINI_LOG_KEEP_CHARS = 33    # 截断后保留尾部字符数(36 = len('...') + 33)
@@ -266,13 +263,15 @@ class ReadyCheckPanel(QWidget):
         w, h = self.width(), self.height()
         r = Glass.RADIUS_CARD  # 10
 
-        # 半透明玻璃背景
+        # 暖白卡片底 + 弱化边框（高级浅色主题）
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(16, 18, 28, 140))
+        p.setBrush(QColor(251, 252, 250, 245))
         p.drawRoundedRect(0, 0, w, h, r, r)
-
-        # 顶部折射高光
-        _draw_top_highlight(p, w, h, r, intensity=3)
+        p.setPen(QColor(226, 232, 230, 255))
+        p.setBrush(Qt.NoBrush)
+        path = QPainterPath()
+        path.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
+        p.drawPath(path)
 
         p.end()
 
@@ -294,6 +293,10 @@ class ChampionIcon(QPushButton):
         self.cid = cid
         self._is_selected = False
         self._is_preinput = False
+        self._is_preferred = False
+        # v5.1(ultra M9): 脏值比较缓存(状态三元组 + 是否高亮)。
+        self._last_state = None
+        self._last_highlight = None
         self.setFixedSize(52, 52)
         self.setCursor(Qt.PointingHandCursor)
         # v17:不设 tooltip —— PyQt5 默认悬停 tooltip 是系统黑框,观感突兀
@@ -315,32 +318,41 @@ class ChampionIcon(QPushButton):
     def _apply_normal(self):
         self.setStyleSheet(f"""
             QPushButton {{
-                background: rgba(18, 20, 30, 130);
-                border: 1px solid rgba(99, 102, 241, 0.10);
+                background: rgba(0, 0, 0, 0.04);
+                border: 1px solid rgba(0, 0, 0, 0.10);
                 border-radius: {Glass.RADIUS_BTN};
             }}
             QPushButton:hover {{
-                background: rgba(99, 102, 241, 0.08);
-                border-color: rgba(99, 102, 241, 0.25);
+                background: rgba(0, 0, 0, 0.08);
+                border-color: rgba(0, 0, 0, 0.18);
             }}
             QPushButton:pressed {{ padding-top: 1px; }}
         """)
 
     def set_selected(self, sel, is_preferred: bool = False, is_preinput: bool = False):
-        """v13:同时管选中态与偏好态; v4.9.13:再加预输入态。
+        """三态「颜色 + 形状」双通道（液态玻璃规范）：
 
-        视觉优先级: 预输入(蓝) > 当前选中(靛) > 偏好(绿) > 普通。
-        为什么预输入排最前: 它是用户**手动点出来**的本局目标, 而"选中"只是
-        客户端当前恰好锁着谁 —— 排后面的话, 用户刚点亮蓝光的那个头像会被
-        "当前英雄"的靛框盖住, 看起来像没点上。
+        视觉优先级: 预输入(琥珀虚线框+右上圆点) > 当前选中(青绿实线环+底部短条)
+                  > 偏好(冰蓝框+左上切角标) > 普通。
+        颜色不唯一 —— 形状角标见 paintEvent。
+
+        v5.1(ultra M9): 三态组合不变时直接 return —— 原来无条件 setStyleSheet,
+        _do_bench 每秒对几十个 icon 各触发一次 QSS 解析 + style polish, 是选人
+        阶段最易感知的卡顿源。先比状态、再比 iconSize(highlight 会改它)。
         """
+        new_state = (bool(sel), bool(is_preferred), bool(is_preinput))
+        if new_state == self._last_state and self._last_highlight == bool(is_preinput or sel or is_preferred):
+            return
+        self._last_state = new_state
+        self._last_highlight = bool(is_preinput or sel or is_preferred)
         self._is_selected = sel
         self._is_preinput = is_preinput
+        self._is_preferred = is_preferred
         if is_preinput:
             self.setStyleSheet(f"""
                 QPushButton {{
                     background: {Glass.PREINPUT_SUBTLE};
-                    border: 2px solid {Glass.PREINPUT_BORDER};
+                    border: 2px dashed {Glass.PREINPUT_BORDER};
                     border-radius: {Glass.RADIUS_BTN};
                 }}
                 QPushButton:hover {{
@@ -351,30 +363,60 @@ class ChampionIcon(QPushButton):
         elif sel:
             self.setStyleSheet(f"""
                 QPushButton {{
-                    background: rgba(99, 102, 241, 0.12);
-                    border: 1px solid rgba(99, 102, 241, 0.35);
+                    background: {Glass.PRIMARY_SUBTLE};
+                    border: 2px solid {Glass.PRIMARY};
                     border-radius: {Glass.RADIUS_BTN};
                 }}
                 QPushButton:hover {{
-                    background: rgba(99, 102, 241, 0.18);
+                    background: {Glass.PRIMARY_18};
                 }}
             """)
         elif is_preferred:
-            # v4.4.1(UI-A6): 原来硬编 rgba(34,197,94,*)(=#22c55e), 与 Glass.ACCENT
-            # (#34d399) 是两个不同的绿, 同屏出现时偏色。改用 ACCENT 派生的令牌。
             self.setStyleSheet(f"""
                 QPushButton {{
-                    background: {Glass.ACCENT_SUBTLE};
-                    border: 2px solid {Glass.ACCENT_BORDER};
+                    background: rgba(126, 200, 255, 0.08);
+                    border: 2px solid {Glass.PREF_BORDER};
                     border-radius: {Glass.RADIUS_BTN};
                 }}
                 QPushButton:hover {{
-                    background: {Glass.ACCENT_SOFT};
-                    border-color: {Glass.ACCENT_BORDER_HOVER};
+                    background: rgba(126, 200, 255, 0.16);
                 }}
             """)
         else:
             self._apply_normal()
+        # 三态高亮时给边框让位：图标从 46 缩到 40，四周留出 4px 间隙，
+        # 否则图标贴满控件会把左右边框盖住（用户实测：绿框只剩上下两边）。
+        highlight = is_preinput or sel or is_preferred
+        self.setIconSize(QSize(40 if highlight else CHAMP_ICON_PX,
+                               40 if highlight else CHAMP_ICON_PX))
+        self.update()
+
+    def paintEvent(self, event):
+        """三态形状角标（HIG/液态玻璃：颜色不唯一，形状双通道）。"""
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if self._is_preinput:
+            # 预输入：右上角 6px 琥珀实心圆点
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(Glass.PREINPUT))
+            p.drawEllipse(44, 4, 6, 6)
+        elif self._is_selected:
+            # 当前选中：底部中央 16×3 青绿短条
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(Glass.PRIMARY))
+            p.drawRoundedRect(18, 46, 16, 3, 1.5, 1.5)
+        elif self._is_preferred:
+            # 偏好：左上角 8×8 冰蓝切角三角
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor('#7EC8FF'))
+            tri = QPainterPath()
+            tri.moveTo(0, 0)
+            tri.lineTo(8, 0)
+            tri.lineTo(0, 8)
+            tri.closeSubpath()
+            p.drawPath(tri)
+        p.end()
 
     def set_icon_data(self, data: bytes):
         # v4.4.0 修复(P1-16/P1-17): 原来 QPixmap().loadFromData + scaled(46,46)
@@ -386,10 +428,9 @@ class ChampionIcon(QPushButton):
 
 
 class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
-    """液态玻璃风格小窗 v12
+    """ULTRA 浅色悬浮控制窗
 
-    v12 还原 v10 的核心 UI（备选英雄头像宫格 + 5 行 mini_log），
-    仅在 main.py 端加严日志过滤（[WS]/[Core]/code= 等监控类不再刷小窗）。
+    备选英雄头像宫格 + 5 行 mini_log；与主窗共用设计令牌与拖拽/玻璃去重实现。
     """
     swap_signal = pyqtSignal(int)
     accept_signal = pyqtSignal()
@@ -673,8 +714,8 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
 
         for key, label in [('auto_queue', '匹配'), ('auto_accept', '接受'), ('auto_pick_champion', '换英雄')]:
             grp = QHBoxLayout()
-            grp.setSpacing(4)
-            grp.setContentsMargins(0, 0, 8, 0)
+            grp.setSpacing(6)          # ds 意见：文字与开关间距加大
+            grp.setContentsMargins(0, 0, 10, 0)
 
             btn = AnimatedToggle()
             btn.setChecked(self._settings.get(key, True))
@@ -801,7 +842,10 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         self._mini_log_labels = []
         for _ in range(MINI_LOG_ROWS):  # v12：4 → 5
             lbl = QLabel('')
-            lbl.setStyleSheet(f"font-size:{Glass.FONT_SIZE_XS};color:{Glass.TEXT_SECONDARY};background:transparent;")
+            # 浅色主题：日志文字用深灰蓝，浅底上清晰可读（旧 #C9D2E0 是深色时代提亮色）
+            lbl.setStyleSheet(
+                f"font-size:{Glass.FONT_SIZE_SM};color:{Glass.TEXT_SECONDARY};"
+                f"background:transparent;")
             lbl.setWordWrap(False)
             lay.addWidget(lbl)
             self._mini_log_labels.append(lbl)
@@ -848,7 +892,7 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         self._run_btn.setFixedSize(52, 24)
         self._run_btn.setCursor(Qt.PointingHandCursor)
         self._run_btn.setStyleSheet(_run_btn_qss(
-            Glass.PRIMARY_SUBTLE, Glass.PRIMARY, 'rgba(99,102,241,0.15)',
+            Glass.PRIMARY_SUBTLE, Glass.PRIMARY, Glass.PRIMARY_40,
             Glass.PRIMARY, 'white', Glass.PRIMARY))
         self._run_btn.clicked.connect(self.toggle_script_signal)
         lay.addWidget(self._run_btn)
@@ -1009,12 +1053,12 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         if running:
             self._run_btn.setText('停止')
             self._run_btn.setStyleSheet(_run_btn_qss(
-                Glass.DANGER_SUBTLE, Glass.DANGER, 'rgba(248,113,113,0.15)',
+                Glass.DANGER_SUBTLE, Glass.DANGER, Glass.DANGER_30,
                 Glass.DANGER, 'white', Glass.DANGER))
         else:
             self._run_btn.setText('启动')
             self._run_btn.setStyleSheet(_run_btn_qss(
-                Glass.PRIMARY_SUBTLE, Glass.PRIMARY, 'rgba(99,102,241,0.15)',
+                Glass.PRIMARY_SUBTLE, Glass.PRIMARY, Glass.PRIMARY_40,
                 Glass.PRIMARY, 'white', Glass.PRIMARY))
 
     @ui_slot
@@ -1131,7 +1175,7 @@ class OverlayWindow(DragMixin, GlassEffectMixin, QWidget):
         # v4.4.0 修复(P1-18): 圆点改走 StatusDot 属性 + update(), 不再 setStyleSheet
         self._live_dot.set_state(color=color)
         if state == 'connected':
-            self._live_dot.set_ring(QColor(52, 211, 153, 153))   # rgba(52,211,153,0.60)
+            self._live_dot.set_ring(QColor(74, 222, 128, 153))   # rgba(74,222,128,0.60) 新绿
         elif state == 'connecting':
             self._live_dot.set_ring(QColor(251, 191, 36, 130))   # 琥珀描边 = "在连, 还没通"
         else:

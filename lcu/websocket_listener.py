@@ -22,6 +22,14 @@ class WebSocketListener:
         self._ws: Optional[WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
         self._handlers: Dict[str, list] = {}
+        # v5.1(ultra L5): _handlers 注册(启动期)与分发(消费线程)的锁。原先
+        # on() 在运行中注册时可能边迭代边改 dict。
+        self._handlers_lock = threading.Lock()
+        # v5.1(ultra M5): 重连看门狗状态。disconnect 置停止位; on_close 排重连。
+        self._reconnect_scheduled = False
+        self._reconnect_stop = threading.Event()
+        self._reconnect_backoff = 3.0
+        self._reconnect_backoff_max = 60.0
         self._connected = False
         self._manual_close = False
         self._on_disconnected: Optional[Callable] = None
@@ -68,7 +76,51 @@ class WebSocketListener:
         self._on_connected = callback
 
     def on(self, uri: str, handler: Callable):
-        self._handlers.setdefault(uri, []).append(handler)
+        with self._handlers_lock:
+            self._handlers.setdefault(uri, []).append(handler)
+
+    def _schedule_reconnect(self):
+        """v5.1(ultra M5): on_close 后的延迟重连看门狗。
+
+        背景: 本类原先把"断线恢复"完全外包给外部 5s tick(main._try_connect) ——
+        若外部 tick 被停、或 connect() 因 is_connected 假真/线程半死而永久返回
+        'already-running', WS 通道就静默死亡。现在 on_close 里排一个 3s 后的
+        单发线程尝试重连(带退避: 失败后间隔翻倍, 上限 60s); 手动 disconnect()
+        置了 gen['manual'], 不排重连。重连失败不回抛、不阻塞 on_close。
+        """
+        try:
+            if self._reconnect_scheduled:
+                return
+            self._reconnect_scheduled = True
+        except Exception:
+            return
+        threading.Thread(target=self._reconnect_worker, daemon=True,
+                         name='lcu-ws-reconnect').start()
+
+    def _reconnect_worker(self):
+        backoff = self._reconnect_backoff
+        try:
+            while True:
+                self._reconnect_stop.wait(backoff)
+                if self._reconnect_stop.is_set():
+                    break
+                if self._connected:
+                    break
+                # 手动关闭 / connector 已不在 → 不再重连
+                if self._c is None or not getattr(self._c, 'is_connected', False):
+                    break
+                try:
+                    st = self.connect()
+                except Exception as e:
+                    st = f'exc:{type(e).__name__}'
+                if st in ('ok', 'already-running'):
+                    break
+                backoff = min(backoff * 2, self._reconnect_backoff_max)
+        finally:
+            try:
+                self._reconnect_scheduled = False
+            except Exception:
+                pass
 
     def connect(self) -> str:
         """启动 WS 监听线程。
@@ -110,6 +162,11 @@ class WebSocketListener:
             except Exception:
                 pass
             self._ws = None
+        # v5.1(ultra M5): 开始新一轮连接前复位重连停止位(disconnect 置过它)
+        try:
+            self._reconnect_stop.clear()
+        except Exception:
+            pass
 
         # v4.4.0 修复：确保消费线程常驻（异常退出后可自愈重启）
         self._ensure_consumer()
@@ -204,11 +261,14 @@ class WebSocketListener:
                 pass
             # v4.4.0 修复：只认本代连接的 manual 标记，避免重连窗口内
             # 新连接的 connect() 复位全局标记后旧线程触发假 on_disconnected
-            if not gen['manual'] and self._on_disconnected:
-                try:
-                    self._on_disconnected()
-                except Exception:
-                    pass
+            if not gen['manual']:
+                if self._on_disconnected:
+                    try:
+                        self._on_disconnected()
+                    except Exception:
+                        pass
+                # v5.1(ultra M5): 非手动关闭 → 排一次延迟重连看门狗
+                self._schedule_reconnect()
 
         self._ws = WebSocketApp(
             ws_url,
@@ -422,6 +482,11 @@ class WebSocketListener:
     def _disconnect_locked(self):
         """disconnect() 的临界区实现(调用方必须持有 _connect_lock)。"""
         self._manual_close = True
+        # v5.1(ultra M5): 停止重连看门狗
+        try:
+            self._reconnect_stop.set()
+        except Exception:
+            pass
         gen = getattr(self, '_gen', None)
         if isinstance(gen, dict):
             gen['manual'] = True

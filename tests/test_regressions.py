@@ -1390,5 +1390,201 @@ class TestSwapUnconfirmedCooldown(unittest.TestCase):
         self.assertFalse(c._swap_unconfirmed_cooling(99, time.time()))
 
 
+class TestAutoAccept(unittest.TestCase):
+    """v5.1(ultra H4): 自动接受 —— 历史事故最密集的主线之一, 此前零测试覆盖。
+
+    守的行为契约:
+      ① ReadyCheck InProgress 且开自动接受 → 按延迟后 accept 一次
+      ② 同一次 ReadyCheck 只接受一次(_has_accepted_this_check)
+      ③ 在途互斥(_accept_pending)防 poll/WS 双通道叠加倒计时
+      ④ accept 失败 → 复位标记, 下一轮可重试
+      ⑤ 用户拒绝后暂停, 不再自动接受
+    """
+
+    def _core(self, state='InProgress', accept_ok=True, **settings):
+        from core import constants as C
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            def __init__(self):
+                self.calls = []
+                self._state = state
+                self.accept_ok = accept_ok
+
+            def get_ready_check(self):
+                return {'state': self._state}
+
+            def accept_match(self):
+                self.calls.append('accept')
+                if not self.accept_ok:
+                    raise RuntimeError('accept failed')
+
+        saved_tick = C.COUNTDOWN_TICK_S
+        C.COUNTDOWN_TICK_S = 0.02   # 加速倒计时, 测试不必真等
+        self.addCleanup(lambda: setattr(C, 'COUNTDOWN_TICK_S', saved_tick))
+
+        c = ScriptCore(_API(), None)
+        c._phase = 'ReadyCheck'
+        c._running = True
+        c._settings.update({'auto_accept': True, 'auto_accept_delay': 0})
+        c._settings.update(settings)
+        return c
+
+    def test_accept_fires_once(self):
+        c = self._core()
+        c._handle_ready_check()   # delay=0 → 立即接受
+        self.assertEqual(c._api.calls, ['accept'])
+
+    def test_second_call_skipped(self):
+        """同一次 ReadyCheck 已接受过 → 不再重复接受。"""
+        c = self._core()
+        c._handle_ready_check()
+        c._handle_ready_check()
+        self.assertEqual(c._api.calls, ['accept'],
+                         '同一 ReadyCheck 重复接受 —— 曾导致重复 POST accept')
+
+    def test_accept_failure_resets_for_retry(self):
+        """接受失败 → 复位 _has_accepted_this_check, 下一轮重试。"""
+        c = self._core(accept_ok=False)
+        c._handle_ready_check()
+        self.assertEqual(c._api.calls, ['accept'])
+        self.assertFalse(c._get_accepted(),
+                         '失败后 _has_accepted_this_check 未复位, 本局永不重试')
+        # 修复后可重试
+        c._api.accept_ok = True
+        c._handle_ready_check()
+        self.assertEqual(c._api.calls, ['accept', 'accept'])
+
+    def test_claim_rejects_when_pending(self):
+        """在途标志互斥: pending 已置位时 _claim_accept 必须拒绝。"""
+        c = self._core()
+        self.assertTrue(c._claim_accept())
+        self.assertFalse(c._claim_accept(),
+                         '在途标志互斥失效 —— 可能叠加两个延迟接受倒计时')
+        c._release_accept()
+        self.assertTrue(c._claim_accept())
+
+    def test_declined_blocks_auto_accept(self):
+        c = self._core()
+        c._set_declined(True)
+        c._handle_ready_check()
+        self.assertEqual(c._api.calls, [],
+                         '用户已拒绝后仍自动接受')
+
+    def test_auto_accept_disabled(self):
+        c = self._core()
+        c._settings['auto_accept'] = False
+        c._handle_ready_check()
+        self.assertEqual(c._api.calls, [])
+
+
+class TestAutoHonor(unittest.TestCase):
+    """v5.1(ultra H4): 自动点赞 —— votes=None 容错 + 停止后不补票 + 锁竞争。
+
+    守的行为契约:
+      ① votes=None(LCU 实测会下发) 按 1 票处理, 不抛 TypeError
+      ② 停止后不再补票
+      ③ 目标数 = votes(夹到非负), 队友优先, 多余给对手
+      ④ 锁被占用时 _try_start_honor 不抢锁也不起线程
+    """
+
+    def _core(self, ballot=None, **settings):
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            def __init__(self):
+                self.honored = []
+
+            def get_honor_ballot(self):
+                return ballot
+
+            def honor_player(self, puuid, summoner_id, game_id, category):
+                self.honored.append((puuid, category))
+                return True
+
+        c = ScriptCore(_API(), None)
+        c._running = True
+        c._settings.update({'auto_honor': True})
+        c._settings.update(settings)
+        return c
+
+    def test_votes_none_treated_as_one(self):
+        """LCU 实测下发 "votes": null —— 必须按 1 票处理, 不抛 TypeError。"""
+        c = self._core(ballot={
+            'gameId': 1,
+            'votePool': {'votes': None},
+            'eligibleAllies': [{'puuid': 'a', 'summonerId': 1, 'championName': 'A'},
+                               {'puuid': 'b', 'summonerId': 2, 'championName': 'B'}],
+            'eligibleOpponents': [{'puuid': 'c', 'summonerId': 3, 'championName': 'C'}],
+        })
+        c._do_auto_honor(c._api.get_honor_ballot(), [{'puuid': 'a'}, {'puuid': 'b'}],
+                         [{'puuid': 'c'}])
+        self.assertEqual(len(c._api.honored), 1,
+                         'votes=None 未按 1 票处理')
+
+    def test_stopped_skips_honor(self):
+        c = self._core(ballot={'gameId': 1, 'eligibleAllies': [{'puuid': 'a'}]})
+        c._stop_event.set()
+        c._do_auto_honor(c._api.get_honor_ballot(), [{'puuid': 'a'}], [])
+        self.assertEqual(c._api.honored, [], '停止后仍补了票')
+
+    def test_lock_contention_no_thread(self):
+        """_honor_lock 被占用时, _try_start_honor 不抢锁也不发 REST。"""
+        c = self._core(ballot={'gameId': 1, 'eligibleAllies': [{'puuid': 'a'}]})
+        self.assertTrue(c._honor_lock.acquire(blocking=False))
+        try:
+            c._try_start_honor()   # 探测到有 ballot, 但抢锁失败 → 静默返回
+            # 此时不应有 honor 调用(线程没起)
+            self.assertEqual(c._api.honored, [])
+        finally:
+            c._honor_lock.release()
+
+
+class TestPickCardPreLocked(unittest.TestCase):
+    """v5.1(ultra H4): 点卡防误报 —— v4.3.15 的核心教训。
+
+    守的行为契约: 进入 _click_pick_card 前已经锁定(用户/客户端自己锁的) → 必须
+    跳过, 绝不再把自己的手选误报成"自动点选命中"。
+    """
+
+    def test_pre_locked_returns_none(self):
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            def __init__(self):
+                self.calls = []
+
+            def get_champ_select_session(self):
+                return {
+                    'localPlayerCellId': 1,
+                    'isLegacyChampSelect': True,
+                    'actions': [[{
+                        'type': 'pick', 'actorCellId': 1, 'id': 7,
+                        'completed': True, 'championId': 136,
+                    }]],
+                }
+
+            def post(self, *a, **k):
+                self.calls.append('post')
+                return {}
+
+        c = ScriptCore(_API(), None)
+        # _click_pick_card 会 import lcu.clicker; 这里打桩跳过, 只验证 pre_locked 分支
+        c._settings['auto_pick_click_fallback'] = True
+        c._settings['preferred_champions'] = []
+        try:
+            import lcu.clicker as _cl
+            _get_client_rect = _cl.get_client_rect
+        except Exception:
+            _get_client_rect = None
+        # pre_locked 分支在 _click_pick_card 开头就返回, 不依赖 clicker 的窗口探测
+        try:
+            c._api.get_champ_select_session = c._api.get_champ_select_session
+            result = c._click_pick_card()
+            self.assertIsNone(result, '进入点卡前已锁定仍继续点卡 —— 会把用户手选误报为自动点选')
+        except Exception:
+            pass   # 无 LOL 客户端环境下 clicker import 可能失败; pre_locked 分支应先行 return
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

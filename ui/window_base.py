@@ -295,8 +295,8 @@ class GlassPanel(QWidget):
 
 
 def glass_hline():
-    """1px 靛蓝霓虹分隔线(activation_dialog / agreement_dialog 共用)。"""
+    """1px 品牌色分隔线(activation_dialog / agreement_dialog 共用)。"""
     line = QFrame()
     line.setFixedHeight(1)
-    line.setStyleSheet('background:rgba(99,102,241,0.22);border:none;')
+    line.setStyleSheet('background:rgba(8,127,115,0.35);border:none;')
     return line

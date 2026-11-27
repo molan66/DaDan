@@ -14,9 +14,9 @@ gameId 单拉 `/lol-match-history/v1/games/{gameId}`。该请求由 main 侧**�
 """
 import time as _time
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QPushButton,
-                             QScrollArea, QVBoxLayout, QWidget)
+from PyQt5.QtCore import Qt, QTimer, QThread
+from PyQt5.QtWidgets import (QApplication, QGridLayout, QHBoxLayout, QLabel,
+                             QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from .styles import Glass
 from .icons import rounded_pixmap, augment_pixmap
@@ -25,9 +25,9 @@ from .match_fmt import (dur_text, game_mode_text, kda_ratio, kda_text,
 # v4.4.0 修复(P1-21/P2): 与主窗/小窗共用拖拽 + 玻璃去重实现
 from .window_base import DragMixin, GlassEffectMixin, ui_slot
 
-# 胜=红 / 负=绿(国服习惯: 红为正向)
-WIN_COLOR = '#f87171'
-LOSE_COLOR = '#34d399'
+# 胜=红 / 负=绿(国服习惯: 红为正向) —— 令牌单一来源，不再写字面量
+WIN_COLOR = Glass.DANGER
+LOSE_COLOR = Glass.SUCCESS
 
 
 def _safe_int(v, default=0):
@@ -54,7 +54,7 @@ def _kv(label, width):
     w = QWidget()
     w.setFixedWidth(width)
     w.setStyleSheet(
-        'background: rgba(255,255,255,0.05);'
+        f'background: {Glass.BG_CARD_ALT};'
         f'border: 1px solid {Glass.BORDER_GLASS};'
         f'border-radius: {Glass.RADIUS_SM}px;')
     lay = QVBoxLayout(w)
@@ -111,7 +111,7 @@ class _IconBox(QLabel):
         self._requested = False
         self.deadline = _time.monotonic() + self.RETRY_WINDOW_S
         self.setStyleSheet(
-            'background: rgba(255,255,255,0.06);'
+            f'background: {Glass.BG_INSET};'
             f'border-radius: {radius}px;'
             f'color: {Glass.TEXT_MUTED}; font-size: {Glass.FONT_SIZE_XS};')
         if text:
@@ -150,11 +150,11 @@ class _PlayerRow(QWidget):
     NAME_W = 96
     ROW_H = 34
     ICON = 24
-    ITEM = 17
-    SPELL = 17
-    AUG = 17
+    ITEM = 18          # ds 意见：装备/技能/海克斯图标统一尺寸（原 17 略挤）
+    SPELL = 18
+    AUG = 18
     # 图标格间距: 行内与表头**必须一致**, 否则列错位(第一版就是这里不一致)
-    STRIP_GAP = 2
+    STRIP_GAP = 3      # ds 意见：图标间距放宽，避免糊在一起
     # 列间距: 同上, 表头与行共用
     COL_GAP = 4
     # 名字/英雄名截断阈值(魔法数字收口): 超长截断并悬停显示全名
@@ -261,9 +261,10 @@ class _PlayerRow(QWidget):
             wan_text(p.get('taken')),
         )
         for (head_text, width, color), text in zip(self.NUM_COLS, values):
+            # 浅色主题：高亮行底是淡青，文字保持深色即可读（不再用白字）
             lb = _lbl(text, Glass.FONT_SIZE_XS, color)
             lb.setFixedWidth(width)
-            lb.setAlignment(Qt.AlignCenter)
+            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lay.addWidget(lb)
 
         # 召唤师技能 ×2 —— 放在出装之前(与表头 header_cols 顺序严格对应)
@@ -443,7 +444,7 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
         # 底色更亮但透明度接近 1, 结果就是"比主界面发黑"。改成同色系的低透明度
         # (保留一点提亮, 否则小窗透底下文字对比度不够)。
         self._panel.setStyleSheet(
-            'QWidget#panel{background: rgba(10, 12, 20, 0.82);'
+            'QWidget#panel{background: rgba(250, 251, 248, 0.98);'
             f'border: 1px solid {Glass.NEON_BORDER};'
             f'border-radius: {Glass.RADIUS_CARD}px;}}')
         outer.addWidget(self._panel)
@@ -498,7 +499,7 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
         self._close_btn.setStyleSheet(
             f'QPushButton{{background:transparent;color:{Glass.TEXT_MUTED};'
             f'border:none;border-radius:{Glass.RADIUS_SM}px;font-size:12px;}}'
-            'QPushButton:hover{background: rgba(248,113,113,0.18);color:#f87171;}')
+            f'QPushButton:hover{{background: {Glass.DANGER_BG};color:{Glass.DANGER};}}')
         self._close_btn.clicked.connect(self.close)
         self._close_btn.raise_()
 
@@ -509,16 +510,16 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
         (NAV_GUTTER)之上, 视觉上是"翻页"而不是标题栏小按钮。
         """
         nav_qss = (
-            f'QPushButton{{background:rgba(10,12,20,0.55);'
+            f'QPushButton{{background:rgba(237,241,238,0.95);'
             f'color:{Glass.TEXT_MUTED};'
             f'border:1px solid {Glass.NEON_BORDER};'
             f'border-radius:{Glass.RADIUS_CARD}px;font-size:16px;}}'
-            f'QPushButton:hover{{background:rgba(99,102,241,0.22);'
+            f'QPushButton:hover{{background:{Glass.PRIMARY_12};'
             f'color:{Glass.TEXT_PRIMARY};'
             f'border-color:{Glass.NEON_BORDER_HOVER};}}'
-            f'QPushButton:disabled{{color:rgba(255,255,255,0.15);'
-            f'background:rgba(255,255,255,0.04);'
-            f'border-color:rgba(255,255,255,0.06);}}')
+            f'QPushButton:disabled{{color:rgba(0,0,0,0.25);'
+            f'background:rgba(0,0,0,0.04);'
+            f'border-color:rgba(0,0,0,0.08);}}')
         self._nav_prev = QPushButton('◀', self)
         self._nav_prev.setFixedSize(self.NAV_W, self.NAV_H)
         self._nav_prev.setCursor(Qt.PointingHandCursor)
@@ -640,6 +641,9 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
         left.addWidget(self._ov_name)
         left.addWidget(self._ov_sub)
         self._ov_badge = _lbl('', Glass.FONT_SIZE_XS, WIN_COLOR, True)
+        # QLabel 在竖排布局里默认被拉伸到整行宽 —— 限宽避免"胜负 pill 变全宽横条"
+        self._ov_badge.setMaximumWidth(64)
+        self._ov_badge.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         left.addWidget(self._ov_badge)
         lay.addLayout(left, 1)
 
@@ -762,8 +766,8 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
         self._retry_btn.setStyleSheet(
             f'QPushButton{{background:{Glass.PRIMARY_SUBTLE};color:{Glass.PRIMARY};'
             f'border:1px solid {Glass.NEON_BORDER};'
-            f'border-radius:{Glass.RADIUS_SM}px;padding:0 10px;font-size:11px;}}'
-            f'QPushButton:hover{{background:rgba(99,102,241,0.22);}}')
+            f'border-radius:{Glass.RADIUS_SM}px;padding:0 10px;font-size:{Glass.FONT_SIZE_XS};}}'
+            f'QPushButton:hover{{background:{Glass.PRIMARY_12};}}')
         self._retry_btn.clicked.connect(self._retry)
         self._retry_btn.setVisible(False)
         lay.addWidget(self._hint_lbl)
@@ -800,12 +804,23 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
         return scroll
 
     # ---------------- 数据回填 ----------------
+    @ui_slot
     def set_detail(self, detail, err=''):
         """main 侧异步拉取完成后回填(主线程调用)。
 
         err == '__slow__' 是进度信号("还在读, 只是慢"; waiter 未摘除, 结果仍会回来),
         只更新提示, 不当失败处理。
+
+        v5.1(ultra M10): 加线程守卫 —— 本方法全程是 UI 操作(填表/setStyleSheet/
+        deleteLater), 必须在主线程执行。若非主线程被调(未来的新调用方踩坑),
+        经 QTimer.singleShot(0) 转投主线程, 而不是在后台线程直接碰控件。
         """
+        try:
+            if QThread.currentThread() is not QApplication.instance().thread():
+                QTimer.singleShot(0, lambda: self.set_detail(detail, err))
+                return
+        except Exception:
+            pass
         if self._closed:
             return
         try:
@@ -1035,10 +1050,14 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
             # 否则列会整体偏移。两边都从 _PlayerRow 的类常量取, 单一来源。
             hl.setContentsMargins(3, 0, 3, 0)
             hl.setSpacing(_PlayerRow.COL_GAP)
-            for text, width in _PlayerRow.header_cols(self._has_augments()):
+            for i, (text, width) in enumerate(
+                    _PlayerRow.header_cols(self._has_augments())):
                 lb = _lbl(text, Glass.FONT_SIZE_XS, Glass.TEXT_MUTED)
                 lb.setFixedWidth(width)
-                lb.setAlignment(Qt.AlignCenter)
+                # 数值列表头右对齐，与行内数值一致；文本列居中
+                lb.setAlignment(
+                    Qt.AlignRight | Qt.AlignVCenter if 1 <= i <= 6
+                    else Qt.AlignCenter)
                 hl.addWidget(lb)
             hl.addStretch()
             bl.addWidget(head)
@@ -1133,7 +1152,7 @@ class RecentDetailDialog(DragMixin, GlassEffectMixin, QWidget):
             self._ov_badge.setText(text)
             self._ov_badge.setStyleSheet(
                 f"font-size:{Glass.FONT_SIZE_XS};font-weight:700;"
-                f"color:{color};background:rgba(255,255,255,0.06);"
+                f"color:{color};background:{Glass.BG_CARD_ALT};"
                 f"border-radius:5px;padding:2px 7px;")
         except Exception as e:
             print(f'[详情] 胜负徽章失败: {type(e).__name__}: {e}')

@@ -18,12 +18,12 @@ from . import screen_utils
 # 首次启动须知正文（HTML 富文本，与主界面文字风格一致）
 _AGREEMENT_HTML = """
 <style>
-  h2 { color: #ffffff; font-size: 15px; font-weight: 700; margin: 14px 0 6px; }
-  p  { color: #c8c8d8; font-size: 13px; line-height: 1.7; margin: 4px 0; }
-  li { color: #c8c8d8; font-size: 13px; line-height: 1.7; margin: 3px 0 3px 4px; }
-  .hl { color: #a5b4fc; }
-  .warn { color: #fbbf24; }
-  .danger { color: #f87171; }
+  h2 { color: #202D35; font-size: 15px; font-weight: 700; margin: 14px 0 6px; }
+  p  { color: #4A5A68; font-size: 13px; line-height: 1.7; margin: 4px 0; }
+  li { color: #4A5A68; font-size: 13px; line-height: 1.7; margin: 3px 0 3px 4px; }
+  .hl { color: #06574F; }
+  .warn { color: #B77928; }
+  .danger { color: #C34F55; }
 </style>
 
 <p>一个免安装的单文件小工具，连上游戏客户端就能一键挂机，帮你自动打<b>海克斯大乱斗</b>、攒蓝色精粹、刷英雄熟练度。</p>
@@ -140,7 +140,7 @@ class AgreementDialog(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet(
-            f"QScrollArea{{background:rgba(12,14,24,0.55);border:1px solid {Glass.NEON_BORDER};"
+            f"QScrollArea{{background:{Glass.BG_INSET};border:1px solid {Glass.NEON_BORDER};"
             f"border-radius:{Glass.RADIUS_CARD};}}"
             f"QScrollArea > QWidget > QWidget {{background:transparent;}}")
         body = QLabel(_AGREEMENT_HTML)
@@ -213,8 +213,8 @@ class AgreementDialog(QWidget):
         else:
             self._btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: rgba(255,255,255,0.06);
-                    color: {Glass.TEXT_MUTED}; border: 1px solid rgba(255,255,255,0.08);
+                    background: rgba(0,0,0,0.05);
+                    color: {Glass.TEXT_MUTED}; border: 1px solid rgba(0,0,0,0.10);
                     border-radius: {Glass.RADIUS_BTN};
                     font-size: {Glass.FONT_SIZE_LG}; font-weight: 600;
                 }}

@@ -180,9 +180,6 @@ class ScriptCore:
         # 判定为"已过期"而中止 —— 例如"等待结算返回房间"的倒计时会被离开 ReadyCheck
         # 时的清理顺手打断(v4.3.11 的 _clear_return_pending 就是在补这个洞)。
         # 现在按功能各持一个计数器, 每个功能只取消自己那一个; 跨功能互不干扰。
-        # 兼容: 保留 _countdown_id 属性(外部/旧代码若读过它不会 AttributeError),
-        # 但代码内已不再读写它。
-        self._countdown_id = 0  # 已弃用(v4.4.0 P1-7): 仅为兼容保留, 不再参与判断
         self._countdown_id_queue = 0   # 自动匹配倒计时
         self._countdown_id_accept = 0  # 自动接受倒计时(含撤销在途接受)
         self._countdown_id_return = 0  # 自动返回房间倒计时
@@ -357,8 +354,9 @@ class ScriptCore:
                 return
         self._running = True
         self._stop_event.clear()
-        self._has_accepted_this_check = False
-        self._user_declined_this_session = False
+        self._set_accepted(False)
+        self._set_declined(False)
+        self._release_accept()
         self._auto_queue_paused = False  # 手动点启动即解除拒绝暂停
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -551,7 +549,7 @@ class ScriptCore:
                 handle_it = allow_handle
             # 阶段未变化：幂等兜底（回到大厅/空闲时解除拒绝暂停）
             elif old in ('Lobby', 'None'):
-                self._user_declined_this_session = False
+                self._set_declined(False)
         if changed:
             self._emit(self._on_phase_changed, new_phase)
             if handle_it:
@@ -571,7 +569,7 @@ class ScriptCore:
         """
         # 离开 ChampSelect 时重置单次接受标记
         if old == 'ChampSelect' and new != 'ChampSelect':
-            self._has_accepted_this_check = False
+            self._set_accepted(False)
             # v4.9.13:预输入是**这一局**的选择, 每局清空(用户明确要求)。
             # 跨局沿用很危险: 下一局的备选池里多半没有这个英雄, 会先亮蓝光再
             # 被判"已不在备选池"清掉, 中间那句提示纯属噪音。
@@ -580,7 +578,7 @@ class ScriptCore:
             self._clear_preinput()
         # 回到 Lobby/None = 新匹配会话，解除"主动拒绝"暂停
         if new in ('Lobby', 'None'):
-            self._user_declined_this_session = False
+            self._set_declined(False)
             self._return_pending = False
             # v4.9.12 修复(本次 B): 已经回到大厅, 说明"返回房间"这件事**已完成**,
             # 在途的返回倒计时必须当场作废。
@@ -707,6 +705,40 @@ class ScriptCore:
                 print('[Core] 匹配失败')
 
     # ==================== 自动接受（sona 模式） ====================
+    # v5.1(ultra H5): 接受状态三标志的读写全部收口到下面的私有方法 —— 之前
+    # "检查+置位"在 _accept_lock 锁内、但复位点在 _ws_ready_check /
+    # accept_current_match / decline_current_match / _clear_ready_state 锁外裸写,
+    # 半加锁仍可能叠加两个延迟接受倒计时。现在读/写都走同一把锁。
+    def _claim_accept(self) -> bool:
+        """原子地"检查 + 置位"自动接受在途标志。返回 True = 本轮可发起接受。"""
+        with self._accept_lock:
+            if self._accept_pending or self._has_accepted_this_check:
+                return False
+            self._accept_pending = True
+            return True
+
+    def _release_accept(self):
+        """复位自动接受在途标志（倒计时取消 / 手动接受拒绝 / 离开 ReadyCheck）。"""
+        with self._accept_lock:
+            self._accept_pending = False
+
+    def _set_accepted(self, accepted: bool):
+        """原子写"本次 ReadyCheck 是否已自动接受"。"""
+        with self._accept_lock:
+            self._has_accepted_this_check = accepted
+
+    def _get_accepted(self) -> bool:
+        with self._accept_lock:
+            return self._has_accepted_this_check
+
+    def _is_declined(self) -> bool:
+        with self._accept_lock:
+            return self._user_declined_this_session
+
+    def _set_declined(self, declined: bool):
+        with self._accept_lock:
+            self._user_declined_this_session = declined
+
     def _handle_ready_check(self):
         """sona 模式：每次 ReadyCheck 只接受一次，用户拒绝后暂停直到回到大厅
 
@@ -715,7 +747,7 @@ class ScriptCore:
         导致首次接受请求失败后永不重试,现改为成功才置位、失败复位等下一轮重试。
         """
         try:
-            if self._user_declined_this_session:
+            if self._is_declined():
                 return
 
             check = self._api.get_ready_check()
@@ -729,19 +761,10 @@ class ScriptCore:
             if state != 'InProgress' or not self._settings.get('auto_accept'):
                 return
 
-            # sona 核心：本次 ReadyCheck 已接受过就不再接受
-            if self._has_accepted_this_check:
+            # sona 核心 + 在途互斥：v5.1(ultra H5) 收口到 _claim_accept 一次原子完成
+            # "本次 ReadyCheck 已接受过" 与 "已有一个延迟接受在途" 两重检查。
+            if not self._claim_accept():
                 return
-            # v23:已有一个延迟接受在途(倒计时未触发)时不再叠加。
-            # v4.3.10 修复: 原实现"先查后置"无锁 —— poll(1s) 与 WS 推送两个通道
-            # 可能同时通过检查, 叠加出两个延迟接受倒计时(重复接受)。
-            # WS 事件在本版修好解析后**真的会推送了**, 这条竞态从"理论"变成"常见",
-            # 所以用专用锁把"检查 + 置位"做成原子的。
-            # (不复用 _swap_lock: 那个锁管选人/换英雄, 语义不同, 混用会造成假耦合。)
-            with self._accept_lock:
-                if self._accept_pending:
-                    return
-                self._accept_pending = True
 
             base = _safe_int(self._settings.get('auto_accept_delay', 1), 1, lo=0)
             # sona 模式：最大延迟保护（15秒上限）
@@ -755,7 +778,7 @@ class ScriptCore:
                     c = self._api.get_ready_check()
                     if c and c.get('state') == 'InProgress':
                         self._api.accept_match()
-                        self._has_accepted_this_check = True
+                        self._set_accepted(True)
                         self._emit(self._on_status_update, '✅ 已接受对局!')
                         self._emit(self._on_ready_check_response, 'Accepted')
                         print(f'[Core] 延迟{delay}秒后接受对局')
@@ -763,11 +786,10 @@ class ScriptCore:
                 except Exception as e:
                     # v23:接受失败复位标记 → 下一轮 poll(1s)自动重试,
                     # 不再"一次失败本局就永远不接"
-                    self._has_accepted_this_check = False
+                    self._set_accepted(False)
                     print(f'[Core] 接受对局失败(下轮重试): {type(e).__name__}: {e}')
                 finally:
-                    with self._accept_lock:
-                        self._accept_pending = False
+                    self._release_accept()
 
             if delay > 0:
                 self._start_countdown(delay, '⏳ 接受倒计时', do_accept,
@@ -1333,8 +1355,10 @@ class ScriptCore:
                           f'(rank#{current_rank+1}<=#{best_rank+1})')
                 return
 
-        if best_cid == current_id:
-            return
+        # v5.1(ultra M11): 删除 `if best_cid == current_id: return` 死分支 ——
+        # best_cid 必在 preferred 内; current_id 在 preferred 时 current_rank<=best_rank
+        # 已提前 return(相等时 rank 必相等), current_id 不在 preferred 时二者不可能
+        # 相等 —— 逻辑上不可达。
 
         # 3) 秒换到更高优先级偏好英雄（无冷却）
         # v5.0.0(#2): 读回未确认后的冷却。同一英雄在冷却期内不重复 POST。
@@ -1537,31 +1561,52 @@ class ScriptCore:
         轮询与状态对账多次触发;用非阻塞锁保证同一时刻只有一个点赞线程,
         且先快速探测 ballot 避免为"没有待点赞的对局"空起线程。
         锁由 worker 线程结束时释放。
+
+        v5.1(ultra M3): ballot 探测移到抢锁**之前** —— 原来持 _honor_lock 发
+        REST(get_honor_ballot, 最坏超时级), 违反 _set_phase 注释"锁外执行 IO"的
+        纪律, poll 线程在锁上整段排队。现在无锁探测, 命中才抢锁; 抢到后重新
+        取一次 ballot(防探测与抢锁之间对局变化), 空则释放。
         """
         if not self._settings.get('auto_honor'):
             return
-        if not self._honor_lock.acquire(blocking=False):
-            return  # 已有点赞线程在跑
+        # 无锁快速探测: 避免为"没有待点赞的对局"抢锁并起线程
         try:
             ballot = self._api.get_honor_ballot()
         except Exception:
             ballot = None
         if not ballot:
-            self._honor_lock.release()
             return
         allies = list(ballot.get('eligibleAllies') or [])
         opponents = list(ballot.get('eligibleOpponents') or [])
         if not allies and not opponents:
-            self._honor_lock.release()
             print('[Core] 没有可点赞的玩家')
             return
+        # 抢到锁前可能已有另一线程在点赞; 抢到后重读一次, 空则释放
+        if not self._honor_lock.acquire(blocking=False):
+            return  # 已有点赞线程在跑
+        try:
+            try:
+                ballot2 = self._api.get_honor_ballot()
+            except Exception:
+                ballot2 = None
+            if not ballot2:
+                self._honor_lock.release()
+                return
+            allies2 = list(ballot2.get('eligibleAllies') or [])
+            opponents2 = list(ballot2.get('eligibleOpponents') or [])
+            if not allies2 and not opponents2:
+                self._honor_lock.release()
+                return
+        except Exception:
+            self._honor_lock.release()
+            raise
         # v4.1.60: 防御 start() 失败(线程资源耗尽等极端情况)导致 _honor_lock
         # 永不释放 —— 锁由 _honor_worker 结束时释放, 若线程根本没起来锁会泄漏,
         # 后续所有自动点赞全被阻塞。这里 start 异常时立即归还锁。
         try:
             self._spawn_worker(self._honor_worker, name='core-honor',
-                               kwargs={'ballot': ballot, 'allies': allies,
-                                       'opponents': opponents})
+                               kwargs={'ballot': ballot2, 'allies': allies2,
+                                       'opponents': opponents2})
         except Exception as e:
             self._honor_lock.release()
             print(f'[Core] 点赞线程启动失败: {type(e).__name__}: {e}')
@@ -1672,19 +1717,19 @@ class ScriptCore:
             self._emit(self._on_ready_check_response, response)
         # 本机玩家已拒绝（任何途径）：撤销延迟接受 + 暂停自动接受与自动匹配，
         # 直到手动点"启动"或手动在客户端开始匹配(→ _set_phase Matchmaking)才恢复
-        if response == 'Declined' and not self._user_declined_this_session:
-            self._user_declined_this_session = True
-            self._has_accepted_this_check = True
+        if response == 'Declined' and not self._is_declined():
+            self._set_declined(True)
+            self._set_accepted(True)
             self._auto_queue_paused = True  # G6:拒绝后连自动匹配一起暂停,防"拒绝→重排→自动接受"循环
             # v4.4.0 修复(P1-7): 只撤销"在途的自动接受倒计时"; 原先共用 _countdown_id,
             # 这一刀会连带打断自动匹配/自动返回的倒计时(自动匹配那种情况下本就被
             # _auto_queue_paused 挡住, 但自动返回会被误伤)。
             self._bump_countdown('accept')
-            self._accept_pending = False  # 撤销任何在途延迟接受
+            self._release_accept()  # 撤销任何在途延迟接受
             print('[Core] 检测到已拒绝对局，暂停自动接受/自动匹配直到手动恢复')
             self._emit(self._on_status_update, '❌ 已拒绝，暂停自动匹配')
             return
-        if state == 'InProgress' and not self._user_declined_this_session:
+        if state == 'InProgress' and not self._is_declined():
             self._handle_ready_check()
 
     # ==================== 公共操作 ====================
@@ -1747,9 +1792,9 @@ class ScriptCore:
             self._bump_countdown('accept')  # v4.4.0(P1-7): 只取消在途自动接受
             self._api.accept_match()
             # sona 模式：手动接受解除拒绝暂停
-            self._user_declined_this_session = False
-            self._has_accepted_this_check = True
-            self._accept_pending = False  # 手动接受:取消在途的自动接受倒计时
+            self._set_declined(False)
+            self._set_accepted(True)
+            self._release_accept()  # 手动接受:取消在途的自动接受倒计时
             self._auto_queue_paused = False  # 手动接受 = 恢复整条自动化链
             self._emit(self._on_status_update, '✅ 已接受对局!')
             self._emit(self._on_ready_check_response, 'Accepted')
@@ -1768,9 +1813,9 @@ class ScriptCore:
             self._bump_countdown('accept')  # v4.4.0(P1-7): 只取消在途自动接受
             self._api.decline_match()
             # sona 核心：用户拒绝后暂停自动接受/自动匹配
-            self._user_declined_this_session = True
-            self._has_accepted_this_check = True
-            self._accept_pending = False  # 取消任何在途自动接受
+            self._set_declined(True)
+            self._set_accepted(True)
+            self._release_accept()  # 取消任何在途自动接受
             self._auto_queue_paused = True  # G6
             print('[Core] 已拒绝对局，暂停自动匹配（手动恢复）')
             self._emit(self._on_status_update, '❌ 已拒绝，暂停自动匹配')
@@ -1802,11 +1847,11 @@ class ScriptCore:
         # 行为等价性: 自动匹配倒计时到点后 _do_queue 仍会做 `self._phase not in
         # ('Lobby','None') → return` 的守卫, 已离开大厅时不会误发匹配请求。
         self._bump_countdown('accept')
-        self._accept_pending = False
+        self._release_accept()
         if self._on_ready_check_state:
             self._on_ready_check_state(False)
         # sona 模式：离开 ReadyCheck 重置单次标记（允许下次匹配自动接受）
-        self._has_accepted_this_check = False
+        self._set_accepted(False)
 
     def _clear_accept_pending(self):
         """v4.1.64: 接受倒计时被取消(被新倒计时/停止打断)时的复位回调。
@@ -1816,7 +1861,7 @@ class ScriptCore:
         v4.4.0(P1-7): 语义已名副其实 —— 现在只有"自动接受倒计时"这一个倒计时
         会回调本方法, 它只复位 _accept_pending, 不再顺带影响返回/匹配流程。
         """
-        self._accept_pending = False
+        self._release_accept()
 
     def _clear_return_pending(self):
         """v4.3.11 修复: 返回倒计时被取消时的复位回调。

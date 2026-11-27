@@ -49,13 +49,18 @@ PUBLIC_KEY_HEX = (    '529a4d7c3f1ab7a4d48620aba382ad9a'
 #: 授权状态文件（与 settings.json 同目录，便于一起备份/清理）
 STATE_FILENAME = 'license.json'
 
-#: 机器指纹槽位定义：(英文标签, 是否强校验)
-#: 标签进 sha256 的输入，**一旦发布就不能改** —— 改了所有已发出的码全部失效。
-SLOTS = (
-    ('board_uuid', 'Win32_ComputerSystemProduct.UUID'),
-    ('cpu_id', 'Win32_Processor.ProcessorId'),
-    ('board_serial', 'Win32_BaseBoard.SerialNumber'),
-    ('disk_serial', 'Win32_DiskDrive.SerialNumber'),
+#: 机器指纹槽位标签(仅英文标签)。标签进 sha256 的输入，**一旦发布就不能改** ——
+#: 改了所有已发出的码全部失效。
+#:
+#: v5.1(ultra M12): 第二元素曾是 WMI 路径字符串且全项目无人读取(注释却写
+#: "是否强校验") —— 真正的查询硬编码在 _PS_COLLECT, 两处靠注释对齐, 一旦
+#: _PS_COLLECT 改查询顺序而这里没同步, 签发的授权码槽位标签会静默错位。
+#: 现在收敛为纯标签元组, WMI 查询与槽位的对应只由 _PS_COLLECT 的注释承载。
+SLOT_TAGS = (
+    'board_uuid',
+    'cpu_id',
+    'board_serial',
+    'disk_serial',
 )
 
 #: 组装机 / OEM 常见的无意义占位串。
@@ -213,13 +218,13 @@ def machine_id(components=None):
     这是给**买家念给卖家/发给卖家**的那串，不带签名、可以公开。
     """
     comps = components if components is not None else collect_components()
-    return LC.b32e(b''.join(_slot_digest(SLOTS[i][0], comps[i]) for i in range(4)))
+    return LC.b32e(b''.join(_slot_digest(SLOT_TAGS[i], comps[i]) for i in range(4)))
 
 
 def slot_digests(components=None):
-    """4 个槽位指纹（各 8 字节），顺序与 SLOTS 一致。"""
+    """4 个槽位指纹（各 8 字节），顺序与 SLOT_TAGS 一致。"""
     comps = components if components is not None else collect_components()
-    return [_slot_digest(SLOTS[i][0], comps[i]) for i in range(4)]
+    return [_slot_digest(SLOT_TAGS[i], comps[i]) for i in range(4)]
 
 
 def machine_id_grouped(components=None):
@@ -284,21 +289,9 @@ def _clock_watermark_paths():
     return [os.path.join(d, n) for n in _CLOCK_WATERMARK_FILENAMES]
 
 
-def _clock_watermark_path():
-    """时钟水位文件路径（**给人看的那一份**，兼容旧调用方）。
-
-    为什么需要：到期判断原先只有 `datetime.date.today()` 一个输入，实测把系统
-    时间调到 2020 年就能让一张 `expires=2026-10-20` 的过期年卡"复活"通过验签。
-    这里持久化"本机见过的最大日期"，每次校验取 `max(系统日期, 水位)`，
-    于是时间往前调不再有任何收益（水位已经记着真实进度）。
-
-    ⚠️ 诚实边界（P1 加固后）：水位现在**同时写三份**（含两个隐藏文件名），
-    读取时取三者最大。任意删掉一份还有另外两份兜底；但**三份全删**仍能清空
-    水位 —— 本地授权做不到绝对，只是把门槛从"删一个文件"抬到"知道有三个、
-    其中一个还是隐藏文件"。要真正堵死必须引入服务器或注册表（后者需要管理员
-    权限 / 会被安全软件拦截，本机规范也不允许未经许可动注册表），故不在此做。
-    """
-    return _clock_watermark_paths()[0]
+# v5.1(ultra M11): 删除 `_clock_watermark_path()` —— 全项目零调用(仅
+# `_clock_watermark_paths()[0]` 被 _write_clock_watermark 用)。留着会让后来人
+# 以为"读水位"有两条路径(一条读一份、一条读三份)。
 
 
 def _read_clock_watermark():
@@ -428,7 +421,7 @@ def verify_code(code, components=None, public_key_hex=None, today=None):
         'payload': payload,
         'expires': exp,
         'tier': tier,
-        'matched': [SLOTS[i][0] for i in matched],
+        'matched': [SLOT_TAGS[i] for i in matched],
         'required': need,
         'machine_id': LC.b32e(b''.join(mine)),
     }

@@ -1797,6 +1797,14 @@ class AppController(QObject):
         self._cache_champ.request(cid, self._api.download_champion_icon,
                                   on_ready=_on_ready, pool=self._icon_pool)
 
+    def _dl_mastery_icon(self, cid, idx):
+        """熟练度 top3 英雄头像: 复用英雄图标缓存, 回调主窗渲染。"""
+        def _on_ready(key, data):
+            if self._main:
+                self._main.set_mastery_icon(idx, data)
+        self._cache_champ.request(cid, self._api.download_champion_icon,
+                                  on_ready=_on_ready, pool=self._icon_pool)
+
     # ==================== v36 召唤师头像(账号卡) ====================
     def _avatar_disk_path(self, icon_id):
         """头像落盘路径。英雄图标是 {cid}.png(带 PNG 魔数校验);头像来源格式
@@ -2539,6 +2547,14 @@ class AppController(QObject):
                                 g['champion_name'] = self._champ_data.get(
                                     cid, f'英雄#{cid}' if cid else '')
                     self._main.update_account_info(info)
+                    # 熟练度 top3 头像：champion_id → 英雄图标（复用英雄图标缓存）
+                    try:
+                        for i, m in enumerate((info.get('mastery_top') or [])[:3]):
+                            cid = int(m.get('champion_id') or 0)
+                            if cid:
+                                self._dl_mastery_icon(cid, i)
+                    except Exception as e:
+                        print(f'[App] 熟练度头像任务失败: {type(e).__name__}: {e}')
                     # v4.1.66: 战绩页图标回调只注入一次(与选择器同源, 走内存缓存)
                     if not getattr(self, '_recent_icon_wired', False):
                         self._main.set_recent_icon_cb(
@@ -4138,12 +4154,12 @@ class SplashWindow(QWidget):
         # paintEvent 每帧(400ms tick)重建 QLinearGradient/QFont 是无谓开销,
         # 现只在 paintEvent 里引用成员(渐变坐标按固定尺寸展开)。
         self._grad_bg = QLinearGradient(0, 0, 0, 200)
-        self._grad_bg.setColorAt(0.0, QColor('#1e1b4b'))
-        self._grad_bg.setColorAt(0.5, QColor('#111827'))
-        self._grad_bg.setColorAt(1.0, QColor('#0b0f1a'))
+        self._grad_bg.setColorAt(0.0, QColor('#EAF0ED'))
+        self._grad_bg.setColorAt(0.5, QColor('#F2F4F1'))
+        self._grad_bg.setColorAt(1.0, QColor('#EDF1EE'))
         self._grad_glow = QLinearGradient(0, 0, 0, 80)
-        self._grad_glow.setColorAt(0.0, QColor(99, 102, 241, 40))
-        self._grad_glow.setColorAt(1.0, QColor(99, 102, 241, 0))
+        self._grad_glow.setColorAt(0.0, QColor(8, 127, 115, 40))
+        self._grad_glow.setColorAt(1.0, QColor(8, 127, 115, 0))
         self._font_title = QFont('Microsoft YaHei UI', 12, QFont.DemiBold)
         self._font_sub = QFont('Microsoft YaHei UI', 9)
 
@@ -4172,7 +4188,7 @@ class SplashWindow(QWidget):
         icon_size = 72
         ix = (self.width() - icon_size) // 2
         iy = 28
-        glow = QColor(99, 102, 241)
+        glow = QColor(8, 127, 115)
         for i in range(3, 0, -1):
             alpha = 40 - i * 8
             if alpha <= 0:

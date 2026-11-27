@@ -393,7 +393,7 @@ def _any_lol_client_running() -> bool:
             n = (proc.info.get('name') or '').lower()
         except Exception:
             continue
-        if n not in [x.lower() for x in _LOL_CLIENT_PROCS]:
+        if n not in _LOL_CLIENT_PROCS_LOWER:
             continue
         # LeagueClientUx/LeagueClient 名字足够独特, 直接认; client.exe 太通用,
         # 必须校验路径属于 LOL 安装目录。

@@ -342,6 +342,39 @@ class LCUAPI:
     def get(self, ep: str, **kw) -> Any:
         return self._checked(self._req('GET', ep, **kw), 'GET', ep)
 
+    # v5.1(ultra M1): 业务性可选 GET 的统一通道 —— 区分"没有这份数据(4xx)"与
+    # "连不上/超时(网络故障)"。后者必须留痕(每端点一次), 前者静默转 default。
+    # 原先 get_wallet / get_champion_mastery / get_eog_stats_block / get_ready_check
+    # / get_honor_ballot / get_champ_select_session 全是 `except: return 空`,
+    # 把网络故障伪装成空数据, 排障时失去现场。现在只有 4xx 业务答复静默;
+    # 网络/超时/5xx/401/403 记录 last_error 并打印一次, 数据仍返回 default
+    # (保持调用方降级行为不变)。
+    _OPTIONAL_NOTED: dict = {}
+    _OPTIONAL_NOTE_LOCK = threading.Lock()
+
+    def _get_optional(self, ep: str, default=None):
+        try:
+            return self.get(ep)
+        except Exception as e:
+            msg = str(e)
+            # 业务性 4xx(如 404 无会话/无数据) = 服务端已在线应答, 静默转 default
+            if msg.startswith('API错误 [4'):
+                return default
+            if msg.startswith('API错误 [3'):
+                return default
+            # 其余(超时/连接失败/5xx/401/403/解析失败) = 值得留痕的连通性问题
+            with self._OPTIONAL_NOTE_LOCK:
+                if ep not in self._OPTIONAL_NOTED:
+                    self._OPTIONAL_NOTED[ep] = True
+                    try:
+                        from core.logger import redact_sensitive as _rs
+                        shown = _rs(msg)
+                    except Exception:
+                        shown = msg
+                    print(f'[API] 可选端点获取失败(本会话只提示一次, 返回默认值): '
+                          f'{ep} → {shown}')
+            return default
+
     def post(self, ep: str, data=None, **kw) -> Any:
         if data is not None and not isinstance(data, str):
             data = json.dumps(data)
@@ -384,10 +417,7 @@ class LCUAPI:
         (value 是每个单位的精粹价值,count 才是余额)。返回结构:
             {'ip':258477,'cosmetic':1254,'mythic':56,'rp':0}
         RP 在腾讯服不计费(原 LOL 客户端无 RP),固定 0。"""
-        try:
-            loot = self.get('/lol-loot/v1/player-loot') or []
-        except Exception:
-            return {'ip': 0, 'cosmetic': 0, 'mythic': 0, 'rp': 0}
+        loot = self._get_optional('/lol-loot/v1/player-loot', default=[])
         out = {'ip': 0, 'cosmetic': 0, 'mythic': 0, 'rp': 0}
         if not isinstance(loot, list):
             return out
@@ -423,7 +453,8 @@ class LCUAPI:
         返回每项: {championId, level(int 英雄成就等级), points, grade}
         """
         try:
-            ms = self.get('/lol-champion-mastery/v1/local-player/champion-mastery')
+            ms = self._get_optional(
+                '/lol-champion-mastery/v1/local-player/champion-mastery', default=[])
         except Exception:
             return []
         out = []
@@ -471,7 +502,7 @@ class LCUAPI:
         分支 raise Exception —— 这里捕获并返回 None, 调用方按"暂不可用"降级。
         """
         try:
-            return self.get('/lol-end-of-game/v1/eog-stats-block')
+            return self._get_optional('/lol-end-of-game/v1/eog-stats-block')
         except Exception:
             return None
 
@@ -543,10 +574,7 @@ class LCUAPI:
         self.post('/lol-matchmaking/v1/ready-check/decline')
 
     def get_ready_check(self) -> Optional[Dict]:
-        try:
-            return self.get('/lol-matchmaking/v1/ready-check')
-        except Exception:
-            return None
+        return self._get_optional('/lol-matchmaking/v1/ready-check')
 
     # ==================== 对局结束 ====================
     def play_again(self):
@@ -555,10 +583,7 @@ class LCUAPI:
     # ==================== 自动点赞 ====================
     def get_honor_ballot(self) -> Optional[Dict]:
         """获取可点赞的玩家列表"""
-        try:
-            return self.get('/lol-honor-v2/v1/ballot')
-        except Exception:
-            return None
+        return self._get_optional('/lol-honor-v2/v1/ballot')
 
     def honor_player(self, puuid: str, summoner_id: int, game_id: int, honor_category: str) -> bool:
         """点赞玩家 (HEART/COOL/SHOTCALLER)"""
@@ -575,10 +600,7 @@ class LCUAPI:
 
     # ==================== 英雄选择 ====================
     def get_champ_select_session(self) -> Optional[Dict]:
-        try:
-            return self.get('/lol-champ-select/v1/session')
-        except Exception:
-            return None
+        return self._get_optional('/lol-champ-select/v1/session')
 
     @staticmethod
     def _champ_select_prefix(s) -> str:
@@ -608,6 +630,9 @@ class LCUAPI:
         v4.4.2(P1-3/P2-44): 加候选截断(PICK_TRY_MAX)与总时限(PICK_TRY_DEADLINE_S);
         单候选失败改 continue(可能是该候选特有的 204/4xx), 只有超时或试完才返回,
         不再因首个候选的 PATCH 异常/非 2xx 就放弃整个列表。
+
+        v5.1(ultra L2): 载荷A/载荷B 两段几乎重复的"PATCH→读回→补complete"流程
+        抽到 _try_pick_candidate, 主循环只负责候选遍历与节流/时限。
         """
         import json as _json
         import time as _t
@@ -673,99 +698,112 @@ class LCUAPI:
                     _timeout_log()
                     break
                 _tried += 1
-                # 载荷A: 单步 PATCH {championId, completed:True}
-                if _late():
-                    _timeout_log()
-                    break
-                try:
-                    r1 = self._req('PATCH', f'{prefix}/actions/{target_id}',
-                                   data=_json.dumps({'championId': cid,
-                                                     'completed': True}))
-                except Exception as e:
-                    print(f'[选人] v30 cid={cid} PATCH 异常: '
-                          f'{type(e).__name__}: {e}')
-                    continue
-                if not (200 <= r1.status_code < 300):
-                    # v4.4.2(P2-44): 4xx/5xx 可能是该候选特有的(非可操作时机/
-                    # 不在本局子集), 不再整体放弃, 试下一个候选。
-                    print(f'[选人] v30 cid={cid} PATCH HTTP {r1.status_code} '
-                          f'(该候选未接受), 试下一个')
-                    continue
-                _t.sleep(0.08)
-                if _late():
-                    _timeout_log()
-                    break
-                a = _read_my_action()
-                if _locked(a, cid):
-                    print(f'[选人] v30 ✅ 自动锁 {cid}: 单步 PATCH HTTP '
-                          f'{r1.status_code}, action 翻转为 done')
-                    return cid
-                if a and a.get('championId') == cid and not a.get('completed'):
-                    # 预选被接受但未 done → 补 POST complete
-                    if _late():
-                        _timeout_log()
-                        break
-                    try:
-                        r2 = self._req('POST',
-                                       f'{prefix}/actions/{target_id}/complete')
-                        _t.sleep(0.08)
-                        if _late():
-                            _timeout_log()
-                            break
-                        a = _read_my_action()
-                        if _locked(a, cid):
-                            print(f'[选人] v30 ✅ 自动锁 {cid}: 单步PATCH+complete '
-                                  f'HTTP {r1.status_code}/{r2.status_code}')
-                            return cid
-                    except Exception as e:
-                        print(f'[选人] v30 cid={cid} complete 异常: '
-                              f'{type(e).__name__}: {e}')
-                # 载荷B: 两步 PATCH {championId} + POST complete
-                if _late():
-                    _timeout_log()
-                    break
-                try:
-                    r1 = self._req('PATCH', f'{prefix}/actions/{target_id}',
-                                   data=_json.dumps({'championId': cid}))
-                except Exception as e:
-                    print(f'[选人] v30 cid={cid} PATCH 异常: '
-                          f'{type(e).__name__}: {e}')
-                    continue
-                if 200 <= r1.status_code < 300:
-                    _t.sleep(0.05)
-                    if _late():
-                        _timeout_log()
-                        break
-                    a = _read_my_action()
-                    if _locked(a, cid):
-                        print(f'[选人] v30 ✅ 自动锁 {cid}: 两步 PATCH HTTP '
-                              f'{r1.status_code}, 已 done')
-                        return cid
-                    if a and a.get('championId') == cid and not a.get('completed'):
-                        if _late():
-                            _timeout_log()
-                            break
-                        try:
-                            r2 = self._req('POST',
-                                           f'{prefix}/actions/{target_id}/complete')
-                            _t.sleep(0.08)
-                            if _late():
-                                _timeout_log()
-                                break
-                            a = _read_my_action()
-                            if _locked(a, cid):
-                                print(f'[选人] v30 ✅ 自动锁 {cid}: 两步PATCH+complete '
-                                      f'HTTP {r1.status_code}/{r2.status_code}')
-                                return cid
-                        except Exception:
-                            pass
-                # 走到这里 = 该候选 204 静默忽略(不在本局允许集) → 试下一个
+                got = self._try_pick_candidate(
+                    cid, target_id, prefix, _read_my_action, _locked, _late,
+                    _timeout_log)
+                if got:
+                    return got
             print(f'[选人] v30 试完候选均未被本局接受'
                   f'(2-3 张卡里无偏好) → 不硬锁')
             return None
         except Exception as e:
             print(f'[选人] v30 异常: {type(e).__name__}: {e}')
             return None
+
+    def _try_pick_candidate(self, cid, target_id, prefix, read_my_action,
+                            locked, late, timeout_log):
+        """v5.1(ultra L2): 单个候选的"载荷A(单步)→载荷B(两步)"试锁流程。
+
+        原 pick_champion 里两段几乎逐字重复(单步 PATCH {championId,completed:True}
+        与两步 PATCH {championId} + POST complete)。抽成一份后, 改锁人时序/读回
+        逻辑只改一处, 不再"改了 A 漏了 B"。返回锁定成功的 cid 或 None。
+        """
+        import json as _json
+        import time as _t
+        # 载荷A: 单步 PATCH {championId, completed:True}
+        if late():
+            timeout_log()
+            return None
+        try:
+            r1 = self._req('PATCH', f'{prefix}/actions/{target_id}',
+                           data=_json.dumps({'championId': cid,
+                                             'completed': True}))
+        except Exception as e:
+            print(f'[选人] v30 cid={cid} PATCH 异常: '
+                  f'{type(e).__name__}: {e}')
+            return None
+        if not (200 <= r1.status_code < 300):
+            print(f'[选人] v30 cid={cid} PATCH HTTP {r1.status_code} '
+                  f'(该候选未接受), 试下一个')
+            return None
+        _t.sleep(0.08)
+        if late():
+            timeout_log()
+            return None
+        a = read_my_action()
+        if locked(a, cid):
+            print(f'[选人] v30 ✅ 自动锁 {cid}: 单步 PATCH HTTP '
+                  f'{r1.status_code}, action 翻转为 done')
+            return cid
+        if a and a.get('championId') == cid and not a.get('completed'):
+            # 预选被接受但未 done → 补 POST complete
+            if late():
+                timeout_log()
+                return None
+            try:
+                r2 = self._req('POST', f'{prefix}/actions/{target_id}/complete')
+                _t.sleep(0.08)
+                if late():
+                    timeout_log()
+                    return None
+                a = read_my_action()
+                if locked(a, cid):
+                    print(f'[选人] v30 ✅ 自动锁 {cid}: 单步PATCH+complete '
+                          f'HTTP {r1.status_code}/{r2.status_code}')
+                    return cid
+            except Exception as e:
+                print(f'[选人] v30 cid={cid} complete 异常: '
+                      f'{type(e).__name__}: {e}')
+        # 载荷B: 两步 PATCH {championId} + POST complete
+        if late():
+            timeout_log()
+            return None
+        try:
+            r1 = self._req('PATCH', f'{prefix}/actions/{target_id}',
+                           data=_json.dumps({'championId': cid}))
+        except Exception as e:
+            print(f'[选人] v30 cid={cid} PATCH 异常: '
+                  f'{type(e).__name__}: {e}')
+            return None
+        if 200 <= r1.status_code < 300:
+            _t.sleep(0.05)
+            if late():
+                timeout_log()
+                return None
+            a = read_my_action()
+            if locked(a, cid):
+                print(f'[选人] v30 ✅ 自动锁 {cid}: 两步 PATCH HTTP '
+                      f'{r1.status_code}, 已 done')
+                return cid
+            if a and a.get('championId') == cid and not a.get('completed'):
+                if late():
+                    timeout_log()
+                    return None
+                try:
+                    r2 = self._req('POST',
+                                   f'{prefix}/actions/{target_id}/complete')
+                    _t.sleep(0.08)
+                    if late():
+                        timeout_log()
+                        return None
+                    a = read_my_action()
+                    if locked(a, cid):
+                        print(f'[选人] v30 ✅ 自动锁 {cid}: 两步PATCH+complete '
+                              f'HTTP {r1.status_code}/{r2.status_code}')
+                        return cid
+                except Exception:
+                    pass
+        return None
 
     def bench_swap(self, champion_id: int) -> Optional[bool]:
         """ARAM 备选池换英雄，带 read-back 验证（非阻塞版）。
