@@ -54,6 +54,14 @@ HEALTH_FAIL_THRESHOLD = 3
 PICK_TRY_MAX = 12
 PICK_TRY_DEADLINE_S = 8.0
 
+# ==================== bench_swap 读回确认（v5.1 A 方案）====================
+# POST bench/swap 后, LCU 慢同步下 0.1s 单次读回大概率读不到目标英雄 → 返回
+# None → 上层被迫走 3s 冷却 → 观感"不是秒选"。现在 POST 后在窗口内每
+# SWAP_READBACK_INTERVAL_S 秒读回一次, 命中即 True; 窗口用尽仍未见 → 才返回
+# None(未验证)。窗口总时长覆盖绝大多数慢同步, 且不会无限阻塞 poll 线程。
+SWAP_READBACK_INTERVAL_S = 0.1
+SWAP_READBACK_WINDOW_S = 0.5
+
 # ==================== 输入注入节奏（P2）====================
 # v4.4.0 修复：原先这 5 个 sleep 以字面量内联在 clicker.py 的注入函数里，
 # 调"点卡手感"时必须逐处找、容易漏改。集中到此便于统一调整。

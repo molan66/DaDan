@@ -15,6 +15,7 @@ from .constants import (
     RETRY_TOTAL, RETRY_BACKOFF, RETRY_STATUS_FORCELIST, RETRY_ALLOWED_METHODS,
     HEALTH_FAIL_THRESHOLD,
     PICK_TRY_MAX, PICK_TRY_DEADLINE_S,
+    SWAP_READBACK_INTERVAL_S, SWAP_READBACK_WINDOW_S,
 )
 
 # v4.4.0 修复（P0-8）：**非 loopback** 的第三方 CDN 请求必须校验证书，且不能复用
@@ -838,24 +839,31 @@ class LCUAPI:
             print(f'[选人] bench_swap POST 异常: {type(e).__name__}: {e}')
             return False
 
-        # 非阻塞 read-back：只检查一次当前状态
+        # v5.1(A): 读回确认从"sleep(0.1) 单次读"升级为"窗口轮询"。
+        # LCU 慢同步下 0.1s 单次读回大概率读不到目标英雄 → 返回 None → 上层
+        # 被迫走 3s 冷却, 日志里"未验证×3 后取消预输入"正是此因(实测 2026-11-27)。
+        # 现在 POST 后在 SWAP_READBACK_WINDOW_S 窗口内每 SWAP_READBACK_INTERVAL_S
+        # 秒读回一次, 命中即 True; 窗口用尽仍未见才返回 None。窗口 ≤0.5s,
+        # 不阻塞 1s 轮询线程。
         try:
             import time as _t
-            _t.sleep(0.1)
-            s = self.get_champ_select_session()
-            if s:
-                local_cell = s.get('localPlayerCellId')
-                for p in s.get('myTeam', []):
-                    if p.get('cellId') == local_cell:
-                        my = p.get('championId')
-                        # v4.4.2(P2-34): 原 `return my == champion_id` 与 docstring
-                        # 矛盾 —— 慢同步下"真的换成了但读回还没刷新"会被误报成
-                        # "API 明确拒绝(False)", 且消费方不更新 _last_swap。
-                        # 改为: 读回命中 → True; 读回成别的英雄 → None(未验证,
-                        # 可能是慢同步); 只有 POST 异常才返回 False。
-                        if my == champion_id:
-                            return True
-                        return None
+            deadline = _t.monotonic() + SWAP_READBACK_WINDOW_S
+            while True:
+                _t.sleep(SWAP_READBACK_INTERVAL_S)
+                s = self.get_champ_select_session()
+                if s:
+                    local_cell = s.get('localPlayerCellId')
+                    for p in s.get('myTeam', []):
+                        if p.get('cellId') == local_cell:
+                            my = p.get('championId')
+                            # v4.4.2(P2-34): 读回命中 → True; 读回成别的英雄 →
+                            # 继续等(慢同步可能在下一拍刷新); 只有 POST 异常才
+                            # 返回 False。
+                            if my == champion_id:
+                                return True
+                            break
+                if _t.monotonic() >= deadline:
+                    break
         except Exception:
             pass
         # v4.4.0 修复（P1-3）：原为 return True。读回校验失败/读不到会话时

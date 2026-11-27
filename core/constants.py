@@ -51,7 +51,9 @@ RANDOM_DELAY_MIN_HALF_S = 0.5
 STOP_JOIN_S = 3.0
 # v5.0.0(#2): bench_swap 读回未确认(返回 None)后的冷却。此前每 1s 轮询都会
 # 重新 POST 同一个 swap(日志实测连打 8~10 次), 这里在冷却期内不再重复提交。
-SWAP_UNCONFIRMED_RETRY_S = 3.0
+# v5.1(A+B): 从 3.0 降到 1.0 —— A 方案(读回窗口轮询)已把"未验证"大幅压降,
+# 1s 冷却只作最后防线, 既保留防连打 POST, 又不会让慢同步观感拖到 3s 一轮。
+SWAP_UNCONFIRMED_RETRY_S = 1.0
 
 # ---- 自动返回 ----
 # v4.9.12: 原先这里的 PLAY_AGAIN_RETRY_MAX(15) / PLAY_AGAIN_RETRY_INTERVAL_S(1)
