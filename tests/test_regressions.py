@@ -1539,6 +1539,37 @@ class TestAutoHonor(unittest.TestCase):
         finally:
             c._honor_lock.release()
 
+    def test_same_game_id_honored_once(self):
+        """v5.1.2(#1): 同一 gameId 只点一次赞 —— 三个阶段都会调 _try_start_honor,
+        无去重时同一局点 2~3 次(日志实测 2 次, 第二次覆盖第一次的点赞类型)。"""
+        ballot = {'gameId': 7,
+                  'eligibleAllies': [{'puuid': 'a', 'summonerId': 1}]}
+        c = self._core(ballot=ballot)
+        # 第一次: 起线程点一次, 等 worker 跑完(锁释放)
+        c._try_start_honor()
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if c._honor_lock.acquire(blocking=False):
+                c._honor_lock.release()
+                break
+            time.sleep(0.02)
+        self.assertEqual(len(c._api.honored), 1, '首次点赞未生效')
+        self.assertEqual(c._honored_game_id, 7, '首次点赞后未记录 gameId')
+        # 第二次: 同 gameId 应直接 return, 不再起线程
+        c._try_start_honor()
+        self.assertEqual(len(c._api.honored), 1,
+                         '同一局重复点赞(第二次覆盖第一次的点赞类型)')
+
+    def test_honor_reset_on_lobby(self):
+        """回大厅后重置 gameId 去重, 下一局结算能再点。"""
+        ballot = {'gameId': 7,
+                  'eligibleAllies': [{'puuid': 'a', 'summonerId': 1}]}
+        c = self._core(ballot=ballot)
+        c._try_start_honor()
+        self.assertEqual(c._honored_game_id, 7)
+        c._apply_phase_side_effects('EndOfGame', 'Lobby')
+        self.assertEqual(c._honored_game_id, 0, '回大厅后未重置点赞去重, 下一局点不了')
+
 
 class TestPickCardPreLocked(unittest.TestCase):
     """v5.1(ultra H4): 点卡防误报 —— v4.3.15 的核心教训。

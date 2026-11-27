@@ -198,6 +198,11 @@ class ScriptCore:
         # v23:自动点赞并发锁 —— 中途启动/状态对账可能在多个结束阶段补点赞,
         # 用非阻塞锁保证同时只有一个点赞线程在跑
         self._honor_lock = threading.Lock()
+        # v5.1.2(#1): 本局已点过赞的 gameId —— 一局结束会依次经过 WaitingForStats
+        # → PreEndOfGame → EndOfGame 三个阶段, 每个阶段都调 _try_start_honor,
+        # _honor_lock 只防并发不防"本局已点过"。实测日志同 gameId 点了 2 次,
+        # 第二次覆盖第一次的点赞类型(HEART 被改 COOL)。回 Lobby 时重置。
+        self._honored_game_id = 0
         # G6:用户主动拒绝后暂停"自动匹配"，直到手动点启动/手动在客户端开始匹配才恢复，
         # 避免"拒绝→回大厅→自动重排→自动接受"的循环违背用户意愿。
         self._auto_queue_paused = False
@@ -580,6 +585,9 @@ class ScriptCore:
         if new in ('Lobby', 'None'):
             self._set_declined(False)
             self._return_pending = False
+            # v5.1.2(#1): 回到大厅 = 上一局彻底结束, 重置"本局已点过赞"的 gameId,
+            # 下一局结算才能再点。
+            self._honored_game_id = 0
             # v4.9.12 修复(本次 B): 已经回到大厅, 说明"返回房间"这件事**已完成**,
             # 在途的返回倒计时必须当场作废。
             # 事故现场(dist/data/logs/app.log, 89 次进大厅里 30 次中招):
@@ -1450,6 +1458,14 @@ class ScriptCore:
         # ④ 在池里、当前不是它 → 换。
         # 复用 _do_auto_pick 调用方已持有的 _swap_lock(见 _try_auto_pick),
         # 这里不再抢锁, 避免自锁。
+        # v5.1.2(#3): 换之前再查一次"本局是否已命中过" —— poll 换成功后
+        # WS 事件可能带着旧 session 快照(current_id 还是旧的)紧接着进入,
+        # 若无此判断会再 POST 一次并重复打印"切换成功"。命中过直接走 ② 的
+        # 语义返回, 不再重复换。
+        with self._preinput_lock:
+            already_hit = self._preinput_hit
+        if already_hit:
+            return True
         # v5.0.0(#2): 读回未确认后的冷却, 同一英雄冷却期内不重复 POST。
         if self._swap_unconfirmed_cooling(cid, now):
             return True
@@ -1576,6 +1592,11 @@ class ScriptCore:
             ballot = None
         if not ballot:
             return
+        # v5.1.2(#1): 同 gameId 只点一次。三个阶段(WaitingForStats/PreEndOfGame/
+        # EndOfGame)都会进本方法, 无此判据会同一局点 2~3 次(日志实测 2 次)。
+        gid = ballot.get('gameId', 0)
+        if gid and gid == self._honored_game_id:
+            return
         allies = list(ballot.get('eligibleAllies') or [])
         opponents = list(ballot.get('eligibleOpponents') or [])
         if not allies and not opponents:
@@ -1592,6 +1613,10 @@ class ScriptCore:
             if not ballot2:
                 self._honor_lock.release()
                 return
+            gid2 = ballot2.get('gameId', 0)
+            if gid2 and gid2 == self._honored_game_id:
+                self._honor_lock.release()
+                return
             allies2 = list(ballot2.get('eligibleAllies') or [])
             opponents2 = list(ballot2.get('eligibleOpponents') or [])
             if not allies2 and not opponents2:
@@ -1600,6 +1625,9 @@ class ScriptCore:
         except Exception:
             self._honor_lock.release()
             raise
+        # 抢锁 + 二次探测通过 = 本局确实要点, 先记 gameId 防并发窗口重复
+        if gid2:
+            self._honored_game_id = gid2
         # v4.1.60: 防御 start() 失败(线程资源耗尽等极端情况)导致 _honor_lock
         # 永不释放 —— 锁由 _honor_worker 结束时释放, 若线程根本没起来锁会泄漏,
         # 后续所有自动点赞全被阻塞。这里 start 异常时立即归还锁。

@@ -112,6 +112,8 @@ class LCUConnector:
         self.bfs_max_depth: int = BFS_MAX_DEPTH
         # v4.4.x(P2): 上次完整慢扫描(全盘 BFS + 日志递归)的时刻, 节流用
         self._last_full_scan = 0.0
+        # v5.1.2(#2): 上次打印"日志兜底参数已失效"的时刻, 60s 节流防刷屏
+        self._last_log_stale_print = 0.0
 
     def _set_params(self, port: Optional[int], token: Optional[str],
                     pid: Optional[int]) -> None:
@@ -804,7 +806,13 @@ class LCUConnector:
             # "先开脚本后开游戏" 10061 复测暴露)。校验失败则丢弃,让后台重连
             # 定时器在用户真正启动 LOL 后再走进程/锁文件拿到真值。
             if not self._validate_cached_connection():
-                print('[连接] 日志兜底参数已失效(LOL 未启动或端口已变),丢弃')
+                # v5.1.2(#2): 失效打印节流 —— LOL 关闭后重连线程每 5s 走一次
+                # 日志兜底, 原先每次都打一行(实测一天日志 1553 行里 299 行是这句)。
+                # 现在同一失效场景最多每 60s 报一次, 保留排障线索、不再刷屏。
+                now_m = time.monotonic()
+                if now_m - self._last_log_stale_print >= 60.0:
+                    self._last_log_stale_print = now_m
+                    print('[连接] 日志兜底参数已失效(LOL 未启动或端口已变),丢弃')
                 self.reset()
                 return False
             # v4.3.14: 去掉"校验通过(旧)"的成功打印 —— 每次重连探活都打一行
