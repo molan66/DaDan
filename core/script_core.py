@@ -320,6 +320,9 @@ class ScriptCore:
 
     def update_settings(self, s):
         # v4.9.14: 先判 None 再 update —— dict.update(None) 会抛 TypeError。
+        # v5.1.3: update 前先记旧值 —— 下面的"开关 True→False 作废倒计时"需要
+        # 判断真实变更, 否则每次全量同步都会 bump, 把在途倒计时无谓作废。
+        _old = dict(self._settings)
         if s is not None:
             self._settings.update(s)
         # 关闭「预输入选英雄」开关时, 必须同步清掉当前标记。
@@ -328,6 +331,18 @@ class ScriptCore:
         # 这里清零后下一轮自然把 0 推过去。
         if s is not None and s.get('auto_preinput_champion') is False:
             self._clear_preinput()
+        # v5.1.3: 某功能开关由 True→False 时, 作废对应在途倒计时。
+        # 否则"关了开关"只挡住排程, 挡不住已经在跑的那次 —— 到点仍会执行动作,
+        # 用户看到"明明关了还是动", 与换英雄开关失效同一族故障模式。
+        if s is not None:
+            _SWITCH_TO_KIND = {
+                'auto_queue': 'queue',
+                'auto_accept': 'accept',
+                'auto_play_again': 'return',
+            }
+            for switch_key, kind in _SWITCH_TO_KIND.items():
+                if s.get(switch_key) is False and _old.get(switch_key) is not False:
+                    self._bump_countdown(kind)
 
     def get_settings(self): return self._settings.copy()
 
@@ -696,6 +711,10 @@ class ScriptCore:
             self._do_queue()
 
     def _do_queue(self):
+        # v5.1.3: 倒计时到点执行时复查开关 —— 排程后用户关掉开关, 动作不得再发。
+        if not self._settings.get('auto_queue', True):
+            print('[Core] 自动匹配已关闭, 跳过(倒计时到点复查)')
+            return
         if self._phase not in ('Lobby', 'None'):
             return
         try:
@@ -782,6 +801,10 @@ class ScriptCore:
             delay = min(self._random_delay(base), C.ACCEPT_DELAY_MAX_S)
 
             def do_accept():
+                # v5.1.3: 到点执行时复查开关 —— 排程后用户关掉自动接受, 不得再接受。
+                if not self._settings.get('auto_accept', True):
+                    print('[Core] 自动接受已关闭, 跳过(倒计时到点复查)')
+                    return
                 try:
                     c = self._api.get_ready_check()
                     if c and c.get('state') == 'InProgress':
@@ -1331,6 +1354,14 @@ class ScriptCore:
         if self._do_preinput(bench_set, current_id, bench_ids, now):
             return
 
+        # v5.1.3(用户 2026-11-28 日志实锤): 偏好秒换必须受"自动换英雄"开关控制。
+        # 此前入口 _auto_select_pass 用 `auto_pick_champion or auto_preinput_champion`
+        # 短路 —— 预输入开着时偏好分支仍会执行, 导致"关闭自动换英雄"形同虚设。
+        # 预输入走 _do_preinput 自己查 auto_preinput_champion, 本守卫只管偏好,
+        # 不会误伤"用户显式指令"的预输入。
+        if not self._settings.get('auto_pick_champion', True):
+            return
+
         # 备选池中优先级最高的偏好英雄（索引最小 = 优先级最高）
         best_cid = None
         best_rank = len(preferred)
@@ -1534,6 +1565,11 @@ class ScriptCore:
         if self._stop_event.is_set():
             self._return_pending = False
             return
+        # v5.1.3: 倒计时到点执行时复查开关 —— 排程后用户关掉开关, 动作不得再发。
+        if not self._settings.get('auto_play_again', True):
+            self._return_pending = False
+            print('[Core] 自动返回已关闭, 跳过(倒计时到点复查)')
+            return
         # v4.9.12 修复(本次 A): 阶段守卫。
         # 事故现场(dist/data/logs/app.log, 89 次进大厅里 30 次中招):
         #   「返回倒计时」启动后阶段已回 Lobby(客户端自己返回/用户点了返回),
@@ -1652,6 +1688,10 @@ class ScriptCore:
         """对局结束后自动点赞队友（sona auto-honor 模式）"""
         # v5.0.0(#1): 停止后不再补票
         if self._stop_event.is_set():
+            return
+        # v5.1.3: 执行时复查开关 —— 关闭自动点赞后不再补票。
+        if not self._settings.get('auto_honor', True):
+            print('[Core] 自动点赞已关闭, 跳过')
             return
         HONOR_CATEGORIES = ['HEART', 'COOL', 'SHOTCALLER']
         try:

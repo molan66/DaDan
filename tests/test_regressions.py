@@ -1209,6 +1209,140 @@ class TestPreinputChampion(unittest.TestCase):
         self.assertEqual(c.preinput_champion, 103, '传 None 不应影响已有标记')
 
 
+class TestSwitchGuards(unittest.TestCase):
+    """v5.1.3: 开关守卫 —— 关闭后不得再由延迟动作/轮询触发。
+
+    背景(用户 2026-11-28 日志实锤):
+      [设置] 自动换英雄 = False 之后仍出现 [Core] 自动秒换 → 扭曲树精(#6)。
+      根因: 入口 `auto_pick_champion or auto_preinput_champion` 短路, 且偏好
+      秒换分支不读 auto_pick_champion; 同族还有: 延迟动作到点执行时只查
+      stop_event, 不复查功能开关(关了开关后 delay 窗口内动作照发)。
+
+    守的行为契约:
+      ① auto_pick_champion=False 时, 偏好秒换分支不得发 bench_swap
+         (预输入是用户显式指令, 仍独立生效)
+      ② 延迟动作到点执行时复查开关(_do_queue/_do_play_again/_do_auto_honor)
+      ③ update_settings 检测 True→False 时作废对应在途倒计时
+    """
+
+    def _pick_core(self, **settings):
+        from core.script_core import ScriptCore
+
+        calls = []
+
+        class _API(object):
+            def bench_swap(self, cid):
+                calls.append(cid)
+                return True
+
+        c = ScriptCore(_API(), None)
+        c._phase = 'ChampSelect'
+        c._running = True
+        c._settings.update({'auto_pick_champion': True,
+                            'auto_preinput_champion': True})
+        c._settings.update(settings)
+        return c, calls
+
+    def test_pick_disabled_blocks_preferred(self):
+        """自动换英雄关着时, 备选池里即使有偏好英雄也不许换。"""
+        c, calls = self._pick_core(auto_pick_champion=False,
+                                   preferred_champions=[57])
+        c._do_auto_pick([57, 99], 7)
+        self.assertEqual(calls, [], '关了自动换英雄仍发出 bench_swap(偏好)')
+
+    def test_pick_disabled_keeps_preinput(self):
+        """预输入是用户显式指令, 不受自动换英雄开关影响 —— 守卫不能误伤它。"""
+        c, calls = self._pick_core(auto_pick_champion=False)
+        c.toggle_preinput(103)
+        c._do_auto_pick([103, 99], 7)
+        self.assertEqual(calls, [103], '预输入被自动换英雄开关误伤')
+
+    def test_pick_disabled_skips_no_pref_branch(self):
+        """开关关着时偏好分支整段跳过, 不再刷"暂不换"日志。"""
+        c, calls = self._pick_core(auto_pick_champion=False,
+                                   preferred_champions=[57])
+        c._do_auto_pick([1, 2], 7)
+        self.assertIsNone(c._last_no_pref_pool,
+                          '关了开关仍执行偏好分支(刷"暂不换"日志)')
+
+    # ---- ② 延迟动作到点执行时复查开关 ----
+    def test_queue_disabled_skips_exec(self):
+        from core.script_core import ScriptCore
+
+        calls = []
+
+        class _API(object):
+            def start_matchmaking(self):
+                calls.append('queue')
+
+        c = ScriptCore(_API(), None)
+        c._phase = 'Lobby'
+        c._running = True
+        c._settings.update({'auto_queue': False})
+        c._do_queue()
+        self.assertEqual(calls, [], '自动匹配关着仍执行了 start_matchmaking')
+
+    def test_return_disabled_skips_exec(self):
+        from core.script_core import ScriptCore
+
+        calls = []
+
+        class _API(object):
+            def play_again(self):
+                calls.append('play_again')
+
+        c = ScriptCore(_API(), None)
+        c._phase = 'EndOfGame'
+        c._running = True
+        c._settings.update({'auto_play_again': False})
+        c._do_play_again()
+        self.assertEqual(calls, [], '自动返回关着仍执行了 play_again')
+
+    def test_honor_disabled_skips_exec(self):
+        from core.script_core import ScriptCore
+
+        honored = []
+
+        class _API(object):
+            def honor_player(self, puuid, summoner_id, game_id, category):
+                honored.append((puuid, category))
+                return True
+
+        c = ScriptCore(_API(), None)
+        c._running = True
+        c._settings.update({'auto_honor': False})
+        c._do_auto_honor({'gameId': 1}, [{'puuid': 'a'}], [])
+        self.assertEqual(honored, [], '自动点赞关着仍补了票')
+
+    # ---- ③ update_settings 检测 True→False 作废在途倒计时 ----
+    def test_update_settings_bumps_inflight_countdown(self):
+        """开关 True→False 时必须作废在途倒计时, 否则关开关后动作仍到点执行。
+
+        用不查开关的纯 lambda 作 on_done —— 只有 update_settings 真正作废
+        倒计时才能阻止它 fired, 与修复点②(executor 复查)彼此独立、互不掩盖。
+        """
+        from core import constants as C
+        from core.script_core import ScriptCore
+
+        class _API(object):
+            pass
+
+        saved = C.COUNTDOWN_TICK_S
+        C.COUNTDOWN_TICK_S = 0.02
+        try:
+            c = ScriptCore(_API(), None)
+            c._running = True
+            c._settings.update({'auto_queue': True})
+            fired = []
+            c._start_countdown(2, '测试', lambda: fired.append('done'), kind='queue')
+            c.update_settings({'auto_queue': False})
+            time.sleep(0.3)
+            self.assertEqual(fired, [],
+                             '关掉开关未作废在途倒计时 —— 动作仍会到点执行')
+        finally:
+            C.COUNTDOWN_TICK_S = saved
+
+
 class TestStopAllThreads(unittest.TestCase):
     """v5.0.0(#1): 停止脚本时所有工作线程必须协作退出。
 

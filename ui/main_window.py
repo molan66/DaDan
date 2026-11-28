@@ -506,8 +506,14 @@ class _GlassPanel(QWidget):
         p.end()
 
 
-def _make_toggle_row(label, toggle_key, settings, toggles_dict, on_toggle_fn):
-    """创建开关行（hover 显示柔和底色）。desc 参数已移除(从未使用)。"""
+def _make_toggle_row(label, toggle_key, settings, toggles_dict, on_toggle_fn,
+                     default=False):
+    """创建开关行（hover 显示柔和底色）。desc 参数已移除(从未使用)。
+
+    v5.1.3: 增加 default 参数 —— 此前缺 key 时一律兜底 True, 而 auto_select/
+    auto_start_on_connect/lol_launch_to_overlay 的真实默认是 False, 一旦某 key
+    因版本迁移缺失就会被误显示成"开"。现由调用方传真实默认。
+    """
     row = HoverRow()
     row.setStyleSheet('background:transparent;')
     rl = QHBoxLayout(row)
@@ -515,7 +521,7 @@ def _make_toggle_row(label, toggle_key, settings, toggles_dict, on_toggle_fn):
     rl.setSpacing(10)
 
     btn = AnimatedToggle()
-    checked = settings.get(toggle_key, True)
+    checked = settings.get(toggle_key, default)
     btn.setChecked(checked)
     btn.toggled.connect(lambda c, k=toggle_key: on_toggle_fn(k, c, btn))
     toggles_dict[toggle_key] = btn
@@ -1392,7 +1398,8 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         lay.addWidget(self._make_delay_card(
             '连上客户端自动启动脚本', 'auto_start_on_connect',
             'auto_start_on_connect_delay', 5, 0, 120,
-            '检测到连上 LOL 客户端后，等设定秒数自动启动脚本'))
+            '检测到连上 LOL 客户端后，等设定秒数自动启动脚本',
+            toggle_default=False))
 
         _group('界面行为')
         # v4.8.1(用户要求): 点「启动 LOL」成功后隐藏主界面并打开小窗。
@@ -1403,7 +1410,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         clo.setSpacing(8)
         row_lo, _ = _make_toggle_row(
             '启动 LOL 后收起主界面', 'lol_launch_to_overlay',
-            self._settings, self._toggles, self._toggle)
+            self._settings, self._toggles, self._toggle, default=False)
         clo.addWidget(row_lo)
         desc_lo = QLabel(
             '登录器启动成功后，自动把主界面收起、只留小窗；'
@@ -1421,7 +1428,7 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
-        row, _ = _make_toggle_row('自动选英雄', 'auto_select_champion', self._settings, self._toggles, self._toggle)
+        row, _ = _make_toggle_row('自动选英雄', 'auto_select_champion', self._settings, self._toggles, self._toggle, default=False)
         cl.addWidget(row)
         desc = QLabel('进选人界面按偏好点击卡片；无偏好时随机点一张兜底（需要管理员权限以绕开 UIPI）')
         desc.setWordWrap(True)
@@ -1942,15 +1949,18 @@ class MainWindow(DragMixin, GlassEffectMixin, QMainWindow):
     # v4.8.0: 录制/回放卡片(_add_lol_calibrate_card)、_rec_refresh、
     # set_recording_ui、_on_record_clicked、_on_record_clear 全部随录制功能删除。
 
-    def _make_delay_card(self, label, toggle_key, delay_key, delay_def, dmin, dmax, desc):
+    def _make_delay_card(self, label, toggle_key, delay_key, delay_def, dmin, dmax, desc,
+                         toggle_default=True):
         card = GlassCard()
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(8)
         # v4.4.x(P2): 开关行与 _make_toggle_row 完全同构(仅回调不同), 复用避免双份拷贝。
         # _toggle(key, checked, btn) 内部就是 _on_setting(key, checked), 签名正好匹配。
+        # v5.1.3: toggle_default 传给 _make_toggle_row —— auto_start_on_connect 默认 False。
         row, _ = _make_toggle_row(label, toggle_key, self._settings,
-                                  self._toggles, self._toggle)
+                                  self._toggles, self._toggle,
+                                  default=toggle_default)
         rl = row.layout()
         self._make_delay_ctrl(rl, delay_key, delay_def, dmin, dmax)
         rl.addSpacing(4)

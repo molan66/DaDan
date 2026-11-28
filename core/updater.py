@@ -18,4 +18,4 @@ main.py 的启动日志与侧边栏版本号标签都读它, 不要再散落硬�
 # 当前版本(与 version.json 双源, 打包脚本负责强制同步; 打包/侧边栏/日志都读这里)
 # ⚠️ 本文件不是全项目唯一来源 —— version.json 的 `version` 也是来源之一,
 #    两处必须一致, 同步责任在打包脚本(E:\HuanJing\_installers\_build_dadan.py)。
-APP_VERSION = '5.1.0'
+APP_VERSION = '5.1.3'

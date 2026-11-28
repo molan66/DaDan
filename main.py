@@ -3954,13 +3954,10 @@ class AppController(QObject):
 
     @ui_slot
     def _on_overlay_toggle(self, key, value):
-        settings = self._core.get_settings()
-        settings[key] = value
-        self._core.update_settings(settings)
+        # v5.1.3: 只走 persist_setting 单入口 —— 它已覆盖"改内存 + 同步主窗控件
+        # + 落盘 + settings_changed 广播", 广播会再推 core/overlay。此前这里先
+        # core.update_settings 再 persist_setting, 同一次变更被写两遍(双写)。
         if self._main:
-            # v4.4.0(P1): 原为 sync_setting() + 私有 `_save_settings()` 两连击
-            # (sync_setting 自己就落盘)。改用公开的 persist_setting(key, value),
-            # 一次调用完成"改内存 + 同步控件 + 落盘"。
             self._main.persist_setting(key, value)
         label = {
             'auto_queue': '自动匹配', 'auto_accept': '自动接受',
